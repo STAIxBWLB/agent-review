@@ -1,6 +1,7 @@
 import { EXIT, errorLine } from "@staix/cli-output";
 import { version } from "../package.json";
 import { commandUsage, commands, usage } from "./commands-table.ts";
+import { Refusal } from "./ledger.ts";
 import { PacketUsageError, runPacket, runRules } from "./packet-cli.ts";
 import { recordCommand, resolveCommand, showCommand } from "./record.ts";
 
@@ -30,7 +31,8 @@ export function main(args: readonly string[]): number {
     } catch (error) {
       for (const line of errorLine("arev", error instanceof Error ? error.message : "Command failed.", "", {
         tty: Boolean(process.stderr.isTTY),
-        next: `arev ${command.name} --help`,
+        // A refusal states its own next step; only an unexpected failure has nothing to offer but the usage text.
+        next: error instanceof Refusal ? error.next : `arev ${command.name} --help`,
       })) console.error(line);
       return error instanceof PacketUsageError ? EXIT.usage : EXIT.fail;
     }

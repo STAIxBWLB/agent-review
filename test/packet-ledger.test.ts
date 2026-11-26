@@ -141,6 +141,18 @@ test("a report whose packet id is not the packet arev built for that head is ref
   expect(refused.stderr).toContain("arev packet --pr N --out DIR");
 });
 
+test("a refusal that reaches the command's catch prints its own next step, not the command's help", () => {
+  const { base, head, git, cli } = reviewedFlow();
+  // The ledger path is refused while the packet event is written, after the packet itself was built, so this refusal
+  // leaves the packet command through `src/cli.ts`: `arev packet --help` would answer nothing here.
+  git("remote", "add", "origin", "https://github.com/../evil.git");
+  const refused = cli("packet", "--from", base, "--to", head, "--json");
+  expect(refused.status).toBe(1);
+  expect(refused.stderr).toContain("the origin remote does not name a plain repository path");
+  expect(refused.stderr).toContain("set origin to a plain host/owner/repo URL, or remove it to key the ledger by the working tree");
+  expect(refused.stderr).not.toContain("arev packet --help");
+});
+
 test("a packet is recorded once per invocation and the ledger stays append-only", () => {
   const { base, head, cli } = reviewedFlow();
   expect(cli("packet", "--from", base, "--to", head, "--json").status).toBe(0);

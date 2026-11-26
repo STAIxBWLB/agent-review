@@ -1,8 +1,8 @@
 import { afterEach, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { readLedger } from "../src/ledger.ts";
 import { RUN_TOOL_NAMES } from "../src/mcp.ts";
 import { fixture } from "./packet-fixture.ts";
@@ -11,6 +11,15 @@ const scratch: string[] = [];
 afterEach(() => {
   for (const path of scratch.splice(0)) rmSync(path, { recursive: true, force: true });
 });
+
+// The first git the test process would run. On macOS /usr/bin/git is a stub that re-execs the developer-tools copy, and
+// paying that on every reviewer invocation cost about a second per case on the CI runner.
+function hostGit(): string {
+  const found = (process.env.PATH ?? "").split(delimiter).map(dir => join(dir, "git")).find(path => {
+    try { return statSync(path).isFile(); } catch { return false; }
+  });
+  return found ?? "/usr/bin/git";
+}
 
 function reviewer(mode: "json" | "dirty" | "timeout" | "brief" | "invalid" | "secret" | "escaped-secret" | "mcp" | "mcp-dirty" | "mcp-failed" | "hook", review = "# Review\n", host = "codex", separator = "") {
   const sandbox = mkdtempSync(join(tmpdir(), "arev-run-test-"));
@@ -26,7 +35,9 @@ function reviewer(mode: "json" | "dirty" | "timeout" | "brief" | "invalid" | "se
   mkdirSync(join(userHome, ".codex"), { recursive: true });
   writeFileSync(join(userHome, ".codex", "config.toml"), 'model = "fixture-model"\n');
   // A case that removes an executable the fixture provides means the run has none, so PATH is the fixture bin plus the
-  // system directories git and sh live in. Inheriting the host PATH lets an installed one answer a case that has none.
+  // system directories git and sh live in - never the host PATH, which lets an installed one answer a case that has
+  // none. The host's own git is linked into the bin, because the macOS system copy is a stub that re-execs it.
+  symlinkSync(hostGit(), join(bin, "git"));
   const repo = fixture({ HOME: userHome, PATH: `${bin}:/usr/bin:/bin`, OPENAI_API_KEY: "fixture-not-for-reviewer" });
   const { git, write } = repo;
   git("remote", "add", "origin", "https://github.com/owner/repo.git");

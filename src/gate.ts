@@ -284,6 +284,16 @@ export function gateCommand(cwd: string, args: readonly string[]): number {
       ...(parsed.flags["--head"]?.at(-1) === undefined ? {} : { head: parsed.flags["--head"]!.at(-1)! }),
       ...(prFlag === undefined ? {} : { pr: prFlag === "none" ? "none" : Number(prFlag) }),
     });
+    // The spec's ledger has a `gate` event, so every evaluation is recorded: never inside the pure decision, and before
+    // the post preflight, so an evaluation the preflight refuses is still an answer the ledger holds. The decision reads
+    // only record, resolve and packet events, so writing it changes no later answer.
+    appendEvent(cwd, {
+      v: 1, type: "gate", at: new Date().toISOString(), head: result.head,
+      ...(result.mergeBase === undefined ? {} : { base: result.mergeBase }),
+      ok: result.ok,
+      ...(result.record === undefined ? {} : { record: result.record }),
+      ...(result.open.length === 0 ? {} : { open: result.open }),
+    });
     // A commit status belongs to the commit, not to the PR: on a head more than one thread reviewed, a success posted
     // from one PR's pass shows on every other PR's checks, which is a status the gate did not pass there. The plain gate
     // still answers for the thread it was asked about; only the post refuses, and it refuses before any GitHub call.
@@ -324,16 +334,6 @@ export function gateCommand(cwd: string, args: readonly string[]): number {
         checkBase(cwd, result, own);
       }
     }
-    // The spec's ledger has a `gate` event, so each evaluation is recorded: it is written here, never inside the pure
-    // decision, and it sits before the `post` event because a pass posts after this line. The decision reads only
-    // record, resolve and packet events, so writing it changes no later answer.
-    appendEvent(cwd, {
-      v: 1, type: "gate", at: new Date().toISOString(), head: result.head,
-      ...(result.mergeBase === undefined ? {} : { base: result.mergeBase }),
-      ok: result.ok,
-      ...(result.record === undefined ? {} : { record: result.record }),
-      ...(result.open.length === 0 ? {} : { open: result.open }),
-    });
     if (parsed.flags["--post"] !== undefined) {
       // No status is ever posted for a head the gate did not pass, and a failing gate posts nothing.
       if (!result.ok || result.record === undefined) {

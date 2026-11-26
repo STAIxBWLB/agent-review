@@ -343,11 +343,22 @@ export function ledgerEventsView(events: readonly LedgerEvent[], head?: string):
     }
   }
 
-  const findings = findingsForHead(sets, target).map(finding => ({
-    ...finding,
-    ...(shown.get(finding.id)?.text === undefined ? {} : { text: shown.get(finding.id)!.text }),
-    ...(evidence.has(finding.id) ? { evidence: evidence.get(finding.id)! } : {}),
-  }));
+  const findings = findingsForHead(sets, target).map(finding => {
+    // The lifecycle merges a carried id across every record, so its path and anchor can describe a later head than the
+    // one shown. Path, anchor and text all come from the last record at or before this head, like the evidence beside
+    // them; only the disposition comes from the replay.
+    const source = shown.get(finding.id);
+    const base = { ...finding };
+    delete base.path;
+    delete base.anchor;
+    return {
+      ...base,
+      ...(source?.path === undefined ? {} : { path: source.path }),
+      ...(source?.anchor === undefined ? {} : { anchor: source.anchor as ReviewAnchor }),
+      ...(source?.text === undefined ? {} : { text: source.text }),
+      ...(evidence.has(finding.id) ? { evidence: evidence.get(finding.id)! } : {}),
+    };
+  });
   // A record's own packet is the one its report was validated against, so it wins over the newest packet event for the
   // head: a later packet (a re-run, a new base) describes a review this head's record never saw.
   const recordedPacket = recordEvent?.type === "record" ? recordEvent.record.packet : undefined;

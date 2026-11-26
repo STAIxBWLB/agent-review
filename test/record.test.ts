@@ -204,17 +204,19 @@ test("the view carries an open blocking finding to a later head and a resolve se
   expect(unknownHead.record).toBeUndefined();
 });
 
-test("the view shows a finding's text from the records it replays, never from a later head", () => {
+test("the view shows a finding's path, anchor and text from the records it replays, never from a later head", () => {
+  const anchor = (path: string) => ({ path, side: "head", selectors: [{ kind: "lineRange", startLine: 1, endLine: 2 }] });
   const events: LedgerEvent[] = [
     { v: 1, type: "packet", at: "t0", packet: packetFor(HEAD) },
-    { v: 1, type: "record", at: "t1", id: "record-1", record: recordAt(HEAD, [finding({ text: "the frame is missing at the merge base" })]) },
+    { v: 1, type: "record", at: "t1", id: "record-1", record: recordAt(HEAD, [finding({ path: "src/a.ts", anchor: anchor("src/a.ts"), text: "the frame is missing at the merge base" })]) },
     { v: 1, type: "packet", at: "t2", packet: packetFor(NEXT) },
-    { v: 1, type: "record", at: "t3", id: "record-2", record: recordAt(NEXT, [finding({ text: "recorded against a later head" })]) },
+    { v: 1, type: "record", at: "t3", id: "record-2", record: recordAt(NEXT, [finding({ path: "src/b.ts", anchor: anchor("src/b.ts"), text: "recorded against a later head" })]) },
   ];
-  const text = (head: string) => ledgerEventsView(events, head).findings.find(entry => entry.id === "bugs:missing-frame")?.text;
-  // The carried blocking finding is HEAD's, so its text is HEAD's report; NEXT's own record is what NEXT's view prints.
-  expect(text(HEAD)).toBe("the frame is missing at the merge base");
-  expect(text(NEXT)).toBe("recorded against a later head");
+  const shown = (head: string) => ledgerEventsView(events, head).findings.find(entry => entry.id === "bugs:missing-frame");
+  // The carried blocking finding is HEAD's, so everything it describes is HEAD's report; NEXT's own record is what
+  // NEXT's view prints. The lifecycle merges the id across heads, so a later path is what this case catches.
+  expect(shown(HEAD)).toMatchObject({ path: "src/a.ts", anchor: { path: "src/a.ts" }, text: "the frame is missing at the merge base" });
+  expect(shown(NEXT)).toMatchObject({ path: "src/b.ts", anchor: { path: "src/b.ts" }, text: "recorded against a later head" });
 });
 
 test("arev record, resolve and show read and append the same ledger", () => {

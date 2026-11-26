@@ -381,14 +381,16 @@ test("file and directory swaps keep denied and sibling patches out of each patch
   assertExact(isolatedPacket(dir, { kind: "commit", commit: "HEAD" }));
 });
 
-test("local diff ordering cannot change packet identity", () => {
+test("local diff and path quoting settings cannot change packet identity", () => {
   const { dir, git, write } = fixture();
   write("a.txt", "before\n");
   write("z.txt", "before\n");
+  write("é.txt", "before\n");
   git("add", ".");
   git("commit", "-qm", "base");
   write("a.txt", "after a\n");
   write("z.txt", "after z\n");
+  write("é.txt", "after é\n");
   git("commit", "-qam", "head");
   const request = { kind: "commit", commit: "HEAD" } as const;
   const initial = isolatedPacket(dir, request);
@@ -401,6 +403,14 @@ test("local diff ordering cannot change packet identity", () => {
     git("config", option, "true");
     git("config", "diff.indentHeuristic", "false");
     expect(isolatedPacket(dir, request)).toEqual(initial);
+  }
+  for (const quotePath of ["true", "false"]) {
+    git("config", "core.quotePath", quotePath);
+    const rebuilt = isolatedPacket(dir, request);
+    expect(rebuilt.packet.units.some(unit => unit.path === "é.txt")).toBe(true);
+    expect(rebuilt.packet.diffSha256).toBe(initial.packet.diffSha256);
+    expect(rebuilt.packet.id).toBe(initial.packet.id);
+    expect(rebuilt.diff).toBe(initial.diff);
   }
   expect(initial.diff).toContain("diff --git a/a.txt b/a.txt");
 });

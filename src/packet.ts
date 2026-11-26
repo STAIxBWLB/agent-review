@@ -51,6 +51,7 @@ const MAX_PACKET_BYTES = 8 * 1024 * 1024;
 const LOCKFILES = new Set(["bun.lock", "bun.lockb", "package-lock.json", "yarn.lock",
   "pnpm-lock.yaml", "Cargo.lock", "poetry.lock", "uv.lock", "go.sum", "composer.lock", "Gemfile.lock"]);
 const RENAME_OPTIONS = ["-l0", "-M", "-C", "--find-copies-harder"];
+const DIFF_CONFIG = ["-c", "core.quotePath=true"];
 const DIFF_OPTIONS = ["--no-ext-diff", "--no-textconv", "--no-color", "--ignore-submodules=dirty",
   "-O/dev/null", "-U3", "--inter-hunk-context=0", "--diff-algorithm=myers",
   "--src-prefix=a/", "--dst-prefix=b/", "--indent-heuristic"];
@@ -207,13 +208,13 @@ export function buildPacket(cwd: string, request: PacketRequest): PacketBundle {
     "untracked paths",
   ));
   const tracked = pathGroups(checkedOutput(
-    reviewGit(root, [...gitOptions, `--attr-source=${subject.mergeBase}`, "diff", ...DIFF_OPTIONS,
+    reviewGit(root, [...gitOptions, ...DIFF_CONFIG, `--attr-source=${subject.mergeBase}`, "diff", ...DIFF_OPTIONS,
       "--ignore-submodules=none", ...RENAME_OPTIONS, "--name-status", "-z", subject.head, "--"]),
     "workspace paths in the real Git index",
   ));
   const renamed = new Set(tracked.filter(group => group.status === "R").map(group => group.paths[0]!));
   const stagedDeletions = new Set(untracked.length === 0 ? [] : names(checkedOutput(
-    reviewGit(root, [...gitOptions, "diff", "--cached", "--no-renames", "--diff-filter=D",
+    reviewGit(root, [...gitOptions, ...DIFF_CONFIG, "diff", "--cached", "--no-renames", "--diff-filter=D",
       "--name-only", "-z", subject.head, "--"]),
     "staged deletions",
   )));
@@ -272,7 +273,7 @@ function buildPacketFromIndex(
     // by escaping one leading character and all glob metacharacters.
     const exact = paths.map(path =>
       `:(top,glob)\\${path[0]!}${path.slice(1).replace(/[\\*?\[\]]/g, "\\$&")}`);
-    return reviewGit(root, [...gitOptions, `--attr-source=${subject.mergeBase}`, "diff", ...DIFF_OPTIONS,
+    return reviewGit(root, [...gitOptions, ...DIFF_CONFIG, `--attr-source=${subject.mergeBase}`, "diff", ...DIFF_OPTIONS,
       ...options, ...trees, "--", ...exact], {
       indexFile, literalPathspecs: exact.length === 0, maxBuffer: maxBuffer ?? 16 * 1024 * 1024,
     });

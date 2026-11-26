@@ -484,6 +484,44 @@ test("light comes only from the --light flag, and a report that carries it is re
   expect(() => parseReviewRecord(reportFor(HEAD, { light: false }), options)).toThrow("the report has an unknown field (light)");
 });
 
+test("an abbreviated --head selects the full recorded head, and one that names no commit is refused", () => {
+  const { root, repo, home } = fixture();
+  const commit = (body: string, message: string) => {
+    writeFileSync(join(repo, "a.ts"), body);
+    git(repo, ["add", "a.ts"]);
+    git(repo, ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", message]);
+    return gitOut(repo, ["rev-parse", "HEAD"]);
+  };
+  const base = commit("export const a = 1;\n", "base");
+  const head = commit("export const a = 2;\n", "head");
+  const built = JSON.parse(run(repo, home, "packet", "--from", base, "--to", head, "--json").stdout);
+  const report = join(root, "report.json");
+  writeFileSync(report, JSON.stringify(reportFor(head, {
+    packet: { id: built.id, subject: built.subject },
+    coverage: { reviewed: built.units.map((unit: { path: string }) => unit.path), skipped: [] },
+  })));
+  const recorded = JSON.parse(run(repo, home, "record", report, "--json").stdout);
+
+  // The ledger spells heads as full OIDs, so a commit id the caller may type is resolved first: comparing the
+  // abbreviation to `subject.head` would answer the ledger's silence for a head arev never looked up.
+  const abbreviated = run(repo, home, "show", "--head", head.slice(0, 12), "--json");
+  expect(abbreviated.code).toBe(0);
+  expect(JSON.parse(abbreviated.stdout)).toMatchObject({ head, record: recorded.id });
+  // `resolve` reads the same flag through the same resolution, so a short head settles the finding it names.
+  const resolved = run(repo, home, "resolve", "bugs:short-head", "--as", "fixed", "--head", head.slice(0, 12));
+  expect(resolved.code).toBe(1);
+  expect(resolved.stderr).toContain("no record at " + head + " reports the finding bugs:short-head");
+
+  // A hexadecimal value that resolves to no commit is refused by name, not answered as a head with no review: the two
+  // are different facts, and only one of them is about the ledger.
+  for (const args of [["show", "--head", "deadbeef1234", "--json"], ["resolve", "bugs:one", "--as", "fixed", "--head", "deadbeef1234"]] as const) {
+    const refused = run(repo, home, ...args);
+    expect(refused.code, args.join(" ")).toBe(1);
+    expect(refused.stderr, args.join(" ")).toContain("--head deadbeef1234 does not name a commit in this repository");
+    expect(refused.stderr, args.join(" ")).toContain("→ pass the full 40-character head SHA, or fetch that commit and retry");
+  }
+});
+
 test("arev record --light keeps the flag on the record it appends, and show --json echoes it", () => {
   const { root, repo, home } = fixture();
   const commit = (body: string, message: string) => {

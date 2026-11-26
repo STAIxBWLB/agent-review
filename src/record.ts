@@ -17,6 +17,7 @@ import { sanitize } from "./frame.ts";
 import { MAX_REPORT_BYTES, Refusal, appendEvent, readLedger, recordId, reviewProjectId, secretShaped, stringsIn, type LedgerEvent, type PacketBlock, type RecordFinding, type ReviewRecordV1 } from "./ledger.ts";
 import { buildPacket, type PacketRequest } from "./packet.ts";
 import { PacketUsageError } from "./packet-cli.ts";
+import { reviewGit } from "./review-git.ts";
 import { DEFAULT_ADVISORY_CAP, MAX_ADVISORY_CAP } from "./review-md.ts";
 
 const MAX_FINDINGS = MAX_ADVISORY_CAP, MAX_FINDING_BYTES = 64 * 1024;
@@ -33,6 +34,21 @@ function refuse(message: string, next: string): never {
 const FULL_OID = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 /** A commit id as a caller may type it on the command line: hexadecimal, full or abbreviated. */
 const COMMITISH = /^(?:[a-f0-9]{4,64})$/;
+/**
+ * A `--head` value as the ledger spells heads. An abbreviation is a commit id the caller may type, so it is resolved
+ * against this repository: comparing it to `subject.head` would report the ledger's silence for a head arev never
+ * looked up. A value that resolves to no commit here is refused by name, because "no review at that head" and "that is
+ * not a head here" are different facts. Callers shape-check the value with `COMMITISH` first, so this echo is hex.
+ */
+function resolveHead(cwd: string, value: string): string {
+  if (FULL_OID.test(value)) return value;
+  const result = reviewGit(cwd, ["rev-parse", "--verify", "-q", `${value}^{commit}`]);
+  if (result.status !== 0) {
+    throw new Refusal(`--head ${value} does not name a commit in this repository`,
+      "pass the full 40-character head SHA, or fetch that commit and retry");
+  }
+  return result.stdout.replace(/\r?\n$/, "");
+}
 /** A packet id is the sha256 of the packet's canonical JSON: a report's claim on it is checked before it is looked up. */
 const PACKET_ID = /^[a-f0-9]{64}$/;
 /** A review thread is a PR number, in the shape `arev packet --pr` takes it. */
@@ -664,7 +680,9 @@ export function resolveCommand(cwd: string, args: readonly string[]): number {
     // is the thread with no PR, so it reads the newest record that names none.
     const newestRecord = [...events].reverse().find(event => event.type === "record"
       && (pr === undefined || threadOf(event.record.packet.subject) === (pr === "none" ? undefined : pr)));
-    const head = headFlag ?? (newestRecord?.type === "record" ? newestRecord.record.packet.subject.head : undefined);
+    const head = headFlag === undefined
+      ? (newestRecord?.type === "record" ? newestRecord.record.packet.subject.head : undefined)
+      : resolveHead(cwd, headFlag);
     if (!head) throw new Refusal("the ledger has no head to resolve against", "pass --head <sha> or record a review first");
     // The thread is the head's own: `--pr` when given, else the only thread that head carries, refused when it carries
     // more than one. The resolve states it on the event, and it refuses an id that thread never reported, so one PR's
@@ -705,12 +723,15 @@ export function showCommand(cwd: string, args: readonly string[]): number {
   const headFlag = parsed.flags["--head"]?.at(-1);
   if (headFlag !== undefined && !COMMITISH.test(headFlag)) return usageError("--head must be a commit SHA: 4 to 64 hexadecimal characters");
   try {
+    // Resolved before the ledger is read: a `--head` that names no commit here is refused on its own terms, whether or
+    // not this project has a ledger yet.
+    const head = headFlag === undefined ? undefined : resolveHead(cwd, headFlag);
     const events = readLedger(cwd);
     if (events.length === 0) {
       console.log(`no review ledger for ${reviewProjectId(cwd)} yet; next: arev packet --pr N --out DIR`);
       return EXIT.ok;
     }
-    const view = ledgerEventsView(events, headFlag, pr);
+    const view = ledgerEventsView(events, head, pr);
     if (parsed.flags["--json"] !== undefined) {
       console.log(JSON.stringify(view, null, 2));
       return EXIT.ok;

@@ -186,6 +186,8 @@ export function gateCommand(cwd: string, args: readonly string[]): number {
     // A commit status belongs to the commit, not to the PR: on a head more than one thread reviewed, a success posted
     // from one PR's pass shows on every other PR's checks, which is a status the gate did not pass there. The plain gate
     // still answers for the thread it was asked about; only the post refuses, and it refuses before any GitHub call.
+    // The set is deliberately "a packet or a record": a PR that has only built its packet still has checks on this
+    // commit, so narrowing this to recorded threads (as the head's ambiguity decision does) would post over it.
     if (parsed.flags["--post"] !== undefined) {
       const threads = threadsAtHead(readLedger(cwd), result.head);
       if (threads.length > 1) {

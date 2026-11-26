@@ -330,6 +330,23 @@ test("--post refuses a head more than one thread reviewed, because a commit stat
   expect(answered.stdout).toContain("gate: passes");
 });
 
+test("--post refuses a shared head even when the other thread has only built its packet", () => {
+  const { repo, base, head, home } = fixture();
+  const seven: Subject = { kind: "range", base, head, mergeBase: base, pr: 7 };
+  const eight: Subject = { kind: "range", base, head, mergeBase: base, pr: 8 };
+  seed({ repo, home, subject: seven, record: recordFor(seven) });
+  // PR 8 built its packet for this head and has not recorded a review yet: its checks still live on this commit, so a
+  // success posted from PR 7 would satisfy them. The set is "a packet or a record", never a record alone.
+  appendEvent(repo, { v: 1, type: "packet", at: "2026-01-01T00:00:02.000Z", packet: packetFor(eight) }, { home });
+
+  const args = join(home, "gh-args.txt");
+  const refused = run(repo, { PATH: `${fakeGh(args)}:${process.env.PATH ?? ""}`, AGENTHUB_HOME: home }, "gate", "--pr", "7", "--post");
+  expect(refused.code).toBe(1);
+  expect(refused.stderr).toContain(`head ${head} has packets or records in more than one thread (PR 7, PR 8)`);
+  expect(existsSync(args)).toBe(false);
+  expect(events(repo, home).filter(event => event.type === "gate" || event.type === "post")).toEqual([]);
+});
+
 test("REVIEW.md must be at the merge base unless the record says --light", () => {
   const { repo, base, head } = fixture(null);
   const subject: Subject = { kind: "range", base, head, mergeBase: base };

@@ -1,9 +1,10 @@
 import { closeSync, mkdirSync, openSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { parseArgs } from "node:util";
-import { appendEvent } from "./ledger.ts";
+import { EXIT, errorLine } from "@staix/cli-output";
+import { Refusal, appendEvent } from "./ledger.ts";
 import { buildPacket, repositoryPath, type PacketRequest } from "./packet.ts";
-import { parseReviewMd } from "./review-md.ts";
+import { parseReviewMd, type ReviewMdSettings } from "./review-md.ts";
 import { commitOid, mergeBaseOid, repositoryRoot, reviewGit } from "./review-git.ts";
 import { readRules, renderRules } from "./rules.ts";
 
@@ -26,7 +27,7 @@ function packetArgs(args: readonly string[]) {
   }
 }
 
-export function runPacket(cwd: string, args: readonly string[]): void {
+export function runPacket(cwd: string, args: readonly string[]): number | void {
   const { values, positionals, tokens } = packetArgs(args);
   const seen = new Set<string>();
   let takingFiles = false;
@@ -63,7 +64,15 @@ export function runPacket(cwd: string, args: readonly string[]): void {
   // where that packet is kept, so it is written before the reviewer can hold a packet.json without one. REVIEW.md's
   // settings are read from the same merge-base rule text the packet was built from, and the cap is kept with the event
   // so the report is checked against the REVIEW.md this packet was built under.
-  const settings = parseReviewMd(readRules(repositoryRoot(cwd), bundle.packet.subject.mergeBase, []).rules);
+  let settings: ReviewMdSettings;
+  try {
+    settings = parseReviewMd(readRules(repositoryRoot(cwd), bundle.packet.subject.mergeBase, []).rules);
+  } catch (error) {
+    // The next step is the REVIEW.md line to change, not this command's help, so the refusal is printed as it stands.
+    if (!(error instanceof Refusal)) throw error;
+    for (const line of errorLine("arev", error.message, "", { tty: Boolean(process.stderr.isTTY), next: error.next })) console.error(line);
+    return EXIT.fail;
+  }
   appendEvent(cwd, { v: 1, type: "packet", at: new Date().toISOString(), packet: bundle.packet, review: { advisory_cap: settings.advisoryCap } });
   const json = JSON.stringify(bundle.packet, null, 2);
   if (values.out !== undefined) {

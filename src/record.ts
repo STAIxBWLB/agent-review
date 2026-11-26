@@ -23,7 +23,7 @@ const MAX_ID = 96, MAX_PATH = 512, MAX_TEXT = 2048, MAX_REF = 512, MAX_NAME = 12
 const TERMS = ["bugs", "security", "compliance"] as const, SEVERITIES = ["blocking", "advisory"] as const;
 const DISPOSITIONS = ["open", "fixed", "false_positive", "accepted"] as const, ORIGINS = ["introduced", "pre_existing", "indeterminate"] as const;
 const FINDING_FIELDS = ["id", "term", "severity", "path", "anchor", "text", "disposition", "rationale", "origin", "evidence"];
-const RECORD_FIELDS = ["v", "packet", "reviewer", "coverage", "findings", "verdict", "call"];
+const RECORD_FIELDS = ["v", "packet", "reviewer", "coverage", "findings", "verdict", "call", "light"];
 
 function refuse(message: string, next: string): never {
   throw new Refusal(message, next);
@@ -111,7 +111,7 @@ export interface RecordOptions {
   person: boolean;
   /** `--implementer`; when the report also states one, the two must agree. */
   implementer?: string;
-  /** `--light`: the review was made without a REVIEW.md, which the gate then accepts. */
+  /** `--light`: the review was made without a REVIEW.md; the report's own `light` states the same fact. */
   light?: boolean;
 }
 
@@ -128,6 +128,9 @@ export function parseReviewRecord(raw: unknown, options: RecordOptions): ReviewR
   const row = closed(raw, RECORD_FIELDS, "the report");
   if (!row) refuse("the report must be a plain JSON object with own data fields only", "write the report as JSON with no accessors, prototypes or hidden fields");
   if (row.v !== 1) refuse(`the report's v must be the number 1 (got ${jsonType(row.v)}); this arev reads v: 1`, "set v to 1 in the report");
+  if (row.light !== undefined && typeof row.light !== "boolean") {
+    refuse(`the report's light must be true or false (got ${jsonType(row.light)})`, "set light to true when the review was made without a REVIEW.md, or drop it");
+  }
 
   const claim = row.packet;
   const declaredId = own(claim, "id"), declaredHead = own(own(claim, "subject"), "head");
@@ -246,8 +249,8 @@ export function parseReviewRecord(raw: unknown, options: RecordOptions): ReviewR
     findings,
     verdict: oneOf(row.verdict, ["approved", "changes_requested"] as const, "verdict"),
     call,
-    // `--light` is the reviewer's claim about the run, not a report field: it travels only when it was passed.
-    ...(options.light ? { light: true } : {}),
+    // Either the flag or the report may state it; both name the same fact, so either one sets it and the record carries it.
+    ...(options.light || row.light === true ? { light: true } : {}),
   };
 }
 
@@ -260,6 +263,8 @@ export interface ReviewView {
   record?: string;
   verdict?: ReviewRecordV1["verdict"];
   call?: ReviewRecordV1["call"];
+  /** The record's own lightness, so `arev show` echoes what `arev record --light` wrote. */
+  light?: boolean;
   findings: (ReviewFinding & { text?: string; evidence?: string[] })[];
   counts: ReviewFindingTally;
   openBlocking: string[];
@@ -349,6 +354,7 @@ export function ledgerEventsView(events: readonly LedgerEvent[], head?: string):
     ...(packetId === undefined ? {} : { packet: packetId }),
     ...(recordEvent?.type === "record" ? { record: recordEvent.id } : {}),
     ...(recordEvent?.type === "record" ? { verdict: recordEvent.record.verdict, call: recordEvent.record.call } : {}),
+    ...(recordEvent?.type === "record" && recordEvent.record.light ? { light: true } : {}),
     findings,
     counts: findingTally(findings),
     openBlocking: findings.filter(blocksApproval).map(finding => finding.id),
@@ -510,7 +516,7 @@ export function showCommand(cwd: string, args: readonly string[]): number {
       return EXIT.ok;
     }
     console.log(`head ${view.head ?? "(none)"}${view.base ? ` base ${view.base}` : ""}${view.mergeBase ? ` merge-base ${view.mergeBase}` : ""}`);
-    console.log(`packet ${view.packet ?? "(none)"} record ${view.record ?? "(none)"}${view.verdict ? ` verdict ${view.verdict}` : ""}${view.call ? ` call ${view.call.ok ? "ok" : "failed"}` : ""}`);
+    console.log(`packet ${view.packet ?? "(none)"} record ${view.record ?? "(none)"}${view.verdict ? ` verdict ${view.verdict}` : ""}${view.call ? ` call ${view.call.ok ? "ok" : "failed"}` : ""}${view.light ? " light" : ""}`);
     const counts = view.counts;
     console.log(`findings: ${counts.important} blocking (${counts.openImportant} open), ${counts.nit} advisory (${counts.openNit} open), ${counts.fixed} fixed, ${counts.falsePositive} false_positive, ${counts.accepted} accepted`);
     for (const finding of view.findings) {

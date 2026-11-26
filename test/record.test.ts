@@ -254,13 +254,15 @@ test("arev record without a packet for the head names the packet command", () =>
   expect(result.stderr).toContain("arev packet");
 });
 
-test("--light is the record's claim about its run, never a report field", () => {
+test("light is a record field, set by the flag or stated in the report", () => {
   expect(parseReviewRecord(reportFor(HEAD), options).light).toBeUndefined();
   expect(parseReviewRecord(reportFor(HEAD), { ...options, light: true }).light).toBe(true);
-  expect(() => parseReviewRecord(reportFor(HEAD, { light: true }), options)).toThrow("has an unknown field (light)");
+  expect(parseReviewRecord(reportFor(HEAD, { light: true }), options).light).toBe(true);
+  // It is a declared field, so a wrong type is refused by name rather than ignored.
+  expect(() => parseReviewRecord(reportFor(HEAD, { light: SECRET }), options)).toThrow("the report's light must be true or false (got string)");
 });
 
-test("arev record --light keeps the flag on the record it appends", () => {
+test("arev record --light keeps the flag on the record it appends, and show --json echoes it", () => {
   const { root, repo, home } = fixture();
   const commit = (body: string, message: string) => {
     writeFileSync(join(repo, "a.ts"), body);
@@ -280,15 +282,21 @@ test("arev record --light keeps the flag on the record it appends", () => {
   })));
 
   expect(run(repo, home, "record", report, "--light").code).toBe(0);
+  const light = JSON.parse(run(repo, home, "show", "--json").stdout);
+  expect(light.light).toBe(true);
+  expect(run(repo, home, "show").stdout).toContain(`record ${light.record} verdict approved call ok light`);
+
+  // The same report without the flag is a different record, and it is not light.
   expect(run(repo, home, "record", report).code).toBe(0);
+  const plain = JSON.parse(run(repo, home, "show", "--json").stdout);
+  expect(plain.light).toBeUndefined();
+  expect(plain.record).not.toBe(light.record);
+
   const records = readFileSync(join(home, "review", "github.com/owner/repo", "ledger.jsonl"), "utf8")
     .split("\n").filter(Boolean).map(line => JSON.parse(line)).filter(event => event.type === "record");
-
   expect(records).toHaveLength(2);
   expect(records[0].record.light).toBe(true);
   expect(records[1].record.light).toBeUndefined();
-  // The flag is part of the record, so it is part of the id the merge-time gate names.
-  expect(records[1].id).not.toBe(records[0].id);
 });
 
 const SECRET = `ghp_${"a".repeat(36)}`;

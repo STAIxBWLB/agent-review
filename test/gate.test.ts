@@ -109,7 +109,7 @@ function seed(options: { repo: string; home: string; subject: Subject; record: R
 /**
  * A `gh` that records its arguments instead of making a network call: the status write's to `argsPath`, the pull-request
  * read's to `argsPath.read`. `FAKE_GH_PULLS` is the JSON the read returns - a page array when the case exercises
- * pagination - and `FAKE_GH_ERROR` makes the write fail.
+ * pagination - `FAKE_GH_READ_ERROR` makes the read fail and `FAKE_GH_ERROR` makes the write fail.
  */
 function fakeGh(argsPath: string): string {
   const bin = temp("arev-bin-");
@@ -119,6 +119,7 @@ function fakeGh(argsPath: string): string {
     'case "$*" in',
     "  *repos/*/pulls*)",
     `    for arg in "$@"; do printf '%s\\n' "$arg" >> ${JSON.stringify(argsPath)}.read; done`,
+    '    if [ -n "$FAKE_GH_READ_ERROR" ]; then printf "%s\\n" "$FAKE_GH_READ_ERROR" >&2; exit 1; fi',
     '    printf \'%s\' "${FAKE_GH_PULLS:-[]}"',
     "    exit 0 ;;",
     "esac",
@@ -741,4 +742,37 @@ test("a gate that fails posts nothing, and a failed write is not recorded as pos
   expect(refused.stderr).toContain("HTTP 403: Resource not accessible by integration");
   expect(refused.stderr).toContain("gh is authenticated");
   expect(events(passing.repo, passing.home).some(event => event.type === "post" && event.record === id)).toBe(false);
+});
+
+test("a secret-shaped gh diagnostic is withheld from both refusals and from the ledger", () => {
+  // gh's stderr is data read from outside arev, so it is screened like a path or a report field: a token-shaped line
+  // leaves `<withheld>` where the detail was. The plain 403 above is the other half of that pair, still echoed.
+  const token = `ghp_${"A".repeat(36)}`;
+  const { repo, base, head, home } = fixture();
+  const subject: Subject = { kind: "range", base, head, mergeBase: base, pr: 7 };
+  seed({ repo, home, subject, record: recordFor(subject) });
+  const args = join(home, "gh-args.txt");
+  const env = (more: Record<string, string>) => ({ PATH: `${fakeGh(args)}:${process.env.PATH ?? ""}`, AGENTHUB_HOME: home, ...more });
+  // The whole ledger, not just the events a reader parses: no line of it may carry the token.
+  const ledgerText = () => readFileSync(ledgerPath(repo, { home }), "utf8");
+
+  // The read of the open pull requests fails with the token on stderr.
+  const read = run(repo, env({ FAKE_GH_READ_ERROR: `HTTP 401: bad credentials (${token})` }), "gate", "--pr", "7", "--post");
+  expect(read.code).toBe(1);
+  expect(read.stderr).toContain(`cannot read the open pull requests at ${head}: <withheld>`);
+  expect(read.stderr).not.toContain(token);
+  expect(ledgerText()).not.toContain(token);
+  // The evaluation that ran before the preflight is in the ledger; the status write is not.
+  expect(gating(repo, home).map(event => event.type)).toEqual(["gate"]);
+
+  // The status write fails with the token on stderr, after the read succeeded and listed only this PR.
+  const write = run(repo,
+    { ...env({ FAKE_GH_ERROR: `HTTP 403: Resource not accessible by integration (${token})` }),
+      FAKE_GH_PULLS: JSON.stringify([{ number: 7, state: "open", head: { sha: head }, base: { sha: base } }]) },
+    "gate", "--pr", "7", "--post");
+  expect(write.code).toBe(1);
+  expect(write.stderr).toContain(`cannot post the arev/gate status on ${head}: <withheld>`);
+  expect(write.stderr).not.toContain(token);
+  expect(ledgerText()).not.toContain(token);
+  expect(gating(repo, home).map(event => event.type)).toEqual(["gate", "gate"]);
 });

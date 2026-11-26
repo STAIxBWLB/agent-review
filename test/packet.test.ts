@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { expect, test } from "bun:test";
 import { copyFileSync, readFileSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -227,6 +228,7 @@ test("a deleted source can become a rename and a copy in one packet", () => {
   expect(bundle.packet.units.map(({ status }) => status).sort()).toEqual(["C", "R"]);
   assertParity(bundle.packet, ["first.txt", "second.txt"]);
   expect(bundle.diff).toContain("second variation");
+  expect(bundle.brief).toContain("Git can label a copy as a rename");
 });
 
 test("a shallow boundary commit refuses an incomplete review base", () => {
@@ -395,7 +397,12 @@ test("local diff ordering cannot change packet identity", () => {
   git("config", "diff.context", "0");
   git("config", "diff.interHunkContext", "12");
   git("config", "diff.algorithm", "histogram");
-  expect(isolatedPacket(dir, request)).toEqual(initial);
+  for (const option of ["diff.noprefix", "diff.mnemonicPrefix"]) {
+    git("config", option, "true");
+    git("config", "diff.indentHeuristic", "false");
+    expect(isolatedPacket(dir, request)).toEqual(initial);
+  }
+  expect(initial.diff).toContain("diff --git a/a.txt b/a.txt");
 });
 
 test("an exact patch retains both sides of a rename into the old pathname", () => {
@@ -478,4 +485,63 @@ test("a temporary index keeps a same-size edit at the real index timestamp", () 
   assertParity(bundle.packet, ["tracked.txt", "untracked.txt"]);
   expect(bundle.diff).toContain("+edited");
   expect(readFileSync(index)).toEqual(before);
+});
+
+test("workspace packet identity binds changed content even if paths and counts stay the same", () => {
+  const { dir, git, write } = fixture();
+  write("file.txt", "original\n");
+  git("add", ".");
+  git("commit", "-qm", "base");
+  const request = { kind: "workspace" } as const;
+  write("file.txt", "first replacement\n");
+  const first = isolatedPacket(dir, request);
+  write("file.txt", "second replacement\n");
+  const second = isolatedPacket(dir, request);
+
+  expect(second.packet.units).toEqual(first.packet.units);
+  for (const bundle of [first, second]) {
+    expect(bundle.packet.diffSha256).toBe(createHash("sha256").update(bundle.diff).digest("hex"));
+  }
+  expect(second.packet.diffSha256).not.toBe(first.packet.diffSha256);
+  expect(second.packet.id).not.toBe(first.packet.id);
+});
+
+test("fixed range and commit packets have repeatable content digests and ids", () => {
+  const { dir, git, write } = fixture();
+  write("file.txt", "original\n");
+  git("add", ".");
+  git("commit", "-qm", "base");
+  const base = git("rev-parse", "HEAD").trim();
+  write("file.txt", "replacement\n");
+  git("commit", "-qam", "head");
+  const head = git("rev-parse", "HEAD").trim();
+  for (const request of [{ kind: "range", base, head }, { kind: "commit", commit: head }] as const) {
+    const first = isolatedPacket(dir, request);
+    expect(isolatedPacket(dir, request).packet).toEqual(first.packet);
+    expect(first.packet.diffSha256).toBe(createHash("sha256").update(first.diff).digest("hex"));
+  }
+  const firstPr = isolatedPacket(dir, { kind: "range", base, head, pr: 7 });
+  const secondPr = isolatedPacket(dir, { kind: "range", base, head, pr: 8 });
+  expect(firstPr.packet.subject.pr).toBe(7);
+  expect(secondPr.packet.subject.pr).toBe(8);
+  expect(firstPr.packet.diffSha256).toBe(secondPr.packet.diffSha256);
+  expect(firstPr.packet.id).not.toBe(secondPr.packet.id);
+});
+
+test("a staged deletion with an untracked copy gives an index repair hint", () => {
+  const { dir, git, write } = fixture();
+  const content = "identical fixture content\n".repeat(8);
+  write("a.txt", content);
+  git("add", ".");
+  git("commit", "-qm", "base");
+  git("rm", "--cached", "a.txt");
+  write("b.txt", content);
+  expect(() => isolatedPacket(dir, { kind: "workspace" })).toThrow(
+    "Git paired a staged deletion with an untracked copy while the original path remains on disk. Restore the original path in the index with git restore --staged or git add, then rebuild the packet.",
+  );
+  git("restore", "--staged", "--", "a.txt");
+  expect(isolatedPacket(dir, { kind: "workspace" }).packet.units.map(({ path }) => path)).toEqual(["b.txt"]);
+  git("rm", "--cached", "a.txt");
+  git("add", "--", "a.txt");
+  expect(isolatedPacket(dir, { kind: "workspace" }).packet.units.map(({ path }) => path)).toEqual(["b.txt"]);
 });

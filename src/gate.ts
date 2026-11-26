@@ -6,7 +6,7 @@
  */
 import { spawnSync } from "node:child_process";
 import { EXIT, errorLine } from "@staix/cli-output";
-import { Refusal, appendEvent, githubRepository, readLedger, type LedgerEvent, type ReviewRecordV1 } from "./ledger.ts";
+import { Refusal, appendEvent, githubRepository, readLedger, shown, type LedgerEvent, type ReviewRecordV1 } from "./ledger.ts";
 import { PR_NUMBER, ledgerEventsView, threadsAtHead } from "./record.ts";
 import { parseReviewMd } from "./review-md.ts";
 import { commitOid, mergeBaseOid, reviewGit } from "./review-git.ts";
@@ -56,6 +56,13 @@ function currentMergeBase(cwd: string, head: string): string {
 /** A SHA echoed back only when it is one: any other `--head` value is named by its length, never repeated. */
 const shownHead = (value: string): string =>
   HEX.test(value) ? ` (got ${value})` : ` (got ${value.length} characters that are not a hexadecimal commit SHA)`;
+
+/**
+ * The one line of a failed `gh` call a refusal may print. gh's own text is data read from outside arev, so it is
+ * screened like any other untrusted value: a secret-shaped line leaves the exit status as the only detail to name.
+ */
+const ghDetail = (result: { status: number | null; stdout: string; stderr: string }): string =>
+  shown((result.stderr || result.stdout || "").trim().split("\n").filter(Boolean)[0] ?? `gh exited ${result.status}`);
 
 /**
  * The gate's decision, with no output and no side effect. `head` defaults to the repository's current HEAD, and `pr`
@@ -160,8 +167,7 @@ function openPrsAt(cwd: string, repository: string, head: string): PullRequest[]
   const result = spawnSync("gh", ["api", "--hostname", "github.com", "--paginate", "--slurp", `repos/${repository}/commits/${head}/pulls`],
     { cwd, encoding: "utf8" });
   if (result.status !== 0) {
-    const detail = (result.stderr || result.stdout || "").trim().split("\n").filter(Boolean)[0] ?? `gh exited ${result.status}`;
-    throw new Refusal(`cannot read the open pull requests at ${head}: ${detail}`,
+    throw new Refusal(`cannot read the open pull requests at ${head}: ${ghDetail(result)}`,
       "check that gh is authenticated and may read this repository's pull requests");
   }
   let parsed: unknown;
@@ -230,8 +236,7 @@ export function postStatus(head: string, record: string, repository: string, cwd
   const result = spawnSync("gh", ["api", "--hostname", "github.com", "--method", "POST", `repos/${repository}/statuses/${head}`,
     "-f", "state=success", "-f", `context=${STATUS_CONTEXT}`, "-f", `description=${description}`], { cwd, encoding: "utf8" });
   if (result.status !== 0) {
-    const detail = (result.stderr || result.stdout || "").trim().split("\n").filter(Boolean)[0] ?? `gh exited ${result.status}`;
-    throw new Refusal(`cannot post the ${STATUS_CONTEXT} status on ${head}: ${detail}`,
+    throw new Refusal(`cannot post the ${STATUS_CONTEXT} status on ${head}: ${ghDetail(result)}`,
       "check that gh is authenticated and the token may write commit statuses for this repository");
   }
 }

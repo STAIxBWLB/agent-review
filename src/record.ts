@@ -140,6 +140,8 @@ function optionalText(row: Record<string, unknown>, key: string, max: number, fi
 }
 
 export interface RecordOptions {
+  /** Override the command named in report-validation repair guidance. */
+  retryCommand?: string;
   /** The packet arev built for this head, as the ledger holds it. */
   packet: PacketBlock;
   /** REVIEW.md's cap when the packet carries it, else `DEFAULT_ADVISORY_CAP`. */
@@ -159,6 +161,18 @@ export interface RecordOptions {
  * and never stated by a report. A `false_positive` without evidence is refused because AC4's gate could never pass on it.
  */
 export function parseReviewRecord(raw: unknown, options: RecordOptions): ReviewRecordV1 {
+  const { retryCommand } = options;
+  try {
+    return validateReviewRecord(raw, options);
+  } catch (error) {
+    if (retryCommand && error instanceof Refusal && error.next.includes("arev record")) {
+      throw new Refusal(error.message, error.next.replaceAll("arev record", () => retryCommand));
+    }
+    throw error;
+  }
+}
+
+function validateReviewRecord(raw: unknown, options: RecordOptions): ReviewRecordV1 {
   const cap = options.maxAdvisories ?? DEFAULT_ADVISORY_CAP;
   if (!Number.isSafeInteger(cap) || cap < 0 || cap > MAX_FINDINGS) refuse(`the advisory cap ${cap} is not an integer in 0-${MAX_FINDINGS}`, `fix review.advisory_cap in the packet, or omit it for the default ${DEFAULT_ADVISORY_CAP}`);
   const row = closed(raw, RECORD_FIELDS, "the report");
@@ -413,7 +427,7 @@ function recordedThreadsAtHead(events: readonly LedgerEvent[], head: string): (n
  * The review thread a caller names: a PR number, or `none` for the thread with no PR - the exact-head review a packet
  * built without `--pr` produces. `undefined` means undecided, never "the thread with no PR".
  */
-type ThreadSelector = number | "none";
+export type ThreadSelector = number | "none";
 
 /** The spellings to pass, in the ledger's own order, so a refusal's next step is a command a person can copy. */
 const prFlags = (threads: readonly (number | undefined)[]): string =>

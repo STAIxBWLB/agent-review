@@ -10,7 +10,7 @@ import { parseReviewRecord, requireCurrentPacket } from "./record.ts";
 type Row = Record<string, unknown>;
 const SHA = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const MAX_SOURCE_BYTES = 128 * 1024;
-const SENSITIVE_KEY = /secret|password|passwd|token|apikey|privatekey|credential|auth/;
+const SENSITIVE_KEY = /secret|password|passwd|token|apikey|privatekey|credential|authorization|oauth|^auth$/;
 const credentialKey = (key: string) => SENSITIVE_KEY.test(foldPathSegment(key).replace(/[_-]/g, ""));
 
 function invalid(message: string): never {
@@ -187,7 +187,8 @@ export function importCommand(cwd: string, args: readonly string[]): void {
       tokens.filter(token => token.kind === "option" && token.name === "from").length !== 1) {
     throw new PacketUsageError(usage);
   }
-  const report = readReport(resolve(cwd, positionals[0]!), values.from);
+  const file = positionals[0]!;
+  const report = readReport(resolve(cwd, file), values.from);
   const hub = values.from === "brief" && report.hub_review !== undefined
     ? requireRow(report.hub_review, "hub_review") : undefined;
   const format = hub ? "hub" : values.from;
@@ -235,7 +236,10 @@ export function importCommand(cwd: string, args: readonly string[]): void {
       sameFamilyFallback: false,
       ...reviewer,
     },
-  }, { packet: event.packet, maxAdvisories: event.review?.advisory_cap });
+  }, {
+    packet: event.packet, maxAdvisories: event.review?.advisory_cap,
+    retryCommand: `arev import --from ${values.from} '${shown(file).replaceAll("'", "'\\''")}'`,
+  });
   const id = recordId(record);
   appendEvent(cwd, { v: 1, type: "record", at: new Date().toISOString(), id, record,
     source: { format, report } });

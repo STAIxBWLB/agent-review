@@ -42,6 +42,7 @@ test("import refuses mismatched subjects, omitted coverage and secret fields bef
   expect(badBase.stderr).toContain("base differs");
   expect(noCoverage.status).toBe(1);
   expect(noCoverage.stderr).toContain("coverage omits");
+  expect(noCoverage.stderr).toContain("arev import --from ocr 'report.json'");
   expect(secret.status).toBe(1);
   expect(secret.stderr).toContain("credential field");
   expect(secret.stderr).not.toContain("fixture-sensitive-canary");
@@ -162,4 +163,11 @@ test("compound credential keys in hub arguments are refused before they enter th
     expect(readFileSync(ledger)).toEqual(before);
   }
   expect(cli("export", "--to", "hub").status).toBe(1);
+});
+
+test("ordinary author metadata is retained without triggering the credential screen", () => {
+  const { dir, home, ingest, load } = exchangeFixture();
+  expect(ingest("ocr", { ...load("ocr"), author: "fixture author" }).status).toBe(0);
+  const event = readLedger(dir, { home }).at(-1);
+  expect(event?.type === "record" && event.source?.report.author).toBe("fixture author");
 });

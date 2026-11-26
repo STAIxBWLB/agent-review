@@ -35,30 +35,55 @@ test("Markdown export frames user text and shows the lifecycle, finding and cove
   });
 });
 
-test("hub export applies a same-PR resolution at a later head to the earlier review", () => {
-  const { dir, home, cli, ingest, load, git, write, base, head } = exchangeFixture();
-  const savePacket = (head: string) => {
-    const { packet } = isolatedPacket(dir, { kind: "range", base, head, pr: 7 });
-    appendEvent(dir, { v: 1, type: "packet", at: "2026-11-26T00:00:00Z", packet }, { home });
-    return packet.id;
-  };
-  const report = load("hub");
-  const hub = report.hub_review as { findings: ({ id: string } & Record<string, unknown>)[] };
-  const original = { ...hub, verdict: "changes_requested",
-    findings: hub.findings.map(finding => ({ ...finding, severity: "important" })) };
-  expect(ingest("hub", { ...report, packet_id: savePacket(head), hub_review: original }).status).toBe(0);
-  expect(JSON.parse(cli("export", "--to", "hub", "--head", head).stdout)).toEqual(original);
-  write("src/rules.ts", "rule 5\n");
-  git("commit", "-qam", "later head");
-  const later = git("rev-parse", "HEAD").trim();
-  savePacket(later);
-  const resolved = cli("resolve", String(original.findings[0]?.id), "--as", "fixed", "--head", later, "--pr", "7");
-  expect(resolved.status).toBe(0);
+for (const [initial, disposition] of [["open", "fixed"], ["fixed", "false_positive"]] as const) {
+  test(`hub export applies a later same-PR ${disposition} to an earlier ${initial} finding`, () => {
+    const { dir, home, cli, ingest, load, git, write, base, head } = exchangeFixture();
+    const savePacket = (head: string) => {
+      const { packet } = isolatedPacket(dir, { kind: "range", base, head, pr: 7 });
+      appendEvent(dir, { v: 1, type: "packet", at: "2026-11-26T00:00:00Z", packet }, { home });
+      return packet.id;
+    };
+    const report = load("hub");
+    const hub = report.hub_review as { findings: ({ id: string } & Record<string, unknown>)[] };
+    const original = { ...hub, verdict: "changes_requested",
+      findings: hub.findings.map(finding => ({ ...finding, severity: "important", disposition: initial })) };
+    expect(ingest("hub", { ...report, packet_id: savePacket(head), hub_review: original }).status).toBe(0);
+    expect(JSON.parse(cli("export", "--to", "hub", "--head", head).stdout)).toEqual(original);
+    write("src/rules.ts", "rule 5\n");
+    git("commit", "-qam", "later head");
+    const later = git("rev-parse", "HEAD").trim();
+    savePacket(later);
+    const resolved = cli("resolve", String(original.findings[0]?.id), "--as", disposition, "--head", later, "--pr", "7",
+      ...(disposition === "false_positive" ? ["--evidence", "src/rules.ts:1"] : []));
+    expect(resolved.status).toBe(0);
 
-  const shown = cli("show", "--head", head, "--pr", "7", "--json");
-  expect(shown.status).toBe(0);
-  expect(JSON.parse(shown.stdout).openBlocking).toEqual([]);
-  const exported = cli("export", "--to", "hub", "--head", head);
-  expect(exported.status).toBe(0);
-  expect(JSON.parse(exported.stdout).findings[0].disposition).toBe("fixed");
+    const shown = cli("show", "--head", head, "--pr", "7", "--json");
+    expect(shown.status).toBe(0);
+    expect(JSON.parse(shown.stdout).openBlocking).toEqual([]);
+    const exported = cli("export", "--to", "hub", "--head", head);
+    expect(exported.status).toBe(0);
+    expect(JSON.parse(exported.stdout).findings[0].disposition).toBe(disposition);
+    if (initial === "fixed") expect(JSON.parse(shown.stdout).findings[0].disposition).toBe(disposition);
+  });
+}
+
+test("export selects numbered and no-PR records independently at a shared head", () => {
+  const { dir, home, cli, ingest, load, base, head } = exchangeFixture();
+  const report = load("hub");
+  const hub = report.hub_review as Record<string, unknown>;
+  const noPr = { ...hub, note: "no-PR review fixture" };
+  const seven = { ...hub, note: "PR 7 review fixture" };
+  expect(ingest("hub", { ...report, hub_review: noPr }).status).toBe(0);
+  const { packet } = isolatedPacket(dir, { kind: "range", base, head, pr: 7 });
+  appendEvent(dir, { v: 1, type: "packet", at: "2026-11-26T00:00:00Z", packet }, { home });
+  expect(ingest("hub", { ...report, hub_review: seven, packet_id: packet.id }).status).toBe(0);
+
+  const ambiguous = cli("export", "--to", "hub", "--head", head);
+  expect(ambiguous.status).toBe(1);
+  expect(ambiguous.stderr).toContain("--pr 7");
+  for (const [selector, expected] of [["none", noPr], ["7", seven]] as const) {
+    const result = cli("export", "--to", "hub", "--head", head, "--pr", selector);
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual(expected);
+  }
 });

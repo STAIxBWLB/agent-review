@@ -3,7 +3,7 @@ import { PacketUsageError } from "./packet-cli.ts";
 import { frame } from "./frame.ts";
 import { assertSafeExchange } from "./import.ts";
 import { readLedger, type LedgerEvent, type RecordFinding, type ReviewRecordV1 } from "./ledger.ts";
-import { ledgerEventsView, type ReviewView } from "./record.ts";
+import { PR_NUMBER, ledgerEventsView, type ReviewView, type ThreadSelector } from "./record.ts";
 import { commitOid } from "./review-git.ts";
 
 type RecordEvent = Extract<LedgerEvent, { type: "record" }>;
@@ -91,11 +91,11 @@ function renderMarkdown(record: ReviewRecordV1, view: ReviewView, source?: Recor
 }
 
 export function exportCommand(cwd: string, args: readonly string[]): void {
-  const usage = "Choose arev export --to hub|markdown [--head SHA].";
+  const usage = "Choose arev export --to hub|markdown [--head SHA] [--pr N|none].";
   let parsed;
   try {
     parsed = parseArgs({ args: [...args], allowPositionals: true, tokens: true,
-      options: { to: { type: "string" }, head: { type: "string" } } });
+      options: { to: { type: "string" }, head: { type: "string" }, pr: { type: "string" } } });
   } catch {
     throw new PacketUsageError(usage);
   }
@@ -105,9 +105,14 @@ export function exportCommand(cwd: string, args: readonly string[]): void {
       flags.length !== new Set(flags).size) {
     throw new PacketUsageError(usage);
   }
+  const pr = values.pr;
+  if (pr !== undefined && pr !== "none" && (!PR_NUMBER.test(pr) || !Number.isSafeInteger(Number(pr)))) {
+    throw new PacketUsageError("Pass a positive integer to --pr, or none for a review with no PR.");
+  }
+  const thread: ThreadSelector | undefined = pr === undefined || pr === "none" ? pr : Number(pr);
   const events = readLedger(cwd);
   const head = values.head === undefined ? undefined : commitOid(cwd, values.head);
-  const view = ledgerEventsView(events, head, undefined, { includeSettled: values.to === "hub" });
+  const view = ledgerEventsView(events, head, thread, { includeSettled: values.to === "hub" });
   const event = events.findLast((item): item is RecordEvent =>
     item.type === "record" && item.id === view.record && item.record.packet.subject.head === view.head);
   if (!event) throw new Error("No review record matches the head. Import or record a review first.");

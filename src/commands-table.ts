@@ -6,7 +6,7 @@ export const commands = [
   { name: "import", aliases: [], description: "Import a legacy review report",
     syntax: "import --from ocr|brief <file>" },
   { name: "export", aliases: [], description: "Export a recorded review",
-    syntax: "export --to hub|markdown [--head SHA]" },
+    syntax: "export --to hub|markdown [--head SHA] [--pr N|none]" },
   { name: "status", aliases: [], description: "Show implementation status" },
   { name: "record", aliases: [], description: "Validate a review report against the packet for its head and append it to the ledger",
     syntax: "record <report.json> [--implementer NAME] [--light] [--json]" },

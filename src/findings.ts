@@ -168,8 +168,8 @@ export function findingsForHead(
     else {
       const seen = current.get(key);
       // Settling on B also settles older A when A is queried again. A later new nit/open remains a head-local nit.
-      if (seen?.item.disposition === "open" && seen.order <= entry.order) {
-        if (includeSettled) current.set(key, entry);
+      if (seen && seen.order <= entry.order) {
+        if (includeSettled || seen.item.disposition !== "open") current.set(key, entry);
         else current.delete(key);
       }
     }

@@ -20,6 +20,8 @@ function reviewer(mode: "json" | "dirty" | "timeout" | "brief" | "invalid" | "se
   const hookMarker = join(sandbox, "hook-ran");
   const envFile = join(sandbox, "reviewer-env.json");
   const argvFile = join(sandbox, "reviewer-argv.json");
+  const probeCwdFile = join(sandbox, "probe-cwd");
+  const runCwdFile = join(sandbox, "reviewer-cwd");
   mkdirSync(bin);
   mkdirSync(join(userHome, ".codex"), { recursive: true });
   writeFileSync(join(userHome, ".codex", "config.toml"), 'model = "fixture-model"\n');
@@ -59,7 +61,11 @@ printf '%s\\n' '{"baseRefOid":"${base}","headRefOid":"${head}","title":"Review f
   writeFileSync(executable, `#!${process.execPath}
     import { readFileSync, utimesSync, writeFileSync } from "node:fs";
     const mode = ${JSON.stringify(mode)}, out = ${JSON.stringify(out)}, host = ${JSON.stringify(host)};
-    if (process.argv.includes("--help")) { console.log("fixture help: --plan"); process.exit(0); }
+    if (process.argv.includes("--help")) {
+      writeFileSync(${JSON.stringify(probeCwdFile)}, process.cwd());
+      console.log("fixture help: --plan");
+      process.exit(0);
+    }
     const checkout = process.argv[process.argv.indexOf("--add-dir") + 1];
     if (!checkout || checkout === process.cwd() || !process.cwd().endsWith("/launch") ||
         process.env.AREV_FIXTURE_CHECKOUT_ENV || !readFileSync(checkout + "/bunfig.toml", "utf8").includes("Reviewed configuration")) process.exit(18);
@@ -69,6 +75,7 @@ printf '%s\\n' '{"baseRefOid":"${base}","headRefOid":"${head}","title":"Review f
     writeFileSync(${JSON.stringify(envFile)}, JSON.stringify(Object.fromEntries(Object.entries(process.env)
       .filter(([key]) => key.startsWith("GIT_")).sort())));
     writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(process.argv.slice(2)));
+    writeFileSync(${JSON.stringify(runCwdFile)}, process.cwd());
     if (host === "claude") {
       if (process.argv[process.argv.indexOf("--setting-sources") + 1] !== "user" ||
           process.argv[process.argv.indexOf("--permission-mode") + 1] !== "plan") process.exit(9);
@@ -151,7 +158,7 @@ printf '%s\\n' '{"baseRefOid":"${base}","headRefOid":"${head}","title":"Review f
     }
   `);
   chmodSync(executable, 0o755);
-  return { ...repo, out, head, arev, sandbox, hookMarker, envFile, argvFile };
+  return { ...repo, out, head, arev, sandbox, hookMarker, envFile, argvFile, probeCwdFile, runCwdFile };
 }
 
 test("run records the exact PR packet, attests the host, and gates", () => {
@@ -302,7 +309,7 @@ test("a staged report does not become a record when the MCP reviewer changes the
 });
 
 test("Kimi without a supported MCP config flag falls back to stdout without an arev executable", () => {
-  const { cli, dir, home, out, arev } = reviewer("json", "# Review\n", "kimi");
+  const { cli, dir, home, out, arev, probeCwdFile, runCwdFile } = reviewer("json", "# Review\n", "kimi");
   rmSync(arev);
   const result = cli("run", "--host", "kimi", "--implementer", "qwen", "--out", out);
   expect(result.status, result.stderr).toBe(0);
@@ -310,6 +317,17 @@ test("Kimi without a supported MCP config flag falls back to stdout without an a
   expect(readLedger(dir, { home }).at(-1)).toMatchObject({ type: "record",
     record: { reviewer: { started: "run", id: "kimi", implementer: "qwen" } },
   });
+  // The capability probe reads startup configuration from its cwd, so it gets a private directory of its own - never the
+  // caller's --out - and that directory is gone once the probe returns. macOS reports tmpdir() as /var while the child
+  // sees /private/var, so a plain string comparison here would pass whatever directory the probe was given.
+  const unprivate = (value: string): string => value.replace(/^\/private(?=\/var\/)/, "");
+  const probeCwd = readFileSync(probeCwdFile, "utf8");
+  expect(unprivate(probeCwd) === out || unprivate(probeCwd).startsWith(`${out}/`)).toBe(false);
+  expect(unprivate(probeCwd).startsWith(`${dir}/`) || unprivate(probeCwd) === dir).toBe(false);
+  expect(probeCwd.split("/").at(-1)!.startsWith("arev-review-probe-")).toBe(true);
+  expect(existsSync(probeCwd)).toBe(false);
+  // The reviewer itself still starts in the runner's own launch directory, not in --out either.
+  expect(readFileSync(runCwdFile, "utf8").endsWith("/launch")).toBe(true);
 });
 
 

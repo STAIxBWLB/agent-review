@@ -293,9 +293,14 @@ export async function runCommand(cwd: string, args: readonly string[]): Promise<
 
   // The reviewer attaches arev over MCP unless its host offers no config flag to pass one. This is resolved before the
   // bundle is written, because a run that cannot attach MCP refuses here: a retry into the same --out would otherwise
-  // trip over the packet files this command had already written. The probe runs in the output directory, which is
-  // already outside the reviewed checkout.
-  const kimiFlag = host === "kimi" ? kimiMcpFlag(executable, out, pathEnv) : undefined;
+  // trip over the packet files this command had already written. The probe still needs a cwd of its own - a host reads
+  // startup configuration from it, and --out belongs to the caller, so a private directory is used and removed at once.
+  let kimiFlag: string | undefined;
+  if (host === "kimi") {
+    const probe = mkdtempSync(join(tmpdir(), "arev-review-probe-"));
+    try { kimiFlag = kimiMcpFlag(executable, probe, pathEnv); }
+    finally { rmSync(probe, { recursive: true, force: true }); }
+  }
   const attachMcp = host !== "kimi" || kimiFlag !== undefined;
   const arev = attachMcp ? hostExecutable("arev", pathEnv, path => !insideWorktree(root, path)) : undefined;
   if (attachMcp && arev === undefined) {

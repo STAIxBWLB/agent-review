@@ -1,6 +1,7 @@
 import { EXIT, errorLine } from "@staix/cli-output";
 import { version } from "../package.json";
 import { commandUsage, commands, usage } from "./commands-table.ts";
+import { setupCommand } from "./setup.ts";
 import { mcpCommand } from "./mcp.ts";
 import { gateCommand } from "./gate.ts";
 import { Refusal } from "./ledger.ts";
@@ -20,6 +21,7 @@ const RUN = {
   show: showCommand,
   gate: gateCommand,
   mcp: mcpCommand,
+  setup: setupCommand,
 } as const satisfies Record<string, Runner>;
 const dispatchable = (name: string): name is keyof typeof RUN => Object.hasOwn(RUN, name);
 

@@ -98,6 +98,23 @@ test("rules names withheld paths by count and never echoes their spelling", () =
   expect(mixed.stdout).toContain("src/host.ts");
   expect(mixed.stdout).not.toContain(".env");
 
+  // A denied path spelled differently is denied too - the deny match folds case and width and reads a backslash as a
+  // separator - so it gets the same line and reaches neither `Applies to:` nor the output at all. This is the arm worth
+  // pinning: the rule reader screens with the case-sensitive isDenied, so without the filter in rulesForPaths these three
+  // were echoed under `Applies to:` and took the root rule while the line said they were withheld.
+  for (const spelling of [".ENV", ".ＥＮＶ", "docs\\.env"]) {
+    const folded = cli("rules", spelling);
+    expect(folded.status).toBe(0);
+    expect(folded.stdout).toContain("1 supplied path is withheld as denied, so no rule applies to it.");
+    expect(folded.stdout).toContain("(no reviewable paths)");
+    expect(folded.stdout).not.toContain(spelling);
+  }
+  const foldedMixed = cli("rules", ".ENV", "src/host.ts");
+  expect(foldedMixed.status).toBe(0);
+  expect(foldedMixed.stdout).toContain("1 supplied path is withheld as denied");
+  expect(foldedMixed.stdout).toContain("src/host.ts");
+  expect(foldedMixed.stdout).not.toContain(".ENV");
+
   // And a query that withheld nothing says nothing about denials.
   const clean = cli("rules", "src/host.ts");
   expect(clean.status).toBe(0);

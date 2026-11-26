@@ -105,6 +105,12 @@ test("arev_rules takes no base argument, so the trusted merge base is the only o
   const { dir, base } = repo();
   const result = mcpHandlers(dir).arev_rules({ paths: ["src/a.ts"] }) as { base: string; rules: string };
   expect(result.base).toBe(base);
+  // The denied-path filter sits in rulesForPaths, which this tool shares with `arev rules`, so a folded spelling is
+  // withheld here as well: no rule claims it, and the spelling is not handed back in `appliesTo`.
+  const folded = mcpHandlers(dir).arev_rules({ paths: [".ENV", "src/a.ts"] }) as
+    { rules: { name: string; appliesTo: string[] }[] };
+  expect(folded.rules.find(rule => rule.name === "REVIEW.md")?.appliesTo).toEqual(["src/a.ts"]);
+  expect(JSON.stringify(folded)).not.toContain(".ENV");
 });
 
 test("arev_record takes no light argument, so lightness stays a statement a person makes at a terminal", () => {

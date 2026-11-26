@@ -4,6 +4,14 @@
   "description": "Deterministic review tooling for coding agents",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/STAIxBWLB/agent-review.git"
+  },
+  "homepage": "https://github.com/STAIxBWLB/agent-review#readme",
+  "bugs": {
+    "url": "https://github.com/STAIxBWLB/agent-review/issues"
+  },
   "engines": {
     "bun": ">=1.4.4"
   },
@@ -12,7 +20,7 @@
   },
   "files": ["bin", "src", "skills", "README.md", "LICENSE"],
   "scripts": {
-    "check": "bun run typecheck && bun scripts/check-boundary.ts && bun scripts/gen-readme.ts --check && bun test",
+    "check": "bun run typecheck && bun scripts/check-boundary.ts && bun scripts/gen-readme.ts --check && bun scripts/check-pack.ts && bun test",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

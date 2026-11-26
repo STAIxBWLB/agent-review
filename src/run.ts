@@ -221,17 +221,23 @@ function hasSecret(line: string): boolean {
   return false;
 }
 
+/** What the screen removed, split by whether the file can become the recorded review. */
+type Screening = { refused: string[]; warned: string[] };
+
 /** Process complete lines after the pipes close so a split chunk cannot split a secret. */
-function screenReviewerFiles(out: string): string[] {
-  const redactions: string[] = [];
+function screenReviewerFiles(out: string): Screening {
+  const screening: Screening = { refused: [], warned: [] };
   for (const name of REVIEWER_FILES) {
+    // reviewer.stderr is a diagnostic log that is never recorded, so what the screen removes from it cannot leak
+    // into the review: it is named as a warning and the review still records. The two record-bearing files refuse.
+    const messages = name === STDERR_FILE ? screening.warned : screening.refused;
     const path = join(out, name);
     try {
       const stat = lstatSync(path);
       if (!stat.isFile()) throw new Error("not a regular output file");
       if (stat.size > MAX_OUTPUT) {
         writeFileSync(path, `${OUTPUT_MARKER}\n`);
-        redactions.push(`${name}: oversized output withheld`);
+        messages.push(`${name}: oversized output withheld`);
         continue;
       }
       let count = 0;
@@ -244,20 +250,20 @@ function screenReviewerFiles(out: string): string[] {
       });
       if (count > 0) {
         writeFileSync(path, screened);
-        redactions.push(`${name}: ${count} redacted line(s)`);
+        messages.push(`${name}: ${count} redacted line(s)`);
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
       // Do not preserve unchecked output if the artifact cannot be opened or overwritten.
       try {
         unlinkSync(path);
-        redactions.push(`${name}: removed after screening failed`);
+        messages.push(`${name}: removed after screening failed`);
       } catch {
-        redactions.push(`${name}: could not be screened or removed`);
+        messages.push(`${name}: could not be screened or removed`);
       }
     }
   }
-  return redactions;
+  return screening;
 }
 
 function cleanCheckout(checkout: string, head: string, gitFile: string, filters: string[]): boolean {
@@ -354,10 +360,14 @@ export async function runCommand(cwd: string, args: readonly string[]): Promise<
     throw new Refusal("Cannot create the detached reviewer worktree", "check Git worktree permissions and retry");
   }
 
-  let redactions: string[] = [];
-  const retained = () => new Refusal(
-    `Reviewer worktree ${shown(checkout)} changed or could not be verified, so this review is void${redactions.length ? `. ${redactions.join(", ")}` : ""}`,
-    "inspect the retained checkout and save any changes before removing it");
+  let screening: Screening = { refused: [], warned: [] };
+  const retained = () => {
+    // A void review reports everything the screen removed, not only what would have refused the record.
+    const removed = [...screening.refused, ...screening.warned];
+    return new Refusal(
+      `Reviewer worktree ${shown(checkout)} changed or could not be verified, so this review is void${removed.length ? `. ${removed.join(", ")}` : ""}`,
+      "inspect the retained checkout and save any changes before removing it");
+  };
   let gitFile: string;
   try { gitFile = readFileSync(join(checkout, ".git"), "utf8"); }
   catch { throw retained(); }
@@ -377,7 +387,7 @@ export async function runCommand(cwd: string, args: readonly string[]): Promise<
     outcome = await runReviewer(executable, host, hostArgs(host, model, checkout, launch, out, prompt, mcp), launch, out, prompt,
       options.timeout, pathEnv, homes);
   } finally {
-    try { redactions = screenReviewerFiles(out); }
+    try { screening = screenReviewerFiles(out); }
     finally {
       if (!cleanCheckout(checkout, head, gitFile, filters)) throw retained();
       const removed = reviewGit(root, ["worktree", "remove", checkout]);
@@ -386,8 +396,11 @@ export async function runCommand(cwd: string, args: readonly string[]): Promise<
     }
   }
 
-  if (redactions.length) {
-    throw new Refusal(`Reviewer output was withheld (${redactions.join(", ")})`,
+  // The warning prints before the refusal check because the stderr redaction happened either way, and it names no
+  // part of the redacted line: the kept file already holds the marker in its place.
+  for (const warning of screening.warned) console.error(`arev: warning: ${warning} in ${shown(out)}`);
+  if (screening.refused.length) {
+    throw new Refusal(`Reviewer output was withheld (${screening.refused.join(", ")})`,
       `inspect the redacted output in ${shown(out)} and rerun with a reviewer that does not print sensitive values`);
   }
 

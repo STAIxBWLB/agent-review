@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { isDenied } from "@staix/agent-mem/platform";
 import { frame } from "./frame.ts";
+import { githubRepository } from "./ledger.ts";
 import { commitOid, globalIgnoreOptions, mergeBaseOid, repositoryRoot, reviewGit } from "./review-git.ts";
 import { readAttributes, readRules, renderRules, type RuleMissing, type RuleText } from "./rules.ts";
 
@@ -68,7 +69,13 @@ interface WorkspaceInventory {
 
 function prRefs(cwd: string, number: string): { base: string; head: string } {
   if (!/^[1-9][0-9]*$/.test(number)) throw new Error("Invalid PR number. Pass a positive integer to --pr.");
-  const result = spawnSync("gh", ["pr", "view", number, "--json", "baseRefOid,headRefOid"], {
+  // The repository is pinned to the origin the ledger is keyed to: `GH_REPO` or gh's own resolution could read a fork's
+  // PR N, and the packet it built would then sit under origin's key while naming another repository's commit.
+  const repository = githubRepository(cwd);
+  if (repository === undefined) {
+    throw new Error("A PR packet names the GitHub repository origin gives, and this repository's origin does not name one. Set origin to the GitHub repository URL (gh repo view --json url prints it).");
+  }
+  const result = spawnSync("gh", ["pr", "view", number, "--repo", `github.com/${repository}`, "--json", "baseRefOid,headRefOid"], {
     cwd, encoding: "utf8", timeout: 15_000, maxBuffer: 32_000,
     env: { ...process.env, GH_PROMPT_DISABLED: "1" },
   });

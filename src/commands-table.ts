@@ -10,6 +10,8 @@ export const commands = [
     syntax: "resolve <finding-id> --as fixed|false_positive|accepted [--evidence REF]... [--rationale TEXT] [--head SHA] [--pr N|none] [--json]" },
   { name: "show", aliases: [], description: "Show the recorded review for a head",
     syntax: "show [--head SHA] [--pr N|none] [--json]" },
+  { name: "gate", aliases: [], description: "Answer whether this exact head is reviewed, and post the status with --post",
+    syntax: "gate [--head SHA] [--pr N|none] [--post] [--json]" },
   { name: "--help", aliases: ["-h"], description: "Show usage" },
   { name: "--version", aliases: ["-v"], description: "Show version" },
 ] as const;

@@ -33,6 +33,12 @@ export interface HostChoice {
 const IDENTITY = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const MAX_CONFIG_BYTES = 64 * 1024, MAX_MODEL_BYTES = 128;
 const BLOCKED = "blocked: no review host can run";
+/**
+ * The only flag value a refusal echoes: an identity in that charset that also matches no secret pattern. A flag value is
+ * the caller's untrusted text and stderr is output, so anything else is named as withheld - and composing both screens
+ * here is deliberate, because the secret screen alone still passes control characters through.
+ */
+const echoIdentity = (value: string): string => IDENTITY.test(value) && !secretShaped(value) ? value : "<withheld>";
 
 /**
  * Rotation from the pull request number, the implementer skipped, an unavailable host skipped, and the implementer
@@ -81,19 +87,53 @@ export function availableHosts(unavailable: ReadonlySet<string>, pathEnv: string
   return new Set(order.filter(host => !unavailable.has(host) && onPath(host, pathEnv)));
 }
 
+/** The escapes a TOML basic string defines, other than the two numeric forms. */
+const TOML_ESCAPES: Record<string, string> = { b: "\b", t: "\t", n: "\n", f: "\f", r: "\r", '"': '"', "\\": "\\" };
+/** The four and eight digit escapes, as `\uXXXX` and `\UXXXXXXXX`. */
+const TOML_LONG: Record<string, number> = { u: 4, U: 8 };
+
+/** A TOML basic string's body decoded, or `undefined` when it carries an escape TOML does not define. */
+function basicString(body: string): string | undefined {
+  let out = "";
+  for (let index = 0; index < body.length; index++) {
+    const char = body[index]!;
+    if (char !== "\\") {
+      out += char;
+      continue;
+    }
+    const escape = body[++index];
+    if (escape === undefined) return undefined;
+    const short = TOML_ESCAPES[escape];
+    if (short !== undefined) {
+      out += short;
+      continue;
+    }
+    const width = TOML_LONG[escape];
+    const hex = width === undefined ? "" : body.slice(index + 1, index + 1 + width);
+    if (width === undefined || hex.length !== width || !/^[0-9a-fA-F]+$/.test(hex)) return undefined;
+    const codePoint = Number.parseInt(hex, 16);
+    // A surrogate half and anything past the last code point are not characters a string can hold.
+    if (codePoint > 0x10ffff || (codePoint >= 0xd800 && codePoint <= 0xdfff)) return undefined;
+    out += String.fromCodePoint(codePoint);
+    index += width;
+  }
+  return out;
+}
+
 /**
  * The value of one top-level string key of a TOML document, or `undefined`. Only the top level is read: a `model` inside
- * a profile table is not the model the host runs.
+ * a profile table is not the model the host runs. A key may be bare, basic-quoted or literal-quoted, and a value is a
+ * single-line basic or literal string, decoded by TOML's own escapes so a model written with one attests as itself.
  */
 function tomlString(text: string, key: string): string | undefined {
   for (const line of text.split(/\r?\n/)) {
     const entry = line.trim();
     if (entry.startsWith("[")) return undefined;
-    const match = /^([A-Za-z0-9_.-]+|"[^"]*")\s*=\s*(.+)$/.exec(entry);
-    if (!match || match[1] !== key) continue;
-    const value = match[2]!.trim();
-    const quoted = /^"((?:[^"\\]|\\.)*)"\s*(?:#.*)?$/.exec(value);
-    if (quoted) return quoted[1]!.replaceAll(/\\(.)/g, (_, escaped: string) => escaped === "n" ? "\n" : escaped);
+    const match = /^(?:"([^"]*)"|'([^']*)'|([A-Za-z0-9_-]+))\s*=\s*(.+)$/.exec(entry);
+    if (!match || (match[1] ?? match[2] ?? match[3]) !== key) continue;
+    const value = match[4]!.trim();
+    const basic = /^"((?:[^"\\]|\\.)*)"\s*(?:#.*)?$/.exec(value);
+    if (basic) return basicString(basic[1]!);
     const literal = /^'([^']*)'\s*(?:#.*)?$/.exec(value);
     return literal ? literal[1]! : undefined;
   }
@@ -135,16 +175,21 @@ function ids(values: readonly string[] | undefined): string[] {
  */
 export function hostCommand(_cwd: string, args: readonly string[]): number {
   const usage = "Choose arev host --pr N --implementer ID [--hosts LIST] [--unavailable ID...] [--json].";
+  const options = { pr: { type: "string" }, implementer: { type: "string" }, hosts: { type: "string", multiple: true },
+    unavailable: { type: "string", multiple: true }, json: { type: "boolean" } } as const;
   let parsed;
   try {
-    parsed = parseArgs({ args: [...args], allowPositionals: true, strict: true, tokens: true,
-      options: { pr: { type: "string" }, implementer: { type: "string" }, hosts: { type: "string", multiple: true },
-        unavailable: { type: "string", multiple: true }, json: { type: "boolean" } } });
+    parsed = parseArgs({ args: [...args], allowPositionals: true, strict: true, tokens: true, options });
   } catch {
     throw new PacketUsageError(usage);
   }
   const { values, positionals, tokens } = parsed;
-  const flags = tokens.filter(token => token.kind === "option").map(token => token.name);
+  // A flag may repeat only where its own spec says so: `--unavailable codex --unavailable kimi` is two hosts to exclude,
+  // while `--pr 1 --pr 2` is one question asked twice. Reading `multiple` off the spec keeps the two in step, and a token
+  // carries the flag's name without its dashes, which is the form both sides of this comparison use.
+  const repeatable = new Set(Object.entries(options)
+    .filter(([, spec]) => "multiple" in spec).map(([name]) => name));
+  const flags = tokens.filter(token => token.kind === "option").map(token => token.name).filter(name => !repeatable.has(name));
   if (positionals.length !== 0 || flags.length !== new Set(flags).size) throw new PacketUsageError(usage);
 
   const pr = values.pr;
@@ -159,7 +204,9 @@ export function hostCommand(_cwd: string, args: readonly string[]): number {
   const order = given.length === 0 ? HOST_ORDER : given;
   const unavailable = new Set(ids(values.unavailable));
   const unknown = [...order, ...unavailable].find(host => !HOST_ORDER.includes(host));
-  if (unknown !== undefined) throw new PacketUsageError(`arev does not know the host ${unknown}: --hosts and --unavailable take ${HOST_ORDER.join(", ")}.`);
+  if (unknown !== undefined) {
+    throw new PacketUsageError(`arev does not know the host ${echoIdentity(unknown)}: --hosts and --unavailable take ${HOST_ORDER.join(", ")}.`);
+  }
 
   const available = availableHosts(unavailable, process.env.PATH ?? "", order);
   const choice = chooseHost(Number(pr), implementer, available, order);

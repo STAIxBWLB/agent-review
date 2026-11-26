@@ -1,10 +1,10 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { lstatSync, realpathSync } from "node:fs";
+import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
 import { isDenied } from "@staix/agent-mem/platform";
-import { frame } from "./frame.ts";
-import { commitOid, mergeBaseOid, repositoryRoot, reviewGit } from "./review-git.ts";
+import { frame, sanitize } from "./frame.ts";
+import { commitOid, globalIgnoreOptions, mergeBaseOid, repositoryRoot, reviewGit } from "./review-git.ts";
 import { readAttributes, readRules, renderRules, type RuleMissing, type RuleText } from "./rules.ts";
 
 export type PacketRequest =
@@ -80,6 +80,18 @@ function resolveSubject(cwd: string, request: PacketRequest): PacketSubject {
     if (parents.status !== 0) throw new Error("Cannot read commit parents. Fetch the commit history and retry.");
     let base = parents.stdout.trim().split(" ")[1];
     if (!base) {
+      const shallow = reviewGit(cwd, ["rev-parse", "--git-path", "shallow"]);
+      if (shallow.status !== 0) throw new Error("Cannot check shallow commit history. Fetch the commit history and retry.");
+      let boundary = "";
+      try { boundary = readFileSync(resolve(cwd, shallow.stdout.replace(/\r?\n$/, "")), "utf8"); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+          throw new Error("Cannot read shallow commit history. Fetch the commit history and retry.");
+        }
+      }
+      if (boundary.split(/\s+/).includes(head)) {
+        throw new Error("The commit is a shallow history boundary. Fetch the commit history and retry.");
+      }
       const empty = reviewGit(cwd, ["hash-object", "-t", "tree", "--stdin"], { input: "" });
       if (empty.status !== 0) throw new Error("Cannot identify the empty base tree. Check Git and retry.");
       base = empty.stdout.trim();
@@ -90,19 +102,19 @@ function resolveSubject(cwd: string, request: PacketRequest): PacketSubject {
   return { kind: request.kind, base: head, head, mergeBase: head };
 }
 
-export function repositoryPath(cwd: string, root: string, path: string): string {
+export function repositoryPath(cwd: string, root: string, path: string, allowRoot = false): string {
   const resolved = isAbsolute(path) ? resolve(path) : resolve(realpathSync(cwd), path);
   const inside = (target: string) => Boolean(target) && target !== ".." &&
     !target.startsWith("../") && !isAbsolute(target);
 
   if (!path.includes("\0")) {
     const direct = relative(root, resolved);
-    if (inside(direct)) return direct;
+    if (inside(direct) || (allowRoot && !direct)) return direct || ".";
     // Resolve an external alias of the worktree without dereferencing the selected file itself.
     for (let ancestor = dirname(resolved); dirname(ancestor) !== ancestor; ancestor = dirname(ancestor)) {
       try {
         const target = relative(root, resolve(realpathSync(ancestor), relative(ancestor, resolved)));
-        if (inside(target)) return target;
+        if (inside(target) || (allowRoot && !target)) return target || ".";
       } catch (error) {
         const code = (error as NodeJS.ErrnoException).code;
         if (code !== "ENOENT" && code !== "ENOTDIR") break;
@@ -143,7 +155,7 @@ export function buildPacket(cwd: string, request: PacketRequest): PacketBundle {
   const root = repositoryRoot(cwd);
   const subject = resolveSubject(root, request);
   const workspace = request.kind === "workspace" || request.kind === "files";
-  const scopes = request.kind === "files" ? request.paths.map(path => repositoryPath(cwd, root, path)) : [];
+  const scopes = request.kind === "files" ? request.paths.map(path => repositoryPath(cwd, root, path, true)) : [];
   if (request.kind === "files" && scopes.length === 0) throw new Error("No file scope given. Pass paths after --files.");
   const trees = workspace ? [subject.head] : [subject.mergeBase, subject.head];
   const gitOptions = workspace ? workspaceFilterOptions(root) : [];
@@ -174,19 +186,23 @@ export function buildPacket(cwd: string, request: PacketRequest): PacketBundle {
   }
 
   if (workspace) {
-    const untracked = checkedOutput(reviewGit(root, ["ls-files", "-z", "--others", "--exclude-standard", "--", ...scopes]), "untracked paths");
+    const untracked = checkedOutput(reviewGit(root, [...globalIgnoreOptions(root), "ls-files", "-z", "--others", "--exclude-standard", "--",
+      ...(scopes.includes(".") ? [] : scopes)]), "untracked paths");
     for (const path of names(untracked)) {
       if (!listed.has(path)) groups.push({ status: "A", paths: [path], untracked: true });
     }
   }
   // Scope after pairing, so selecting only a public rename destination cannot hide its denied source.
-  if (scopes.length) {
+  if (scopes.length && !scopes.includes(".")) {
     groups = groups.filter(group => group.paths.some(path =>
       scopes.some(scope => path === scope || path.startsWith(scope + "/"))));
   }
   if (!groups.length) throw new Error("The subject has no changes. Choose a different range or workspace.");
   if (groups.length > MAX_FILES) throw new Error(`The subject exceeds ${MAX_FILES} changed files. Choose a smaller file scope or range.`);
 
+  const trackedCounts = parseNumstat(checkedOutput(
+    diff([...RENAME_OPTIONS, "--numstat", "-z"], []), "the changed-file counts",
+  ));
   const attrs = readAttributes(root, subject.mergeBase, groups.filter(group => !group.paths.some(path => isDenied(path))).flatMap(group => group.paths));
   const units: PacketUnit[] = [], excluded: PacketExcluded[] = [];
   const ruleTargets: { path: string; sides: string[] }[] = [];
@@ -201,19 +217,20 @@ export function buildPacket(cwd: string, request: PacketRequest): PacketBundle {
     if (group.untracked) {
       const stat = lstatSync(resolve(root, path));
       if (!stat.isFile() && !stat.isSymbolicLink()) {
-        throw new Error("An untracked path is not a regular file or symlink. Use --files to select reviewable files.");
+        throw new Error(`Untracked path ${sanitize(JSON.stringify(path))} is not a regular file or symlink. Use --files to select reviewable files.`);
       }
     }
 
     const readDiff = (option: string[], limit?: number) => group.untracked
       ? reviewGit(root, [...gitOptions, `--attr-source=${subject.mergeBase}`, "diff", ...DIFF_OPTIONS, "--no-index", ...option,
           "--", "/dev/null", path], { maxBuffer: limit ?? 16 * 1024 * 1024 })
-      : diff([...RENAME_OPTIONS, ...(group.status === "C" ? ["--diff-filter=C"] : []), ...option], group.paths, limit);
+      : diff([...RENAME_OPTIONS, ...(group.status === "C" ? ["--diff-filter=CR"] : []), ...option], group.paths, limit);
     const diffText = (result: ReturnType<typeof reviewGit>, label: string) =>
       group.untracked && result.status === 1 ? result.stdout : checkedOutput(result, label);
 
-    const stats = diffText(readDiff(["--numstat", "-z"]), "file counts");
-    const counts = parseNumstat(stats).get(path);
+    const counts = group.untracked
+      ? parseNumstat(diffText(readDiff(["--numstat", "-z"]), "file counts")).get(path)
+      : trackedCounts.get(path);
     if (!counts) throw new Error("Git file counts changed while building the packet. Stabilize the worktree and retry.");
     if (counts.binary) {
       excluded.push({ path, reason: "binary" });

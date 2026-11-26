@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
-import { readFileSync, rmSync, symlinkSync } from "node:fs";
+import { readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { buildPacket, coverageGap, repositoryPath, type ReviewPacket } from "../src/packet.ts";
 import { fixture } from "./packet-fixture.ts";
 
@@ -182,4 +183,60 @@ test("a worktree alias resolves absolute paths even when the selected file is ab
   } finally {
     rmSync(alias);
   }
+});
+
+test("workspace inventory honors the global ignore file and local precedence", () => {
+  const configDir = fixture().dir;
+  const config = join(configDir, "config");
+  const ignore = join(configDir, "global-ignore");
+  writeFileSync(ignore, "globally-ignored.txt\n");
+  const { git, write, cli } = fixture({ GIT_CONFIG_GLOBAL: config });
+  git("config", "--global", "core.excludesFile", ignore);
+  git("commit", "--allow-empty", "-qm", "base");
+  write("globally-ignored.txt", "IGNORED_FIXTURE_CONTENT\n");
+  write("public.txt", "reviewed change\n");
+  const packet = cli("packet", "--files", ".", "--json");
+  expect(packet.status).toBe(0);
+  assertParity(JSON.parse(packet.stdout), git("ls-files", "--others", "--exclude-standard", "-z").split("\0").filter(Boolean));
+  const artifact = cli("packet", "--workspace");
+  expect(artifact.status).toBe(0);
+  expect(artifact.stdout).not.toContain("IGNORED_FIXTURE_CONTENT");
+  expect(artifact.stdout).not.toContain("globally-ignored.txt");
+
+  const local = join(configDir, "local-ignore");
+  writeFileSync(local, "public.txt\n");
+  git("config", "--local", "core.excludesFile", local);
+  const overridden = cli("packet", "--workspace", "--json");
+  expect(overridden.status).toBe(0);
+  assertParity(JSON.parse(overridden.stdout), ["globally-ignored.txt"]);
+});
+
+test("a deleted source can become a rename and a copy in one packet", () => {
+  const { dir, git, write } = fixture();
+  const source = "a long shared fixture line for rename similarity\n".repeat(12);
+  write("source.txt", source);
+  git("add", ".");
+  git("commit", "-qm", "base");
+  git("mv", "source.txt", "first.txt");
+  write("second.txt", source + "second variation\n");
+  git("add", ".");
+  git("commit", "-qm", "head");
+  const bundle = buildPacket(dir, { kind: "commit", commit: "HEAD" });
+  expect(bundle.packet.units.map(({ status }) => status).sort()).toEqual(["C", "R"]);
+  assertParity(bundle.packet, ["first.txt", "second.txt"]);
+  expect(bundle.diff).toContain("second variation");
+});
+
+test("a shallow boundary commit refuses an incomplete review base", () => {
+  const { dir, git, write } = fixture();
+  write("REVIEW.md", "base rules\n");
+  git("add", ".");
+  git("commit", "-qm", "base");
+  write("file.txt", "changed content\n");
+  git("add", ".");
+  git("commit", "-qm", "head");
+  const shallower = fixture();
+  shallower.git("clone", "--depth=1", pathToFileURL(dir).href, "clone");
+  expect(() => buildPacket(join(shallower.dir, "clone"), { kind: "commit", commit: "HEAD" }))
+    .toThrow("Fetch the commit history");
 });

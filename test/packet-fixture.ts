@@ -9,12 +9,12 @@ afterEach(() => {
   for (const dir of cleanup.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-export function fixture() {
+export function fixture(overrides: NodeJS.ProcessEnv = {}) {
   const dir = mkdtempSync(join(tmpdir(), "arev-packet-"));
   cleanup.push(dir);
   const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1",
     AGENTHUB_HOME: join(dir, ".fixture-hub"), GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t",
-    GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" };
+    GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t", ...overrides };
   const git = (...args: string[]) => {
     const result = spawnSync("git", ["-C", dir, "-c", "core.hooksPath=/dev/null", ...args], {
       encoding: "utf8", env,

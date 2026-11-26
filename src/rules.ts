@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { posix, win32 } from "node:path";
 import { isDenied } from "@staix/agent-mem/platform";
-import { frame } from "./frame.ts";
+import { frame, sanitize } from "./frame.ts";
 import { reviewBlob, reviewGit } from "./review-git.ts";
 
 const RULE_BYTES = 32_000;
@@ -86,7 +86,7 @@ export function readRules(
       if (!name || ["unspecified", "unset", "set"].includes(name)) continue;
       if (posix.isAbsolute(name) || win32.isAbsolute(name) || /^[a-z]:/i.test(name) ||
           name.split(/[\\/]/).includes("..")) {
-        throw new Error("Invalid base-tree review-rule attribute. Set it to a repository-relative path without '..'.");
+        throw new Error(`Invalid ${attribute} for ${sanitize(JSON.stringify(side))}. Set it in .gitattributes at the merge base to a repository-relative path without '..'.`);
       }
       const normalized = posix.normalize(name);
       if (isDenied(normalized) || normalized === "REVIEW.md") continue;

@@ -37,3 +37,19 @@ export function mergeBaseOid(cwd: string, base: string, head: string): string {
   if (result.status !== 0) throw new Error("No merge base found. Fetch the missing history and retry.");
   return result.stdout.trim();
 }
+
+/** Preserve the user's global ignore file without importing global config into review Git commands. */
+export function globalIgnoreOptions(cwd: string): string[] {
+  const local = reviewGit(cwd, ["config", "--get", "core.excludesFile"]);
+  if (local.status === 0) return [];
+  if (local.status !== 1) throw new Error("Cannot read the repository's Git ignore setting. Check git config and retry.");
+  const options = gitOptions();
+  const result = memoryGitSync(gitArgs(cwd, ["config", "--global", "--type=path", "--null", "--get", "core.excludesFile"]), {
+    ...options,
+    env: { ...options.env, GIT_CONFIG_GLOBAL: process.env.GIT_CONFIG_GLOBAL },
+    encoding: "utf8",
+  });
+  if (result.status === 1) return [];
+  if (result.status !== 0) throw new Error("Cannot read the global Git ignore setting. Check git config --global and retry.");
+  return ["-c", `core.excludesFile=${result.stdout.replace(/\0$/, "")}`];
+}

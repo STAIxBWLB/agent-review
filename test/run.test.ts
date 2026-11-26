@@ -21,7 +21,7 @@ function hostGit(): string {
   return found ?? "/usr/bin/git";
 }
 
-function reviewer(mode: "json" | "dirty" | "timeout" | "brief" | "invalid" | "secret" | "escaped-secret" | "mcp" | "mcp-dirty" | "mcp-failed" | "hook", review = "# Review\n", host = "codex", separator = "", env: NodeJS.ProcessEnv = {}, dotenv: string[] = []) {
+function reviewer(mode: "json" | "dirty" | "timeout" | "brief" | "invalid" | "secret" | "escaped-secret" | "secret-stderr" | "secret-dirty-stderr" | "secret-stdout" | "secret-staged" | "unreadable-stderr" | "unremovable-stderr" | "mcp" | "mcp-dirty" | "mcp-failed" | "hook", review = "# Review\n", host = "codex", separator = "", env: NodeJS.ProcessEnv = {}, dotenv: string[] = []) {
   const sandbox = mkdtempSync(join(tmpdir(), "arev-run-test-"));
   scratch.push(sandbox);
   const bin = join(sandbox, "bin"), userHome = join(sandbox, "home"), out = join(sandbox, "out");
@@ -77,7 +77,7 @@ printf '%s\\n' '{"baseRefOid":"${base}","headRefOid":"${head}","title":"Review f
   writeFileSync(arev, `#!${process.execPath}\nif (process.env.AREV_FIXTURE_CHECKOUT_ENV || !process.cwd().endsWith("/launch")) process.exit(19);\nawait import(${JSON.stringify(cliEntry)});\n`, { mode: 0o755 });
   const executable = join(bin, host);
   writeFileSync(executable, `#!${process.execPath}
-    import { readFileSync, utimesSync, writeFileSync } from "node:fs";
+    import { chmodSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
     const mode = ${JSON.stringify(mode)}, out = ${JSON.stringify(out)}, host = ${JSON.stringify(host)};
     if (process.argv.includes("--help")) {
       writeFileSync(${JSON.stringify(probeCwdFile)}, process.cwd());
@@ -126,6 +126,20 @@ printf '%s\\n' '{"baseRefOid":"${base}","headRefOid":"${head}","title":"Review f
       console.error(canary);
       writeFileSync(out + "/reviewer-response.md", "response: " + canary + "\\n");
       process.exit(0);
+    }
+    // The same secret-shaped line on one surface at a time: stderr is a diagnostic log, stdout can become the record.
+    if (mode === "secret-stderr") console.error("ghp_" + "d".repeat(36));
+    if (mode === "secret-dirty-stderr") {
+      console.error("ghp_" + "g".repeat(36));
+      writeFileSync(checkout + "/changed-by-reviewer.txt", "fixture edit");
+    }
+    if (mode === "secret-stdout") console.log("ghp_" + "e".repeat(36));
+    // A stderr file the screen cannot read, and one it can neither read nor remove. The mode is applied after the write
+    // because the fd the runner opened stays writable, so the content is there and the screen is what fails.
+    if (mode === "unreadable-stderr" || mode === "unremovable-stderr") {
+      console.error("ghp_" + "h".repeat(36));
+      chmodSync(out + "/reviewer.stderr", 0o000);
+      if (mode === "unremovable-stderr") chmodSync(out, 0o500);
     }
     if (mode === "invalid") { console.log("unparseable fixture"); process.exit(0); }
     const reviewer = { id: "untrusted-name", modelFamily: "untrusted-family", started: "self", sameFamilyFallback: false };
@@ -182,6 +196,13 @@ printf '%s\\n' '{"baseRefOid":"${base}","headRefOid":"${head}","title":"Review f
       process.exit(0);
     }
 
+    // A staged report is the record itself, so a secret-shaped value in it is refused by the recorder, not screened.
+    if (mode === "secret-staged") {
+      writeFileSync(out + "/report.json", JSON.stringify({ v: 1, packet, reviewer, coverage, call,
+        verdict: "changes_requested", findings: [{ id: "bugs:fixture", term: "bugs", severity: "blocking",
+          disposition: "open", origin: "introduced", text: "prefix " + "ghp_" + "f".repeat(36) }] }, null, 2));
+      process.exit(0);
+    }
     if (mode === "brief") {
       console.log(fence + "json\\n" + JSON.stringify({ head: packet.subject.head, base: packet.subject.base,
         packet_id: packet.id, reviewer, coverage, call }) + "\\n" + fence + "\\n## Findings\\nP0: None.\\nP1: None.\\nP2: None.\\nP3: None.");
@@ -285,6 +306,10 @@ test("reviewer secrets are removed from stdout, stderr and the response artifact
     expect(result.stderr).toContain(`${name}: 1 redacted line(s)`);
     expect(readFileSync(join(out, name), "utf8")).toContain("[redacted reviewer output]");
   }
+  // The warning is printed before the refusal, so a run that refuses over another file still names what stderr lost.
+  const warning = result.stderr.indexOf("arev: warning: reviewer.stderr");
+  expect(warning).toBeGreaterThanOrEqual(0);
+  expect(warning).toBeLessThan(result.stderr.indexOf("Reviewer output was withheld"));
   for (const name of readdirSync(out)) {
     expect(readFileSync(join(out, name), "utf8")).not.toContain(canary);
   }
@@ -516,4 +541,81 @@ test("a repository .env cannot supply a host config home", () => {
   expect(JSON.parse(readFileSync(hostHomesFile, "utf8"))).toEqual({});
   expect(readLedger(dir, { home }).at(-1)).toMatchObject({ type: "record",
     record: { reviewer: { id: "codex", model: "fixture-model" } } });
+});
+
+// Issue #44: a reviewer that reads a repository handling credentials prints code-shaped lines on stderr, and stderr is a
+// diagnostic log that never becomes the record. Those lines are still redacted in place; the review records and warns.
+test("a secret-shaped reviewer stderr line warns and the review is still recorded", () => {
+  const { cli, dir, home, out } = reviewer("secret-stderr");
+  const canary = "ghp_" + "d".repeat(36);
+  const result = cli("run", "--host", "codex", "--implementer", "qwen", "--out", out);
+  expect(result.status, result.stderr).toBe(0);
+  expect(result.stderr).toContain(`arev: warning: reviewer.stderr: 1 redacted line(s) in ${out}`);
+  expect(result.stderr).not.toContain("withheld");
+  const kept = readFileSync(join(out, "reviewer.stderr"), "utf8");
+  expect(kept).toContain("[redacted reviewer output]");
+  expect(kept).not.toContain(canary);
+  for (const name of readdirSync(out)) {
+    expect(readFileSync(join(out, name), "utf8")).not.toContain(canary);
+  }
+  expect(result.stdout + result.stderr).not.toContain(canary);
+  expect(readLedger(dir, { home }).filter(event => event.type === "record")).toHaveLength(1);
+});
+
+test("a secret-shaped reviewer stdout line still refuses the review and names that file alone", () => {
+  const { cli, dir, home, out } = reviewer("secret-stdout");
+  const canary = "ghp_" + "e".repeat(36);
+  const result = cli("run", "--host", "codex", "--implementer", "qwen", "--out", out);
+  expect(result.status).toBe(1);
+  expect(result.stderr).toContain("Reviewer output was withheld (reviewer.stdout: 1 redacted line(s))");
+  expect(result.stderr).not.toContain("arev: warning:");
+  expect(readFileSync(join(out, "reviewer.stdout"), "utf8")).toContain("[redacted reviewer output]");
+  expect(result.stdout + result.stderr).not.toContain(canary);
+  expect(readLedger(dir, { home }).some(event => event.type === "record")).toBe(false);
+});
+
+test("a void review names the stderr line it redacted, not only the files that would refuse", () => {
+  const { cli, out, git } = reviewer("secret-dirty-stderr");
+  const result = cli("run", "--host", "codex", "--implementer", "qwen", "--out", out);
+  expect(result.status).toBe(1);
+  expect(result.stderr).toContain("so this review is void. reviewer.stderr: 1 redacted line(s)");
+  // The void review keeps the checkout, so the case removes what it retained the way the dirty-review case does.
+  const retained = git("worktree", "list", "--porcelain").match(/^worktree (.+)$/gm)!.at(-1)!.slice("worktree ".length);
+  rmSync(join(retained, "changed-by-reviewer.txt"));
+  git("worktree", "remove", retained);
+  rmSync(dirname(retained), { recursive: true });
+  expect(git("worktree", "list", "--porcelain").match(/^worktree /gm)).toHaveLength(1);
+});
+
+// Issue #44 allows the review to record once the stderr redaction succeeded, so a stderr file the screen could not read
+// - or could not read and could not remove - is unscreened content and still refuses, exactly as on the base.
+const unscreenable = [
+  ["unreadable", "unreadable-stderr", "removed after screening failed", false],
+  ["unremovable", "unremovable-stderr", "could not be screened or removed", true],
+] as const;
+
+test.each(unscreenable)("a reviewer.stderr that cannot be screened (%s) refuses instead of warning",
+  (_, mode, message, kept) => {
+    const { cli, dir, home, out } = reviewer(mode);
+    try {
+      const result = cli("run", "--host", "codex", "--implementer", "qwen", "--out", out);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain(`Reviewer output was withheld (reviewer.stderr: ${message})`);
+      expect(result.stderr).not.toContain("arev: warning:");
+      expect(readLedger(dir, { home }).some(event => event.type === "record")).toBe(false);
+      // Nothing was screened out, so a file the screen could not remove is still there while the run refused.
+      expect(existsSync(join(out, "reviewer.stderr"))).toBe(kept);
+    } finally {
+      chmodSync(out, 0o755);
+    }
+  });
+
+test("a secret-shaped line in the staged report still refuses the review", () => {
+  const { cli, dir, home, out } = reviewer("secret-staged");
+  const canary = "ghp_" + "f".repeat(36);
+  const result = cli("run", "--host", "codex", "--implementer", "qwen", "--out", out);
+  expect(result.status).toBe(1);
+  expect(result.stderr).toContain("matches a secret pattern, so nothing from it was recorded or shown");
+  expect(result.stdout + result.stderr).not.toContain(canary);
+  expect(readLedger(dir, { home }).some(event => event.type === "record")).toBe(false);
 });

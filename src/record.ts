@@ -14,7 +14,7 @@ import { EXIT, errorLine } from "@staix/cli-output";
 import { parseReviewAnchor, reviewAnchorErrorMessage, type ReviewAnchor } from "./anchor.ts";
 import { blocksApproval, findingTally, findingsForHead, positionalFindingId, type ReviewFinding, type ReviewFindingSet, type ReviewFindingTally } from "./findings.ts";
 import { sanitize } from "./frame.ts";
-import { MAX_REPORT_BYTES, Refusal, appendEvent, readLedger, recordId, reviewProjectId, secretShaped, stringsIn, type LedgerEvent, type PacketBlock, type RecordFinding, type ReviewRecordV1 } from "./ledger.ts";
+import { MAX_REPORT_BYTES, Refusal, appendEvent, readLedger, recordId, reviewProjectId, secretShaped, shown, stringsIn, type LedgerEvent, type PacketBlock, type RecordFinding, type ReviewRecordV1 } from "./ledger.ts";
 import { buildPacket, type PacketRequest } from "./packet.ts";
 import { PacketUsageError } from "./packet-cli.ts";
 import { reviewGit } from "./review-git.ts";
@@ -75,12 +75,6 @@ const jsonType = (value: unknown): string =>
  */
 const echoName = (value: unknown): string =>
   typeof value === "string" && /^[A-Za-z0-9._:-]{1,96}$/.test(value) && !secretShaped(value) ? value : jsonType(value);
-/**
- * A validated report string a refusal may print: the value itself, or `<withheld>` when it is secret-shaped. A `\u`
- * escape decodes into a secret the raw-text screen cannot see, so this guard is what keeps the decoded value out of the
- * message whichever field carried it.
- */
-const shown = (value: string): string => secretShaped(value) ? "<withheld>" : value;
 
 /** A plain own-data object with only the named fields: accessors, proxies, hidden fields and inherited keys are refused. */
 function closed(raw: unknown, fields: readonly string[], what: string): Record<string, unknown> | undefined {
@@ -428,6 +422,16 @@ function threadAtHead(events: readonly LedgerEvent[], head: string, selector?: T
 }
 
 /**
+ * Whether a record or resolve belongs to the view's thread at its head. A numbered thread follows its branch, so any
+ * head of it is in scope; the thread with no PR has no branch to follow, so it is exactly its own head's review - and
+ * never a head where a numbered PR also recorded, because those two threads share the SHA and nothing else.
+ */
+function inThread(subjectThread: number | undefined, subjectHead: string, thread: number | undefined, target: string | undefined): boolean {
+  if (subjectThread !== thread) return false;
+  return thread !== undefined || subjectHead === target;
+}
+
+/**
  * Replay the ledger into the review of one head, scoped to that head's review thread: the records and resolves whose
  * packet carries the same `subject.pr`, or - for a head whose packet has none - only those recorded at that exact head.
  * The ledger is one file per project, so a resolve in one PR would otherwise settle the same finding id in another.
@@ -460,8 +464,6 @@ export function ledgerEventsView(events: readonly LedgerEvent[], head?: string, 
   // A record's own packet is the one its report was validated against, so it wins over the newest packet event for the
   // head: a later packet (a re-run, a new base) describes a review this head's record never saw.
   const recordedPacket = recordEvent?.type === "record" ? recordEvent.record.packet : undefined;
-  const inThread = (subject: PacketBlock["subject"]): boolean =>
-    thread === undefined ? subject.head === target : threadOf(subject) === thread;
   // The text and evidence a view prints belong to the records it replays: a record for a later head describes a review
   // this head never had, so a report text from it is not shown here.
   const recordIndex = recordEvent === undefined ? -1 : events.lastIndexOf(recordEvent);
@@ -471,7 +473,7 @@ export function ledgerEventsView(events: readonly LedgerEvent[], head?: string, 
   for (const [index, event] of events.entries()) {
     if (event.type === "record") {
       const subject = event.record.packet.subject;
-      if (!inThread(subject)) continue;
+      if (!inThread(threadOf(subject), subject.head, thread, target)) continue;
       sets.push({ head: subject.head, items: event.record.findings.map(lifecycle) });
       for (const finding of event.record.findings) {
         latest.set(finding.id, finding);
@@ -484,8 +486,9 @@ export function ledgerEventsView(events: readonly LedgerEvent[], head?: string, 
       const reported = latest.get(event.finding);
       if (!reported) continue;
       // A resolve names the thread it was made in (`arev resolve` writes it from the head it settles), so a resolve in
-      // one PR is not replayed in another even when both report the same id. Without a thread the head is the identity.
-      if (thread === undefined ? event.head !== target : event.pr !== thread) continue;
+      // one PR is not replayed in another even when both report the same id. The thread with no PR has no branch to
+      // follow, so it is that head's own.
+      if (!inThread(event.pr, event.head, thread, target)) continue;
       sets.push({
         head: event.head,
         items: [{
@@ -702,7 +705,7 @@ export function resolveCommand(cwd: string, args: readonly string[]): number {
     const thread = threadAtHead(events, head, pr);
     const reports = (event: LedgerEvent): boolean =>
       event.type === "record" && event.record.findings.some(finding => finding.id === id)
-      && (thread === undefined ? event.record.packet.subject.head === head : threadOf(event.record.packet.subject) === thread);
+      && inThread(threadOf(event.record.packet.subject), event.record.packet.subject.head, thread, head);
     if (!events.some(reports)) {
       throw new Refusal(thread === undefined
         ? `no record at ${shown(head)} reports the finding ${shown(id)}`

@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { ledgerEventsView, parseReviewRecord, recordCommand } from "../src/record.ts";
-import { Refusal, secretShaped, type LedgerEvent, type PacketBlock } from "../src/ledger.ts";
+import { Refusal, appendEvent, ledgerPath, secretShaped, type LedgerEvent, type PacketBlock } from "../src/ledger.ts";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -552,6 +552,67 @@ test("in a SHA-256 repository a 40-character --head is a prefix, so it resolves 
   const refused = run(repo, home, "show", "--head", "0".repeat(40), "--json");
   expect(refused.code).toBe(1);
   expect(refused.stderr).toContain(`--head ${"0".repeat(40)} does not name a commit in this repository`);
+});
+
+test("the thread with no PR reads only its own head's events, never a numbered PR's at that same head", () => {
+  const { repo, home } = fixture();
+  // One head, two threads: the review recorded without a PR and PR 7's review of the same commit. Both report
+  // bugs:missing-frame, and PR 7 also reports bugs:seven-only.
+  const events: LedgerEvent[] = [
+    { v: 1, type: "packet", at: "t0", packet: packetFor(HEAD, null) },
+    { v: 1, type: "record", at: "t1", id: "record-none", record: recordAt(HEAD, [finding()], "changes_requested", { ok: true }, null) },
+    { v: 1, type: "packet", at: "t2", packet: packetFor(HEAD, 7) },
+    { v: 1, type: "record", at: "t3", id: "record-7", record: recordAt(HEAD, [finding(), finding({ id: "bugs:seven-only" })], "changes_requested", { ok: true }, 7) },
+    // PR 7 settles the id at this head. The thread with no PR reported the same id at the same SHA and is another review.
+    { v: 1, type: "resolve", at: "t4", head: HEAD, pr: 7, finding: "bugs:missing-frame", as: "fixed" },
+  ];
+  const none = ledgerEventsView(events, HEAD, "none");
+  expect(none.openBlocking).toEqual(["bugs:missing-frame"]);
+  expect(none.counts).toMatchObject({ important: 1, openImportant: 1, fixed: 0 });
+  expect(none.findings.find(entry => entry.id === "bugs:seven-only")).toBeUndefined();
+  // PR 7's own view replays its record and the resolve, so the pair is read against each other: its report of the id is
+  // what the resolve settles, and the id only it reported stays open there.
+  const seven = ledgerEventsView(events, HEAD, 7);
+  expect(seven.openBlocking).toEqual(["bugs:seven-only"]);
+  expect(seven.counts).toMatchObject({ important: 2, openImportant: 1, fixed: 1 });
+
+  // `resolve --pr none` reports only what the no-PR thread reported: bugs:seven-only is PR 7's alone, so the refusal
+  // names the id instead of writing a no-PR disposition for another thread's finding.
+  for (const event of events) appendEvent(repo, event, { home });
+  const refused = run(repo, home, "resolve", "bugs:seven-only", "--as", "fixed", "--pr", "none");
+  expect(refused.code).toBe(1);
+  expect(refused.stderr).toContain(`no record at ${HEAD} reports the finding bugs:seven-only`);
+  expect(refused.stderr).toContain("→ pass --head of a head whose record reports it, or record that review first");
+});
+
+test("record stores a report's texts through sanitize, so the event holds more bytes than the file it read", () => {
+  const { root, repo, home } = fixture();
+  const commit = (body: string, message: string) => {
+    writeFileSync(join(repo, "a.ts"), body);
+    git(repo, ["add", "a.ts"]);
+    git(repo, ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", message]);
+    return gitOut(repo, ["rev-parse", "HEAD"]);
+  };
+  const base = commit("export const a = 1;\n", "base");
+  const head = commit("export const a = 2;\n", "head");
+  const built = JSON.parse(run(repo, home, "packet", "--from", base, "--to", head, "--json").stdout);
+  // Every line looks like an untrusted header, so `sanitize` prefixes each one: what the ledger stores is larger than
+  // the file `arev record` read, which is the shape the record event's own bound is measured on.
+  const framed = Array.from({ length: 80 }, () => "[agent-hub note]").join("\n");
+  const report = join(root, "report.json");
+  writeFileSync(report, JSON.stringify(reportFor(head, {
+    packet: { id: built.id, subject: built.subject },
+    coverage: { reviewed: built.units.map((unit: { path: string }) => unit.path), skipped: [] },
+    findings: [finding({ id: "bugs:framed", text: framed })],
+  })));
+  const recorded = run(repo, home, "record", report, "--json");
+  expect(recorded.code, recorded.stderr).toBe(0);
+
+  const stored = readFileSync(ledgerPath(repo, { home }), "utf8").trim().split("\n").at(-1)!;
+  const storedText: string = JSON.parse(stored).record.findings[0].text;
+  const readText: string = JSON.parse(readFileSync(report, "utf8")).findings[0].text;
+  expect(storedText.startsWith("> [agent-hub note]")).toBe(true);
+  expect(Buffer.byteLength(storedText)).toBeGreaterThan(Buffer.byteLength(readText));
 });
 
 test("arev record --light keeps the flag on the record it appends, and show --json echoes it", () => {

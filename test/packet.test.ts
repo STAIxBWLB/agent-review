@@ -666,3 +666,19 @@ test("a local info/attributes override cannot supply an exclusion", () => {
   rmSync(join(dir, ".git", "info", "attributes"));
   expect(isolatedPacket(dir, request)).toEqual(clean);
 });
+
+test("an empty Git diff driver name cannot change the packet", () => {
+  const { dir, git, write } = fixture();
+  write(".gitattributes", "*.txt diff=\n");
+  write("file.txt", "original text\n");
+  git("add", ".");
+  git("commit", "-qm", "base");
+  write("file.txt", "updated text\n");
+  git("commit", "-qam", "head");
+  const request = { kind: "commit", commit: "HEAD" } as const;
+  const clean = isolatedPacket(dir, request);
+  expect(clean.packet.units.map(unit => unit.path)).toEqual(["file.txt"]);
+  expect(clean.diff).toContain("+updated text");
+  git("config", "diff..binary", "true");
+  expect(isolatedPacket(dir, request)).toEqual(clean);
+});

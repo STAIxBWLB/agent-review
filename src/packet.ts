@@ -160,7 +160,7 @@ function workspaceFilterOptions(cwd: string): string[] {
 
 /** Keep driver output deterministic. Git flags already disable external commands, textconv and word diff. */
 function diffDriverOverrides(cwd: string): string[] {
-  const configured = reviewGit(cwd, ["config", "--null", "--name-only", "--get-regexp", "^diff\\..+\\.(binary|algorithm|funcname|xfuncname)$"]);
+  const configured = reviewGit(cwd, ["config", "--null", "--name-only", "--get-regexp", "^diff\\..*\\.(binary|algorithm|funcname|xfuncname)$"]);
   if (configured.status !== 0 && configured.status !== 1) {
     throw new Error("Cannot inspect local Git diff drivers. Check the repository Git configuration and retry.");
   }

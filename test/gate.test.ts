@@ -4,7 +4,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, wr
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { gateReport } from "../src/gate.ts";
-import { appendEvent, ledgerPath, recordId, Refusal, type LedgerEvent, type PacketBlock, type ReviewRecordV1 } from "../src/ledger.ts";
+import { appendEvent, ledgerPath, recordId, Refusal, secretShaped, type LedgerEvent, type PacketBlock, type ReviewRecordV1 } from "../src/ledger.ts";
 import { parseReviewRecord } from "../src/record.ts";
 
 const roots: string[] = [];
@@ -109,7 +109,8 @@ function seed(options: { repo: string; home: string; subject: Subject; record: R
 /**
  * A `gh` that records its arguments instead of making a network call: the status write's to `argsPath`, the pull-request
  * read's to `argsPath.read`. `FAKE_GH_PULLS` is the JSON the read returns - a page array when the case exercises
- * pagination - `FAKE_GH_READ_ERROR` makes the read fail and `FAKE_GH_ERROR` makes the write fail.
+ * pagination - `FAKE_GH_READ_ERROR` makes the read fail, `FAKE_GH_ERROR` makes the write fail, and `FAKE_GH_HANG_READ` /
+ * `FAKE_GH_HANG_WRITE` make that call sit there until the gate gives up on its timeout.
  */
 function fakeGh(argsPath: string): string {
   const bin = temp("arev-bin-");
@@ -119,12 +120,14 @@ function fakeGh(argsPath: string): string {
     'case "$*" in',
     "  *repos/*/pulls*)",
     `    for arg in "$@"; do printf '%s\\n' "$arg" >> ${JSON.stringify(argsPath)}.read; done`,
+    '    if [ -n "$FAKE_GH_HANG_READ" ]; then sleep 25; fi',
     '    if [ -n "$FAKE_GH_READ_ERROR" ]; then printf "%s\\n" "$FAKE_GH_READ_ERROR" >&2; exit 1; fi',
     '    printf \'%s\' "${FAKE_GH_PULLS:-[]}"',
     "    exit 0 ;;",
     "esac",
     `: > ${JSON.stringify(argsPath)}`,
     `for arg in "$@"; do printf '%s\\n' "$arg" >> ${JSON.stringify(argsPath)}; done`,
+    'if [ -n "$FAKE_GH_HANG_WRITE" ]; then sleep 25; fi',
     'if [ -n "$FAKE_GH_ERROR" ]; then printf "%s\\n" "$FAKE_GH_ERROR" >&2; exit 1; fi',
     "exit 0",
     "",
@@ -775,4 +778,58 @@ test("a secret-shaped gh diagnostic is withheld from both refusals and from the 
   expect(write.stderr).not.toContain(token);
   expect(ledgerText()).not.toContain(token);
   expect(gating(repo, home).map(event => event.type)).toEqual(["gate", "gate"]);
+});
+
+test("a gh read that runs out of time is refused on its bound, with the retry, and posts nothing", () => {
+  const { repo, base, head, home } = fixture();
+  const subject: Subject = { kind: "range", base, head, mergeBase: base, pr: 7 };
+  seed({ repo, home, subject, record: recordFor(subject) });
+  const args = join(home, "gh-args.txt");
+  // The stub sits there until the gate's own 15 s bound kills it, which is the case a status check in a hook meets on a
+  // network that never answers: the gate gives up and says so, rather than leaving the hook waiting.
+  const read = run(repo, { PATH: `${fakeGh(args)}:${process.env.PATH ?? ""}`, AGENTHUB_HOME: home, FAKE_GH_HANG_READ: "1" }, "gate", "--pr", "7", "--post");
+  expect(read.code).toBe(1);
+  expect(read.stderr).toContain(`cannot read the open pull requests at ${head}: gh did not answer within 15 s`);
+  expect(read.stderr).toContain("→ retry arev gate --post once github.com is reachable from this machine");
+  // Nothing about a killed call is invented: the evaluation is in the ledger, the status write never happened.
+  expect(gating(repo, home).map(event => event.type)).toEqual(["gate"]);
+}, 25_000);
+
+test("a status write that runs out of time is refused on the same bound, after a read that succeeded", () => {
+  const { repo, base, head, home } = fixture();
+  const subject: Subject = { kind: "range", base, head, mergeBase: base, pr: 7 };
+  seed({ repo, home, subject, record: recordFor(subject) });
+  const args = join(home, "gh-args.txt");
+  const write = run(repo,
+    { PATH: `${fakeGh(args)}:${process.env.PATH ?? ""}`, AGENTHUB_HOME: home, FAKE_GH_HANG_WRITE: "1",
+      FAKE_GH_PULLS: JSON.stringify([{ number: 7, state: "open", head: { sha: head }, base: { sha: base } }]) },
+    "gate", "--pr", "7", "--post");
+  expect(write.code).toBe(1);
+  expect(write.stderr).toContain(`cannot post the arev/gate status on ${head}: gh did not answer within 15 s`);
+  expect(write.stderr).toContain("→ retry arev gate --post once github.com is reachable from this machine");
+  expect(gating(repo, home).map(event => event.type)).toEqual(["gate"]);
+}, 25_000);
+
+test("a diagnostic carrying URL userinfo is withheld, and the pattern does not swallow an ordinary URL", () => {
+  const { repo, base, head, home } = fixture();
+  const subject: Subject = { kind: "range", base, head, mergeBase: base, pr: 7 };
+  seed({ repo, home, subject, record: recordFor(subject) });
+  const args = join(home, "gh-args.txt");
+  // A remote or a diagnostic can carry the credential in the URL rather than in a token-shaped value, which is the shape
+  // no earlier pattern caught.
+  const credential = "https://oauth2:ghs-Sup3rS3cretValue@github.com/owner/repo";
+  const refused = run(repo,
+    { PATH: `${fakeGh(args)}:${process.env.PATH ?? ""}`, AGENTHUB_HOME: home, FAKE_GH_READ_ERROR: `HTTP 401: bad credentials for ${credential}` },
+    "gate", "--pr", "7", "--post");
+  expect(refused.code).toBe(1);
+  expect(refused.stderr).toContain(`cannot read the open pull requests at ${head}: <withheld>`);
+  expect(refused.stderr).not.toContain("Sup3rS3cretValue");
+
+  // The colon before the `@` is what makes a URL a credential: a scheme with a user but no password is not one, and
+  // neither is a host:port, so an ssh remote and an ordinary https URL keep passing through the screen.
+  expect(secretShaped(credential)).toBe(true);
+  expect(secretShaped("ssh://git@github.com/owner/repo")).toBe(false);
+  expect(secretShaped("git@github.com:owner/repo")).toBe(false);
+  expect(secretShaped("https://github.com:443/owner/repo")).toBe(false);
+  expect(secretShaped("https://github.com/owner/repo")).toBe(false);
 });

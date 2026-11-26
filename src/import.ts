@@ -26,12 +26,17 @@ function requireRows(raw: unknown, field: string): unknown[] {
   return raw;
 }
 
+/** Apply the record reader's trim before checking the equivalent repository-relative path. */
+function deniedExchangePath(value: string): boolean {
+  return isDenied(posix.normalize(value.trim()));
+}
+
 export function assertSafeExchange(value: unknown): void {
   const pending = [value];
   while (pending.length > 0) {
     const item = pending.pop();
     if (typeof item === "string") {
-      if (secretShaped(item) || (!/\s/.test(item) && isDenied(item))) {
+      if (secretShaped(item) || deniedExchangePath(item)) {
         throw new Error("The review exchange contains a denied path or secret-shaped value. Remove it before exchanging the report.");
       }
     } else if (item && typeof item === "object") {
@@ -130,13 +135,14 @@ function mapFinding(raw: unknown, format: ReviewSource["format"]): Row {
     bug: "bugs", security: "security",
   } as Record<string, string>)[typeof item.category === "string" ? item.category : ""] ?? "compliance";
   const location = typeof item.location === "string" ? /^(.*):(\d+)(?:-(\d+))?$/.exec(item.location) : null;
-  const path = item.path ?? location?.[1];
+  const rawPath = item.path ?? location?.[1];
+  const path = typeof rawPath === "string" ? rawPath.trim() : rawPath;
   const line = item.start_line ?? item.line ?? (location ? Number(location[2]) : undefined);
   const end = item.end_line ?? (location?.[3] ? Number(location[3]) : line);
   const text = item.text ?? item.content ?? item.title ?? item.description ??
     (format === "hub" ? item.rationale ?? item.id : undefined);
   if (typeof text !== "string" || !text.trim()) invalid("A finding needs a description");
-  if (path !== undefined && (typeof path !== "string" || !path || isDenied(path) ||
+  if (path !== undefined && (typeof path !== "string" || !path || deniedExchangePath(path) ||
       posix.isAbsolute(path) || win32.isAbsolute(path) || path.split("/").includes(".."))) {
     invalid("A finding path is invalid or denied");
   }

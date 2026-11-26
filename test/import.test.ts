@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
-import { appendEvent, readLedger } from "../src/ledger.ts";
+import { appendEvent, ledgerPath, readLedger } from "../src/ledger.ts";
 import { isolatedPacket } from "./packet-fixture.ts";
 import { exchangeFixture } from "./exchange-fixture.ts";
 
@@ -131,4 +131,18 @@ test("import uses the packet ID to select the correct review thread", () => {
   if (recorded?.type !== "record") throw new Error("missing record");
   expect(recorded.record.packet.id).toBe(originalPacketId);
   expect(recorded.record.packet.subject.pr).toBeUndefined();
+});
+
+test("denied finding paths are rejected after normalization, leaving the ledger unchanged", () => {
+  const { dir, home, ingest, load } = exchangeFixture();
+  const ledger = ledgerPath(dir, { home });
+  const before = readFileSync(ledger);
+  const report = load("ocr");
+  const findings = report.findings as Record<string, unknown>[];
+  for (const location of [{ path: " .env " }, { path: "./.env" }, { path: undefined, location: " ./private.key :1" }]) {
+    const result = ingest("ocr", { ...report, findings: [{ ...findings[0], ...location }] });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/denied path|path is invalid or denied/);
+    expect(readFileSync(ledger)).toEqual(before);
+  }
 });

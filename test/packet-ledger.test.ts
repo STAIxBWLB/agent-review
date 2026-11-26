@@ -1,7 +1,8 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { reviewProjectId } from "../src/ledger.ts";
 import { fixture } from "./packet-fixture.ts";
 
 const scratch: string[] = [];
@@ -22,8 +23,8 @@ function report(body: unknown): string {
 }
 
 /** A repository with one reviewed change, so `arev packet` has a range to build. */
-function reviewedFlow(review = "# Review\nEvery change gets a packet and a record.\n") {
-  const repo = fixture();
+function reviewedFlow(review = "# Review\nEvery change gets a packet and a record.\n", env: NodeJS.ProcessEnv = {}) {
+  const repo = fixture(env);
   const { git, write } = repo;
   write("REVIEW.md", review);
   write("src/a.ts", "export const a = 1;\n");
@@ -193,4 +194,36 @@ test("a workspace report written inside the worktree is itself a change and is r
   expect(refused.status).toBe(1);
   expect(refused.stderr).toContain("the packet changed since arev packet");
   expect(refused.stderr).toContain("keep the report outside the worktree");
+});
+
+test("a workspace or files packet refuses an --out directory inside the reviewed worktree", () => {
+  const { dir, write, cli } = reviewedFlow();
+  write("src/a.ts", "export const a = 9;\n");
+  // Both subjects count every uncommitted path, so the bundle they wrote there would be a change in the packet they
+  // describe: `record`'s rebuild would refuse the report written from it.
+  for (const subject of [["--workspace"], ["--files", "src/a.ts"]]) {
+    const refused = cli("packet", ...subject, "--out", join(dir, "bundle"));
+    expect(refused.status).toBe(1);
+    expect(refused.stderr).toContain("The --out directory is inside the reviewed worktree");
+    expect(refused.stderr).toContain("choose a directory outside the worktree");
+  }
+  expect(existsSync(join(dir, "bundle"))).toBe(false);
+});
+
+test("a packet whose event cannot be written leaves no bundle behind", () => {
+  const home = mkdtempSync(join(tmpdir(), "arev-hub-broken-"));
+  scratch.push(home);
+  const { base, head, dir, cli } = reviewedFlow("# Review\n", { AGENTHUB_HOME: home });
+  // A directory where the ledger file belongs makes the append fail after the bundle has been written.
+  const ledger = join(home, "review", ...reviewProjectId(dir).split("/"), "ledger.jsonl");
+  mkdirSync(ledger, { recursive: true });
+  const out = join(dirname(dir), "bundle");
+  scratch.push(out);
+  const failed = cli("packet", "--from", base, "--to", head, "--out", out);
+  expect(failed.status).toBe(1);
+  // The bundle goes with the event: nobody can report against it, and a retry would hit the exclusive open.
+  expect(existsSync(out)).toBe(false);
+  rmSync(ledger, { recursive: true, force: true });
+  expect(cli("packet", "--from", base, "--to", head, "--out", out).status).toBe(0);
+  expect(existsSync(join(out, "packet.json"))).toBe(true);
 });

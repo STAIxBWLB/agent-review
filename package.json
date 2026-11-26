@@ -10,7 +10,7 @@
   "bin": {
     "arev": "./bin/arev.js"
   },
-  "files": ["bin", "src", "README.md", "LICENSE"],
+  "files": ["bin", "src", "skills", "README.md", "LICENSE"],
   "scripts": {
     "check": "bun run typecheck && bun scripts/check-boundary.ts && bun scripts/gen-readme.ts --check && bun test",
     "typecheck": "tsc --noEmit"

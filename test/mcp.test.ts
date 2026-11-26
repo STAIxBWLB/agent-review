@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -256,4 +257,68 @@ test("MCP selects and resolves findings only in the requested PR thread", () => 
   expect(handlers.arev_show({ pr: "none" })).toMatchObject({ view: { openBlocking: ["bugs:fixture"] } });
   expect(handlers.arev_show({ pr: 7 })).toMatchObject({ view: { openBlocking: [] } });
   expect(handlers.arev_gate({ pr: "none" })).toMatchObject({ ok: false });
+});
+
+test("MCP records a contract-bearing packet without rereading the original contract", () => {
+  const { dir, base } = repo();
+  const entry = join(import.meta.dir, "../bin/arev.js");
+  const contract = join(dir, "local-contract.md");
+  writeFileSync(contract, "Original fixture contract\n");
+  const built = spawnSync(process.execPath, [entry, "packet", "--from", base, "--to", "HEAD",
+    "--contract", contract, "--json"], { cwd: dir, encoding: "utf8" });
+  expect(built.status, built.stderr).toBe(0);
+  const { packet } = JSON.parse(built.stdout);
+  expect(packet.contract).toMatchObject({ kind: "brief", ref: "local-contract.md" });
+  rmSync(contract);
+  const report = {
+    v: 1, packet,
+    reviewer: { id: "fixture-reviewer", modelFamily: "fixture-family", started: "manual", sameFamilyFallback: false },
+    coverage: { reviewed: ["src/a.ts"], skipped: [] },
+    findings: [], verdict: "approved", call: { ok: true },
+  };
+  const input = [
+    { jsonrpc: "2.0", id: 1, method: "initialize",
+      params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "fixture", version: "1" } } },
+    { jsonrpc: "2.0", method: "notifications/initialized" },
+    { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "arev_record", arguments: { report } } },
+  ].map(message => JSON.stringify(message)).join("\n") + "\n";
+  const recorded = spawnSync(process.execPath, [entry, "mcp"], { cwd: dir, input, encoding: "utf8", timeout: 15_000 });
+  expect(recorded.status, recorded.stderr).toBe(0);
+  const response = JSON.parse(recorded.stdout.trim().split("\n").at(-1)!);
+  expect(response.result.isError).toBeUndefined();
+  expect(JSON.parse(response.result.content[0].text).id).toMatch(/^[a-f0-9]{64}$/);
+  const event = readLedger(dir).at(-1);
+  expect(event).toMatchObject({ type: "record", record: { packet: { id: packet.id, contract: packet.contract } } });
+});
+
+test("MCP PR packet delivers the framed contract whose digest it binds", () => {
+  const { dir, base } = repo();
+  const head = buildPacket(dir, { kind: "range", base, head: "HEAD" }).packet.subject.head;
+  const bin = mkdtempSync(join(tmpdir(), "arev-mcp-contract-gh-"));
+  cleanup.push(bin);
+  writeFileSync(join(bin, "gh"), `#!/bin/sh
+case "$1:$3" in
+  pr:7) printf '%s\\n' '{"baseRefOid":"${base}","headRefOid":"${head}","title":"PR fixture","body":"Contract in #8"}' ;;
+  issue:8) printf '%s\\n' '{"body":"## Issue requirement"}' ;;
+  *) exit 1 ;;
+esac
+`, { mode: 0o755 });
+  const input = [
+    { jsonrpc: "2.0", id: 1, method: "initialize",
+      params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "fixture", version: "1" } } },
+    { jsonrpc: "2.0", method: "notifications/initialized" },
+    { jsonrpc: "2.0", id: 2, method: "tools/call",
+      params: { name: "arev_packet", arguments: { subject: "pr", number: "7" } } },
+  ].map(message => JSON.stringify(message)).join("\n") + "\n";
+  const run = spawnSync(process.execPath, [join(import.meta.dir, "../bin/arev.js"), "mcp"], {
+    cwd: dir, input, encoding: "utf8", timeout: 15_000, env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ""}` },
+  });
+  expect(run.status, run.stderr).toBe(0);
+  const response = JSON.parse(run.stdout.trim().split("\n").at(-1)!);
+  expect(response.result.isError).toBeUndefined();
+  const result = JSON.parse(response.result.content[0].text);
+  expect(result.contract).toContain("> ## Issue requirement");
+  expect(result.packet.contract.sha256).toBe(createHash("sha256").update(result.contract).digest("hex"));
+  expect(result.brief).toContain("the contract field of this result");
+  expect(result.brief).not.toContain("contract.md");
 });

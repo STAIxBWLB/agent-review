@@ -16,7 +16,7 @@ import { blocksApproval, findingTally, findingsForHead, positionalFindingId, typ
 import { deniedReportPath } from "./deny.ts";
 import { sanitize } from "./frame.ts";
 import { MAX_REPORT_BYTES, Refusal, appendEvent, lineShaped, readLedger, recordId, reviewProjectId, secretShaped, shown, stringsIn, type LedgerEvent, type PacketBlock, type RecordFinding, type ReviewRecordV1 } from "./ledger.ts";
-import { buildPacket, type PacketRequest } from "./packet.ts";
+import { bindPacketContract, buildPacket, type PacketRequest } from "./packet.ts";
 import { PacketUsageError } from "./packet-cli.ts";
 import { reviewGit } from "./review-git.ts";
 import { DEFAULT_ADVISORY_CAP, MAX_ADVISORY_CAP } from "./review-md.ts";
@@ -372,7 +372,9 @@ export function requireCurrentPacket(cwd: string, head: string, packetId: string
   if (request) {
     let rebuilt: string;
     try {
-      rebuilt = buildPacket(cwd, request).packet.id;
+      const packet = buildPacket(cwd, request).packet;
+      // The review names the contract captured with its packet. Rebuild Git data without re-reading mutable text.
+      rebuilt = bindPacketContract(packet, packetEvent.packet.contract).id;
     } catch (error) {
       // A packet that cannot be rebuilt cannot be shown to match, and an unrun check is not a pass.
       throw new Refusal(`arev cannot rebuild the packet for head ${head} to check the report against: ${shown(error instanceof Error ? error.message : "unknown error")}`,

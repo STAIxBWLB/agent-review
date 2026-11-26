@@ -11,7 +11,7 @@ import { serve, type Handler, type Tool } from "@staix/mcp-stdio";
 import { version } from "../package.json";
 import { gateReport } from "./gate.ts";
 import { Refusal, readLedger } from "./ledger.ts";
-import { buildPacket, type PacketRequest } from "./packet.ts";
+import { buildPacket, packetResult, type PacketRequest } from "./packet.ts";
 import { appendPacketEvent, packetSettings, rulesForPaths } from "./packet-cli.ts";
 import { ledgerEventsView, recordReview, resolveFinding, resolveHead, type ThreadSelector } from "./record.ts";
 
@@ -90,7 +90,7 @@ export function mcpHandlers(cwd: string): Record<McpToolName, Handler> {
       // `arev record` checks a report against the packet the ledger holds, so the tool writes it exactly as the command
       // does - the same cap from the same REVIEW.md - and only then hands the packet back.
       appendPacketEvent(cwd, bundle, packetSettings(cwd, bundle));
-      return { packet: bundle.packet, brief: bundle.brief, rulesMissing: bundle.rulesMissing };
+      return packetResult(bundle);
     },
     arev_rules: args => {
       const paths = pathsArgument(args.paths);

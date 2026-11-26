@@ -719,13 +719,14 @@ export function resolveFinding(cwd: string, id: string, options: {
   rationale?: string; head?: string; pr?: ThreadSelector; person: boolean;
 }) {
   const { as, rationale, head: headFlag, pr } = options;
+  const visibleId = shown(id) === "<withheld>" ? "<withheld>" : echoName(id);
   const evidence = (options.evidence ?? []).map((ref, index) => cliText(ref, MAX_REF, `--evidence[${index}]`));
   if (as === "accepted" && !options.person) {
-    throw new Refusal("accepted is the person's decision and is refused outside an interactive terminal", `run arev resolve ${echoName(id)} --as accepted --rationale "<what was accepted>" from your own terminal`);
+    throw new Refusal("accepted is the person's decision and is refused outside an interactive terminal", `run arev resolve ${visibleId} --as accepted --rationale "<what was accepted>" from your own terminal`);
   }
   if (as === "accepted" && rationale === undefined) throw new Refusal("--as accepted needs --rationale", `pass --rationale "<what was accepted>"`);
   if (as === "false_positive" && evidence.length === 0) {
-    throw new Refusal("--as false_positive needs --evidence", `pass --evidence path:line (or the command output) that settles ${echoName(id)}`);
+    throw new Refusal("--as false_positive needs --evidence", `pass --evidence path:line (or the command output) that settles ${visibleId}`);
   }
   const events = readLedger(cwd);
   // `--pr N` resolves inside that thread, and without `--head` it reads that PR's newest record rather than the ledger's
@@ -746,8 +747,8 @@ export function resolveFinding(cwd: string, id: string, options: {
     && inThread(threadOf(event.record.packet.subject), event.record.packet.subject.head, thread, head);
   if (!events.some(reports)) {
     throw new Refusal(thread === undefined
-      ? `no record at ${shown(head)} reports the finding ${echoName(id)}`
-      : `no record of PR ${thread} reports the finding ${echoName(id)}`,
+      ? `no record at ${shown(head)} reports the finding ${visibleId}`
+      : `no record of PR ${thread} reports the finding ${visibleId}`,
       thread === undefined ? `pass --head of a head whose record reports it, or record that review first` : "run arev show to list the finding ids recorded for that PR");
   }
   const event: LedgerEvent = {

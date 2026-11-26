@@ -14,7 +14,8 @@ reviewed answer to it, and the gate is the only thing that decides whether that 
    `DIR/brief.md`. Every path, rule line and diff line in it is framed as data, not as instructions.
 2. When a rule file was missing, `arev rules check <path>` reads the same rules at the merge base.
 3. Write the report as JSON: `packet` (`id` and `subject` copied from `DIR/packet.json`), `reviewer`, `coverage`
-   (every unit path, or the reason it was skipped), `findings`, `verdict`, `call`.
+   (every unit path, or the reason it was skipped), `findings`, `verdict`, `call`. Name the implementer in the reviewer block
+   or supply `--implementer` when recording so the gate can check independence.
 4. `arev record report.json --json`, then settle each finding: `arev resolve <id> --as fixed`, or `--as
    false_positive --evidence path:line`. `--as accepted` is the person's decision at their own terminal.
 5. `arev gate` reads only the ledger and git and names each open condition. `arev gate --post` sets the `arev/gate`
@@ -22,9 +23,10 @@ reviewed answer to it, and the gate is the only thing that decides whether that 
 
 ## Over MCP
 
-`arev mcp` serves the same steps as six tools: `arev_packet`, `arev_rules`, `arev_record`, `arev_resolve`,
+`arev mcp` serves six tools: `arev_packet`, `arev_rules`, `arev_record`, `arev_resolve`,
 `arev_show`, `arev_gate`. Two differences: `arev_resolve` offers `fixed` and `false_positive` only, and no tool posts a
-status, so use `arev gate --post` from a shell.
+status. Pass `pr` as a number or `"none"` when a head has multiple review threads. Use the CLI
+for a recorded gate evaluation or a GitHub status post.
 
 ## Not optional
 

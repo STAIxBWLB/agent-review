@@ -4,8 +4,9 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { argumentError } from "@staix/mcp-stdio";
-import { Refusal, readLedger } from "../src/ledger.ts";
+import { Refusal, appendEvent, readLedger } from "../src/ledger.ts";
 import { MCP_TOOLS, mcpFailureText, mcpHandlers } from "../src/mcp.ts";
+import { buildPacket } from "../src/packet.ts";
 
 const cleanup: string[] = [];
 const savedHome = process.env.AGENTHUB_HOME;
@@ -194,4 +195,62 @@ test("the AC9 flow runs over the tools, validated as the protocol validates it",
   expect(gated.open).toEqual([]);
   expect(gated.ok).toBe(true);
   expect(gated.record).toBe(recorded.id);
+});
+
+test("stdio packet, record and gate complete over actual JSON-RPC", () => {
+  const { dir, base } = repo();
+  const { packet } = buildPacket(dir, { kind: "range", base, head: "HEAD" });
+  const report = {
+    v: 1, packet,
+    reviewer: { id: "reviewer-fixture", modelFamily: "fixture-family", started: "manual",
+      implementer: "implementer-fixture", sameFamilyFallback: false },
+    coverage: { reviewed: packet.units.map(unit => unit.path), skipped: [] },
+    findings: [], verdict: "approved", call: { ok: true },
+  };
+  const call = (id: number, name: string, args: Record<string, unknown>) =>
+    ({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } });
+  const input = [
+    { jsonrpc: "2.0", id: 1, method: "initialize",
+      params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "fixture", version: "1" } } },
+    { jsonrpc: "2.0", method: "notifications/initialized" },
+    call(2, "arev_packet", { subject: "range", base, head: "HEAD" }),
+    call(3, "arev_record", { report }),
+    call(4, "arev_gate", { pr: "none" }),
+    call(5, "arev_resolve", { finding: "bugs:fixture", as: "accepted" }),
+  ].map(message => JSON.stringify(message)).join("\n") + "\n";
+  const run = spawnSync(process.execPath, [join(import.meta.dir, "../bin/arev.js"), "mcp"],
+    { cwd: dir, input, encoding: "utf8", timeout: 15_000 });
+  expect(run.status).toBe(0);
+  expect(run.stderr).toBe("");
+  const replies = run.stdout.trim().split("\n").map(line => JSON.parse(line));
+  expect(replies.map(reply => reply.id)).toEqual([1, 2, 3, 4, 5]);
+  expect(JSON.parse(replies[1].result.content[0].text).packet.id).toBe(packet.id);
+  const recorded = JSON.parse(replies[2].result.content[0].text);
+  expect(recorded.id).toMatch(/^[a-f0-9]{64}$/);
+  expect(JSON.parse(replies[3].result.content[0].text)).toMatchObject({ ok: true, record: recorded.id });
+  expect(replies[4].error.code).toBe(-32602);
+  expect(readLedger(dir).map(event => event.type)).toEqual(["packet", "record"]);
+});
+
+test("MCP selects and resolves findings only in the requested PR thread", () => {
+  const { dir, base } = repo();
+  const handlers = mcpHandlers(dir);
+  for (const pr of [undefined, 7] as const) {
+    const { packet } = buildPacket(dir, { kind: "range", base, head: "HEAD", pr });
+    appendEvent(dir, { v: 1, type: "packet", at: "2026-11-26T00:00:00Z", packet });
+    handlers.arev_record({ report: {
+      v: 1, packet,
+      reviewer: { id: "reviewer-fixture", modelFamily: "fixture-family", started: "manual",
+        implementer: "implementer-fixture", sameFamilyFallback: false },
+      coverage: { reviewed: packet.units.map(unit => unit.path), skipped: [] },
+      findings: [{ id: "bugs:fixture", term: "bugs", severity: "blocking",
+        text: "Fixture finding", disposition: "open", origin: "introduced" }],
+      verdict: "changes_requested", call: { ok: true },
+    } });
+  }
+  expect(() => handlers.arev_show({})).toThrow("more than one thread");
+  handlers.arev_resolve({ finding: "bugs:fixture", as: "fixed", pr: 7 });
+  expect(handlers.arev_show({ pr: "none" })).toMatchObject({ view: { openBlocking: ["bugs:fixture"] } });
+  expect(handlers.arev_show({ pr: 7 })).toMatchObject({ view: { openBlocking: [] } });
+  expect(handlers.arev_gate({ pr: "none" })).toMatchObject({ ok: false });
 });

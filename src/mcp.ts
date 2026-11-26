@@ -12,10 +12,8 @@ import { version } from "../package.json";
 import { gateReport } from "./gate.ts";
 import { Refusal, readLedger } from "./ledger.ts";
 import { buildPacket, type PacketRequest } from "./packet.ts";
-import { appendPacketEvent, packetSettings } from "./packet-cli.ts";
-import { ledgerEventsView, recordReview, resolveFinding } from "./record.ts";
-import { commitOid, mergeBaseOid, reviewGit } from "./review-git.ts";
-import { readRules } from "./rules.ts";
+import { appendPacketEvent, packetSettings, rulesForPaths } from "./packet-cli.ts";
+import { ledgerEventsView, recordReview, resolveFinding, resolveHead, type ThreadSelector } from "./record.ts";
 
 const text = (value: unknown): string | undefined =>
   typeof value === "string" && value.trim() !== "" ? value : undefined;
@@ -35,15 +33,16 @@ function pathsArgument(value: unknown): string[] | undefined {
 const FINDING_ID = /^[A-Za-z0-9._:-]{1,96}$/;
 const FULL_OID = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 
-/**
- * The merge base `arev rules` reads: the origin default branch against the repository's HEAD. `arev rules` and
- * `arev gate` each carry this lookup with their own refusal, so this copy leaves both of them alone.
- */
-function defaultBase(cwd: string): string {
-  const defaultRef = ["origin/HEAD", "origin/main", "origin/master"].find(ref =>
-    reviewGit(cwd, ["rev-parse", "--verify", "-q", `${ref}^{commit}`]).status === 0);
-  if (!defaultRef) return fail("no origin default branch is available", "fetch origin and run git remote set-head origin --auto");
-  return mergeBaseOid(cwd, commitOid(cwd, defaultRef), commitOid(cwd, "HEAD"));
+function reviewThread(value: unknown): ThreadSelector | undefined {
+  if (value === undefined || value === "none") return value;
+  if (typeof value === "number" && Number.isSafeInteger(value) && value > 0) return value;
+  return fail("pr must be a positive pull request number or none", "pass the review's PR number, or none to select the no-PR thread");
+}
+
+function reviewHead(value: unknown, tool: string): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value === "string" && FULL_OID.test(value)) return value;
+  return fail(`${tool} needs head: a full commit SHA`, "pass the full head SHA from the review packet");
 }
 
 /** The `arev packet` subject a call asks for. No refusal echoes an argument: each names the argument instead. */
@@ -98,8 +97,7 @@ export function mcpHandlers(cwd: string): Record<McpToolName, Handler> {
       if (paths === undefined) return fail("arev_rules needs paths: one or more repository-relative paths", "pass paths: the files whose rules you need");
       // The merge base is always the computed one: a caller-supplied base could name HEAD, and rules read from the head
       // are the rules the change itself rewrote, which is what AC2 exists to prevent.
-      const base = defaultBase(cwd);
-      const rules = readRules(cwd, base, paths.map(path => ({ path, sides: [path] })));
+      const { base, rules } = rulesForPaths(cwd, paths);
       return { base, ...rules };
     },
     arev_record: args => {
@@ -110,7 +108,7 @@ export function mcpHandlers(cwd: string): Record<McpToolName, Handler> {
       const implementer = text(args.implementer);
       // No `light` here: a report's lightness is the reviewer's claim about how the review was made and it relaxes the
       // gate, so only `arev record --light` at a terminal states it (AC2). A server is never a person.
-      return recordReview(cwd, report, { label: "argument", person: false,
+      return recordReview(cwd, report, { label: "argument",
         ...(implementer === undefined ? {} : { implementer }) });
     },
     arev_resolve: args => {
@@ -129,21 +127,23 @@ export function mcpHandlers(cwd: string): Record<McpToolName, Handler> {
       }
       const evidence = args.evidence === undefined ? [] : pathsArgument(args.evidence);
       if (evidence === undefined) return fail("arev_resolve evidence must be one or more strings", "pass evidence: a path:line or a command's output that settles the finding");
-      const rationale = text(args.rationale), head = text(args.head);
-      // A head is the ledger key the resolve is written at, so it is a full SHA or nothing: a caller-supplied value is
-      // never echoed, and one that is not an OID would key a resolve to a head no review has.
-      if (head !== undefined && !FULL_OID.test(head)) return fail("arev_resolve needs head: a full commit SHA", "pass head: the full 40-character SHA arev_show names");
-      return resolveFinding(cwd, finding, { as, person: false, evidence,
-        ...(rationale === undefined ? {} : { rationale }), ...(head === undefined ? {} : { head }) });
+      const rationale = text(args.rationale);
+      const head = reviewHead(args.head, "arev_resolve");
+      const pr = reviewThread(args.pr);
+      return resolveFinding(cwd, finding, { as, person: false, evidence, head, pr, rationale });
     },
     arev_show: args => {
+      const requested = reviewHead(args.head, "arev_show");
+      const head = requested === undefined ? undefined : resolveHead(cwd, requested);
+      const pr = reviewThread(args.pr);
       const events = readLedger(cwd);
       if (events.length === 0) return { events: 0 };
-      return { events: events.length, view: ledgerEventsView(events, text(args.head)) };
+      return { events: events.length, view: ledgerEventsView(events, head, pr) };
     },
     arev_gate: args => {
-      const head = text(args.head);
-      return gateReport(cwd, head === undefined ? {} : { head });
+      const head = reviewHead(args.head, "arev_gate");
+      const pr = reviewThread(args.pr);
+      return gateReport(cwd, { head, pr });
     },
   };
 }
@@ -155,6 +155,10 @@ const REPORT_SCHEMA = {
   // ReviewRecordV1. A schema that closes the object refuses every real report before its handler runs - the protocol
   // reports `report: unknown argument: v` - and an empty schema is its spelling of "any JSON-safe value".
   additionalProperties: {},
+} as const;
+
+const THREAD_SCHEMA = {
+  oneOf: [{ type: "integer", minimum: 1 }, { type: "string", enum: ["none"] }],
 } as const;
 
 export const MCP_TOOLS: readonly (Tool & { name: McpToolName })[] = [
@@ -211,6 +215,7 @@ export const MCP_TOOLS: readonly (Tool & { name: McpToolName })[] = [
         evidence: { type: "array", items: { type: "string" }, maxItems: 16, description: "path:line or command output, required for false_positive." },
         rationale: { type: "string", description: "What was settled and why, at most 2048 bytes." },
         head: { type: "string", description: "Full head SHA to resolve against; defaults to the newest record's." },
+        pr: THREAD_SCHEMA,
       },
       required: ["finding", "as"],
       additionalProperties: false,
@@ -223,6 +228,7 @@ export const MCP_TOOLS: readonly (Tool & { name: McpToolName })[] = [
       type: "object",
       properties: {
         head: { type: "string", description: "Full head SHA; defaults to the newest record's head." },
+        pr: THREAD_SCHEMA,
       },
       additionalProperties: false,
     },
@@ -234,6 +240,7 @@ export const MCP_TOOLS: readonly (Tool & { name: McpToolName })[] = [
       type: "object",
       properties: {
         head: { type: "string", description: "Full head SHA; defaults to the repository's HEAD." },
+        pr: THREAD_SCHEMA,
       },
       additionalProperties: false,
     },

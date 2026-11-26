@@ -61,8 +61,8 @@ export function runPacket(cwd: string, args: readonly string[]): number | void {
 
   const bundle = buildPacket(cwd, request);
   // `arev record` validates a report against the packet arev builds for that head, and the ledger's packet event is
-  // where that packet is kept, so it is written before the reviewer can hold a packet.json without one. REVIEW.md's
-  // settings are read from the same merge-base rule text the packet was built from, and the cap is kept with the event
+  // where that packet is kept, so the event is written before this command returns, whatever it delivered. REVIEW.md's
+  // settings are read from the whole merge-base rule text the packet was built from, and the cap is kept with the event
   // so the report is checked against the REVIEW.md this packet was built under.
   let settings: ReviewMdSettings;
   try {
@@ -73,7 +73,6 @@ export function runPacket(cwd: string, args: readonly string[]): number | void {
     for (const line of errorLine("arev", error.message, "", { tty: Boolean(process.stderr.isTTY), next: error.next })) console.error(line);
     return EXIT.fail;
   }
-  appendEvent(cwd, { v: 1, type: "packet", at: new Date().toISOString(), packet: bundle.packet, review: { advisory_cap: settings.advisoryCap } });
   const json = JSON.stringify(bundle.packet, null, 2);
   if (values.out !== undefined) {
     const destination = resolve(cwd, values.out);
@@ -105,12 +104,15 @@ export function runPacket(cwd: string, args: readonly string[]): number | void {
       }
       throw new Error("Cannot write packet files. Choose a writable output directory without existing packet files.");
     }
-  } else {
-    if (values.json && bundle.rulesMissing.some(rule => rule.source === "REVIEW.md")) {
-      console.error("arev: REVIEW.md is unavailable at the merge base. Rerun without --json or use --out DIR for the brief.");
-    }
-    console.log(values.json ? json : bundle.brief);
   }
+  // The event is written once the packet is delivered, and before this command returns: a failed `--out` export leaves
+  // no event behind, so it cannot make the report for the packet the reviewer actually holds look stale.
+  appendEvent(cwd, { v: 1, type: "packet", at: new Date().toISOString(), packet: bundle.packet, review: { advisory_cap: settings.advisoryCap } });
+  if (values.out !== undefined) return;
+  if (values.json && bundle.rulesMissing.some(rule => rule.source === "REVIEW.md")) {
+    console.error("arev: REVIEW.md is unavailable at the merge base. Rerun without --json or use --out DIR for the brief.");
+  }
+  console.log(values.json ? json : bundle.brief);
 }
 
 export function runRules(cwd: string, args: readonly string[]): void {

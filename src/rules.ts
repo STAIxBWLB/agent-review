@@ -9,6 +9,7 @@ const MAX_RULE_FILES = 8;
 const attributes = ["linguist-generated", "arev-review-rules", "ahub-review-rules"] as const;
 type RuleAttribute = typeof attributes[number];
 export interface RuleMissing { source: string; reason: string }
+/** `text` is the whole blob at the merge base: REVIEW.md's settings are read from it, and `renderRules` cuts it for display. */
 export interface RuleText { name: string; sha256: string; appliesTo: string[]; text: string }
 export interface RuleSet {
   rules: RuleText[];
@@ -66,10 +67,7 @@ export function readRules(
       return;
     }
     const bytes = content.stdout;
-    const text = bytes.length > RULE_BYTES
-      ? `${bytes.subarray(0, RULE_BYTES).toString("utf8")}\n[cut at ${RULE_BYTES} bytes]`
-      : bytes.toString("utf8");
-    const rule = { name, sha256: createHash("sha256").update(bytes).digest("hex"), appliesTo: [], text };
+    const rule = { name, sha256: createHash("sha256").update(bytes).digest("hex"), appliesTo: [], text: bytes.toString("utf8") };
     loaded.set(name, rule);
     return rule;
   }
@@ -101,6 +99,12 @@ export function readRules(
   return { rules: [...loaded.values()], missing: [...missed.values()], via };
 }
 
+/** A rule's text for display: bounded at RULE_BYTES with the cut named, so a reader knows it is partial. */
+const displayed = (text: string): string => {
+  const bytes = Buffer.from(text, "utf8");
+  return bytes.length > RULE_BYTES ? `${bytes.subarray(0, RULE_BYTES).toString("utf8")}\n[cut at ${RULE_BYTES} bytes]` : text;
+};
+
 export function renderRules({ rules, missing, via }: RuleSet, includeText = true): string {
   return [
     ...rules.map(rule => [
@@ -108,7 +112,7 @@ export function renderRules({ rules, missing, via }: RuleSet, includeText = true
       frame(rule.name),
       "Applies to:",
       frame(rule.appliesTo.join("\n") || "(no reviewable paths)"),
-      ...(includeText ? ["Rule text:", frame(rule.text.trimEnd())] : [
+      ...(includeText ? ["Rule text:", frame(displayed(rule.text).trimEnd())] : [
         rule.name === "REVIEW.md" ? "Source: repository-wide REVIEW.md." :
           `Source: base-tree ${[...(via.get(rule.name) ?? [])].join(" or ")} attribute.`,
       ]),

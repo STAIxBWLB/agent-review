@@ -1,7 +1,8 @@
 /**
- * REVIEW.md's settings sections, read from the rule text at the packet's merge base (spec #1, Decisions 2026-11-26):
- * `[review] advisory_cap = N` and `[gate] same_family = allow|deny`. One parser for both sections, so `arev packet` and
- * `arev gate` read one spelling of the file and neither can drift from the other.
+ * REVIEW.md's settings sections, read from the whole rule blob at the packet's merge base (spec #1, Decisions
+ * 2026-11-26): `[review] advisory_cap = N` and `[gate] same_family = allow|deny`. One parser for both sections, so
+ * `arev packet` and `arev gate` read one spelling of the file and neither can drift from the other. `RuleText.text` is
+ * the whole blob, not the 32,000-byte display text, so a section at the end of a long REVIEW.md is still read.
  *
  * A key arev does not read is refused by name rather than ignored, and so is a value outside its shape or range: a typo
  * would otherwise leave a guard off, or a cap unbounded, with nothing saying so. `REVIEW.md` is content under review,

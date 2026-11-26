@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fixture } from "./packet-fixture.ts";
@@ -80,6 +80,36 @@ test("the packet event keeps REVIEW.md's advisory_cap, so the report is capped b
   const refused = cli("record", report(reportFor(packet, { findings: advisories, verdict: "changes_requested" })));
   expect(refused.status).toBe(1);
   expect(refused.stderr).toContain("3 advisory findings exceed the cap of 2");
+});
+
+test("a REVIEW.md section past the 32,000-byte display cut still sets the advisory cap", () => {
+  // 1,000 rule lines are 44,000 bytes, so the file's own tail is past the point the display and the brief are cut at.
+  const long = `# Review\n${"- Every change is reviewed against its packet.\n".repeat(1_000)}\n[review] advisory_cap = 2\n`;
+  expect(Buffer.byteLength(long)).toBeGreaterThan(32_000);
+  const { base, head, cli } = reviewedFlow(long);
+  const packet = JSON.parse(cli("packet", "--from", base, "--to", head, "--json").stdout) as BuiltPacket;
+  const advisories = [0, 1, 2].map(index => ({
+    id: `bugs:advisory-${index}`, term: "bugs", severity: "advisory", disposition: "open", origin: "introduced", text: `advisory ${index}`,
+  }));
+  const refused = cli("record", report(reportFor(packet, { findings: advisories, verdict: "changes_requested" })));
+  expect(refused.status).toBe(1);
+  expect(refused.stderr).toContain("3 advisory findings exceed the cap of 2");
+});
+
+test("a failed --out export leaves no packet event behind", () => {
+  const { base, head, dir, cli } = reviewedFlow();
+  // An existing packet.json makes the export refuse after it wrote nothing, so the packet never reaches a reviewer.
+  const out = join(dir, "packets");
+  mkdirSync(out, { recursive: true });
+  writeFileSync(join(out, "packet.json"), "written by an earlier run\n");
+  const failed = cli("packet", "--from", base, "--to", head, "--out", out);
+  expect(failed.status).toBe(1);
+  expect(failed.stderr).toContain("Cannot write packet files");
+  // The export that did not happen is not a packet in the ledger: only the packet a reviewer holds is recorded.
+  expect(cli("show").stdout).toContain("no review ledger");
+  const delivered = join(dir, "delivered");
+  expect(cli("packet", "--from", base, "--to", head, "--out", delivered).status).toBe(0);
+  expect(JSON.parse(cli("show", "--json").stdout).packet).toMatch(/^[a-f0-9]{64}$/);
 });
 
 test("a REVIEW.md section arev does not read refuses the packet and writes no packet event", () => {

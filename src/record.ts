@@ -170,7 +170,10 @@ export function parseReviewRecord(raw: unknown, options: RecordOptions): ReviewR
       return { path: text(skipped.path, MAX_PATH, `coverage.skipped[${index}].path`, "path"), reason: text(skipped.reason, MAX_TEXT, `coverage.skipped[${index}].reason`) };
     }),
   };
-  const covered = new Set([...coverage.reviewed, ...coverage.skipped.map(entry => entry.path)]);
+  // Compared as the report wrote them, not by the stored spelling: `text` frames a path for display, so a real path that
+  // begins with a framed header (`--- from x`) would otherwise never match the unit the packet names.
+  const exactPath = (raw: unknown): string => (typeof raw === "string" ? raw.trim() : "");
+  const covered = new Set([...reviewedRows.map(exactPath), ...skippedRows.map(entry => exactPath(own(entry, "path")))]);
   const missing = (options.packet.units ?? []).map(unit => unit.path).filter(path => !covered.has(path));
   if (missing.length > 0) {
     refuse(`coverage omits ${missing.length} packet unit(s): ${missing.slice(0, 5).join(", ")}${missing.length > 5 ? ", ..." : ""}`,
@@ -308,14 +311,19 @@ export function ledgerEventsView(events: readonly LedgerEvent[], head?: string):
     ? (lastPacket?.type === "packet" ? lastPacket : undefined)
     : [...events].reverse().find(event => event.type === "packet" && event.packet.subject.head === target);
   const recordEvent = [...events].reverse().find(event => event.type === "record" && event.record.packet.subject.head === target);
+  // The text and evidence a view prints belong to the records it replays: a record for a later head describes a review
+  // this head never had, so a report text from it is not shown here.
+  const recordIndex = recordEvent === undefined ? -1 : events.lastIndexOf(recordEvent);
 
   const sets: ReviewFindingSet[] = [];
-  const latest = new Map<string, RecordFinding>(), evidence = new Map<string, string[]>();
-  for (const event of events) {
+  const latest = new Map<string, RecordFinding>(), shown = new Map<string, RecordFinding>(), evidence = new Map<string, string[]>();
+  for (const [index, event] of events.entries()) {
     if (event.type === "record") {
       sets.push({ head: event.record.packet.subject.head, items: event.record.findings.map(lifecycle) });
       for (const finding of event.record.findings) {
         latest.set(finding.id, finding);
+        if (recordIndex !== -1 && index > recordIndex) continue;
+        shown.set(finding.id, finding);
         if (finding.evidence?.length) evidence.set(finding.id, [...finding.evidence]);
         else evidence.delete(finding.id);
       }
@@ -336,7 +344,7 @@ export function ledgerEventsView(events: readonly LedgerEvent[], head?: string):
 
   const findings = findingsForHead(sets, target).map(finding => ({
     ...finding,
-    ...(latest.get(finding.id)?.text === undefined ? {} : { text: latest.get(finding.id)!.text }),
+    ...(shown.get(finding.id)?.text === undefined ? {} : { text: shown.get(finding.id)!.text }),
     ...(evidence.has(finding.id) ? { evidence: evidence.get(finding.id)! } : {}),
   }));
   // A record's own packet is the one its report was validated against, so it wins over the newest packet event for the

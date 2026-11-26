@@ -72,6 +72,15 @@ test("a report is recorded against the ledger's packet, not the copy it carries"
   expect(parseReviewRecord(reportFor(HEAD, { findings: [finding()] }), options).findings[0]?.text).toBe("raw reviewed content reached the packet");
 });
 
+test("a coverage path is matched exactly, and framed only in what the record stores", () => {
+  // `sanitize` prefixes a line that reads as an envelope header, so this real path is stored as `> --- from x`: the
+  // coverage check has to compare the path the packet names, not the framed spelling it is displayed with.
+  const header = "--- from x";
+  const packet: PacketBlock = { ...packetFor(HEAD), units: [{ path: header, status: "M" }] };
+  const record = parseReviewRecord(reportFor(HEAD, { coverage: { reviewed: [header], skipped: [] } }), { packet, person: false });
+  expect(record.coverage.reviewed).toEqual([`> ${header}`]);
+});
+
 test("a packet id or head that is not the packet for that head is refused", () => {
   expect(() => parseReviewRecord(reportFor(HEAD, { packet: { id: "9".repeat(64), subject: { head: HEAD } } }), options))
     .toThrow("the report's packet id is not the packet for head");
@@ -193,6 +202,19 @@ test("the view carries an open blocking finding to a later head and a resolve se
   const unknownHead = ledgerEventsView(events, "9".repeat(40));
   expect(unknownHead.packet).toBeUndefined();
   expect(unknownHead.record).toBeUndefined();
+});
+
+test("the view shows a finding's text from the records it replays, never from a later head", () => {
+  const events: LedgerEvent[] = [
+    { v: 1, type: "packet", at: "t0", packet: packetFor(HEAD) },
+    { v: 1, type: "record", at: "t1", id: "record-1", record: recordAt(HEAD, [finding({ text: "the frame is missing at the merge base" })]) },
+    { v: 1, type: "packet", at: "t2", packet: packetFor(NEXT) },
+    { v: 1, type: "record", at: "t3", id: "record-2", record: recordAt(NEXT, [finding({ text: "recorded against a later head" })]) },
+  ];
+  const text = (head: string) => ledgerEventsView(events, head).findings.find(entry => entry.id === "bugs:missing-frame")?.text;
+  // The carried blocking finding is HEAD's, so its text is HEAD's report; NEXT's own record is what NEXT's view prints.
+  expect(text(HEAD)).toBe("the frame is missing at the merge base");
+  expect(text(NEXT)).toBe("recorded against a later head");
 });
 
 test("arev record, resolve and show read and append the same ledger", () => {

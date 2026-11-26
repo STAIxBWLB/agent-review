@@ -58,11 +58,26 @@ const shownHead = (value: string): string =>
   HEX.test(value) ? ` (got ${value})` : ` (got ${value.length} characters that are not a hexadecimal commit SHA)`;
 
 /**
- * The one line of a failed `gh` call a refusal may print. gh's own text is data read from outside arev, so it is
- * screened like any other untrusted value: a secret-shaped line leaves the exit status as the only detail to name.
+ * The bound both gh calls take, the same one `arev packet --pr` gives its own `gh pr view` (src/packet.ts): a metadata
+ * read or a status write that has not answered in fifteen seconds is a network that is not going to, and the gate is
+ * meant to be runnable in a hook.
  */
-const ghDetail = (result: { status: number | null; stdout: string; stderr: string }): string =>
-  shown((result.stderr || result.stdout || "").trim().split("\n").filter(Boolean)[0] ?? `gh exited ${result.status}`);
+const GH_TIMEOUT_MS = 15_000;
+const GH_MAX_BUFFER = 32_000;
+/** Both gh calls here are repeatable, so a call that ran out of time is answered with the retry rather than a repair. */
+const GH_TIMEOUT_NEXT = "retry arev gate --post once github.com is reachable from this machine";
+
+/** A gh call `spawnSync` killed on that bound: no status, and either the timeout error or the signal that ended it. */
+const timedOut = (result: { status: number | null; error?: Error; signal?: string | null }): boolean =>
+  result.status === null && ((result.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT" || result.signal === "SIGTERM");
+
+/**
+ * What a refusal may say about a failed `gh` call. A call that ran out of time printed nothing to screen, so the bound
+ * is the detail; otherwise gh's own first line goes through `shown`, because it is data read from outside arev.
+ */
+const ghDetail = (result: { status: number | null; stdout: string; stderr: string; error?: Error; signal?: string | null }): string =>
+  timedOut(result) ? `gh did not answer within ${GH_TIMEOUT_MS / 1000} s`
+    : shown((result.stderr || result.stdout || "").trim().split("\n").filter(Boolean)[0] ?? `gh exited ${result.status}`);
 
 /**
  * The gate's decision, with no output and no side effect. `head` defaults to the repository's current HEAD, and `pr`
@@ -165,10 +180,10 @@ function openPrsAt(cwd: string, repository: string, head: string): PullRequest[]
   // `--hostname` is pinned because `GH_HOST` or gh's own default would send this read, and the status write with it, to
   // another host. `--paginate --slurp` reads every page: a second page can hold an open PR at this head too.
   const result = spawnSync("gh", ["api", "--hostname", "github.com", "--paginate", "--slurp", `repos/${repository}/commits/${head}/pulls`],
-    { cwd, encoding: "utf8" });
+    { cwd, encoding: "utf8", timeout: GH_TIMEOUT_MS, maxBuffer: GH_MAX_BUFFER });
   if (result.status !== 0) {
     throw new Refusal(`cannot read the open pull requests at ${head}: ${ghDetail(result)}`,
-      "check that gh is authenticated and may read this repository's pull requests");
+      timedOut(result) ? GH_TIMEOUT_NEXT : "check that gh is authenticated and may read this repository's pull requests");
   }
   let parsed: unknown;
   try { parsed = JSON.parse(result.stdout); } catch { parsed = undefined; }
@@ -234,10 +249,11 @@ export function postStatus(head: string, record: string, repository: string, cwd
   }
   // The host is pinned for the write as well: `GH_HOST` would otherwise decide where this status lands.
   const result = spawnSync("gh", ["api", "--hostname", "github.com", "--method", "POST", `repos/${repository}/statuses/${head}`,
-    "-f", "state=success", "-f", `context=${STATUS_CONTEXT}`, "-f", `description=${description}`], { cwd, encoding: "utf8" });
+    "-f", "state=success", "-f", `context=${STATUS_CONTEXT}`, "-f", `description=${description}`],
+    { cwd, encoding: "utf8", timeout: GH_TIMEOUT_MS, maxBuffer: GH_MAX_BUFFER });
   if (result.status !== 0) {
     throw new Refusal(`cannot post the ${STATUS_CONTEXT} status on ${head}: ${ghDetail(result)}`,
-      "check that gh is authenticated and the token may write commit statuses for this repository");
+      timedOut(result) ? GH_TIMEOUT_NEXT : "check that gh is authenticated and the token may write commit statuses for this repository");
   }
 }
 

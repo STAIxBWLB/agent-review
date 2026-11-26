@@ -7,5 +7,5 @@ export function sanitize(body: string): string {
 
 /** Give every untrusted physical line a prefix, including apparent brief headers. */
 export function frame(text: string): string {
-  return terminalText(sanitize(text)).split("\n").map(line => `> ${line}`).join("\n");
+  return terminalText(sanitize(text)).split(/\r?\n|\p{Zl}|\p{Zp}/u).map(line => `> ${line}`).join("\n");
 }

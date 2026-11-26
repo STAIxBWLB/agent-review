@@ -435,3 +435,22 @@ test("a local rename limit cannot hide the denied source of a near-copy", () => 
   git("commit", "-qm", "head");
   expectDenial(isolatedPacket(dir, { kind: "commit", commit: "HEAD" }));
 });
+
+test("workspace accounts for an untracked file recreated at a staged rename source", () => {
+  const { dir, git, write } = fixture();
+  write("a.txt", "original renamed content\n".repeat(8));
+  git("add", ".");
+  git("commit", "-qm", "base");
+  git("mv", "a.txt", "b.txt");
+  write("a.txt", "new tracked-name reuse\n");
+
+  const expected = new Set([
+    ...git("diff", "HEAD", "--name-only", "-z").split("\0"),
+    ...git("ls-files", "--others", "--exclude-standard", "-z").split("\0"),
+  ].filter(Boolean));
+  const bundle = isolatedPacket(dir, { kind: "workspace" });
+  assertParity(bundle.packet, [...expected]);
+  expect(bundle.diff).toContain("new tracked-name reuse");
+  const scoped = isolatedPacket(dir, { kind: "files", paths: ["a.txt"] });
+  expect(scoped.packet.units.some(unit => unit.path === "a.txt")).toBe(true);
+});

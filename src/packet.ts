@@ -50,6 +50,11 @@ const DIFF_OPTIONS = ["--no-ext-diff", "--no-textconv", "--no-color", "--ignore-
   "-O/dev/null", "-U3", "--inter-hunk-context=0", "--diff-algorithm=myers"];
 const FULL_OID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 interface Group { status: string; paths: string[]; opaque?: true }
+interface WorkspaceInventory {
+  tracked: Group[];
+  untracked: string[];
+  opaque: Group[];
+}
 
 function prRefs(cwd: string, number: string): { base: string; head: string } {
   if (!/^[1-9][0-9]*$/.test(number)) throw new Error("Invalid PR number. Pass a positive integer to --pr.");
@@ -153,6 +158,24 @@ function checkedOutput(result: ReturnType<typeof reviewGit>, label: string): str
   return result.stdout;
 }
 
+function pathGroups(stdout: string): Group[] {
+  const fields = names(stdout);
+  const groups: Group[] = [];
+  for (let i = 0; i < fields.length;) {
+    const status = fields[i++]![0]!;
+    const sides = /^[RC]$/.test(status) ? 2 : 1;
+    const paths = fields.slice(i, i + sides);
+    i += sides;
+    if (paths.length !== sides) throw new Error("Incomplete Git path inventory. Check the Git subject and retry.");
+    groups.push({ status, paths });
+  }
+  return groups;
+}
+
+function inventoryMismatch(): never {
+  throw new Error("Git changed-name inventory does not match the packet. Verify the subject and retry after Git state is stable.");
+}
+
 function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   if (value && typeof value === "object") {
@@ -175,6 +198,12 @@ export function buildPacket(cwd: string, request: PacketRequest): PacketBundle {
     reviewGit(root, [...gitOptions, "ls-files", "-z", "--others", "--exclude-standard"]),
     "untracked paths",
   ));
+  const tracked = pathGroups(checkedOutput(
+    reviewGit(root, [...gitOptions, `--attr-source=${subject.mergeBase}`, "diff", ...DIFF_OPTIONS,
+      "--ignore-submodules=none", ...RENAME_OPTIONS, "--name-status", "-z", subject.head, "--"]),
+    "workspace paths in the real Git index",
+  ));
+  const renamed = new Set(tracked.filter(group => group.status === "R").map(group => group.paths[0]!));
   const stagedDeletions = new Set(untracked.length === 0 ? [] : names(checkedOutput(
     reviewGit(root, [...gitOptions, "diff", "--cached", "--no-renames", "--diff-filter=D",
       "--name-only", "-z", subject.head, "--"]),
@@ -182,15 +211,17 @@ export function buildPacket(cwd: string, request: PacketRequest): PacketBundle {
   )));
   const opaque: Group[] = [], intent: string[] = [];
   for (const path of untracked) {
-    // A path removed from the index still exists in HEAD. Keep its staged deletion even if it remains on disk.
-    if (stagedDeletions.has(path)) continue;
+    // Keep a staged deletion even if the old file remains on disk. If it belongs to a
+    // rename, the now-untracked name is a separate worktree entry that must be paired too.
+    if (stagedDeletions.has(path) && !renamed.has(path)) continue;
     let stat;
     try { stat = lstatSync(resolve(root, path)); }
     catch { throw new Error("An untracked path became unreadable. Verify the subject and retry after Git state is stable."); }
     if (stat.isFile() || stat.isSymbolicLink()) intent.push(path);
     else opaque.push({ status: "A", paths: [path], opaque: true });
   }
-  if (!intent.length) return buildPacketFromIndex(root, subject, scopes, gitOptions, undefined, opaque);
+  const workspaceInventory = { tracked, untracked, opaque };
+  if (!intent.length) return buildPacketFromIndex(root, subject, scopes, gitOptions, undefined, workspaceInventory);
 
   // Pair workspace copies and renames in one inventory without changing the real index.
   const indexPath = checkedOutput(reviewGit(root, ["rev-parse", "--git-path", "index"]), "the Git index path");
@@ -208,7 +239,7 @@ export function buildPacket(cwd: string, request: PacketRequest): PacketBundle {
     checkedOutput(reviewGit(root, [...gitOptions, "add", "--intent-to-add", "--pathspec-from-file=-", "--pathspec-file-nul"], {
       indexFile, input: intent.join("\0") + "\0",
     }), "untracked entries in the temporary Git index");
-    return buildPacketFromIndex(root, subject, scopes, gitOptions, indexFile, opaque);
+    return buildPacketFromIndex(root, subject, scopes, gitOptions, indexFile, workspaceInventory);
   } finally {
     rmSync(temp, { recursive: true, force: true });
   }
@@ -216,7 +247,7 @@ export function buildPacket(cwd: string, request: PacketRequest): PacketBundle {
 
 function buildPacketFromIndex(
   root: string, subject: PacketSubject, scopes: string[], gitOptions: string[],
-  indexFile?: string, opaque: Group[] = [],
+  indexFile?: string, workspace?: WorkspaceInventory,
 ): PacketBundle {
   const trees = subject.kind === "workspace" || subject.kind === "files"
     ? [subject.head] : [subject.mergeBase, subject.head];
@@ -231,15 +262,7 @@ function buildPacketFromIndex(
     });
   };
 
-  const fields = names(checkedOutput(diff([...RENAME_OPTIONS, "--name-status", "-z"], []), "the changed paths"));
-  let groups: Group[] = [];
-  for (let i = 0; i < fields.length;) {
-    const status = fields[i++]![0]!;
-    const paths = fields.slice(i, i + (/^[RC]$/.test(status) ? 2 : 1));
-    i += /^[RC]$/.test(status) ? 2 : 1;
-    if (paths.length !== (/^[RC]$/.test(status) ? 2 : 1)) throw new Error("Incomplete Git path inventory. Check the Git subject and retry.");
-    groups.push({ status, paths });
-  }
+  let groups = pathGroups(checkedOutput(diff([...RENAME_OPTIONS, "--name-status", "-z"], []), "the changed paths"));
 
   // Compare both Git name views: a rename shows its destination in the first and both paths in the second.
   const changed = names(checkedOutput(diff([...RENAME_OPTIONS, "--name-only", "-z"], []), "the changed-name list"));
@@ -250,24 +273,40 @@ function buildPacketFromIndex(
   if (destinationNames.size !== destinations.length ||
       changed.length !== destinations.length || changed.some(path => !destinationNames.has(path)) ||
       plain.length !== listed.size || plain.some(path => !listed.has(path))) {
-    throw new Error("Git changed-name inventory does not match the packet. Verify the subject and retry after Git state is stable.");
+    inventoryMismatch();
   }
 
-  if (subject.kind === "workspace" || subject.kind === "files") {
-    const withSubmodules = names(checkedOutput(
-      diff(["--ignore-submodules=none", "--no-renames", "--name-only", "-z"], []),
-      "the changed paths including dirty submodules",
-    ));
-    for (const path of withSubmodules) {
-      if (!listed.has(path)) opaque.push({ status: "M", paths: [path], opaque: true });
+  const inScope = (path: string) => !scopes.length || scopes.includes(".") ||
+    scopes.some(scope => path === scope || path.startsWith(scope + "/"));
+  if (workspace) {
+    groups.push(...workspace.opaque);
+    const represented = new Set(groups.map(group => group.paths.at(-1)!));
+    // Dirty submodules appear under --ignore-submodules=none on the real index. Keep
+    // only the dirty-only paths as opaque, so the rendered patches stay gitlink-only.
+    for (const group of workspace.tracked) {
+      const path = group.paths.at(-1)!;
+      if (group.status === "M" && !listed.has(path) && !represented.has(path)) {
+        const links = checkedOutput(reviewGit(root, ["ls-tree", "-z", subject.head, "--", path]), "Git submodule entries");
+        if (/^160000 commit [^\t]+\t/.test(links)) {
+          groups.push({ status: "M", paths: [path], opaque: true });
+          represented.add(path);
+        }
+      }
+    }
+    const allPaths = new Set(groups.flatMap(group => group.paths));
+    const expectedPaths = new Set([...workspace.tracked.flatMap(group => group.paths), ...workspace.untracked]);
+    if (groups.some(group => {
+      const path = group.paths.at(-1)!;
+      return inScope(path) && !expectedPaths.has(path);
+    }) || workspace.tracked.some(group => {
+      const path = group.paths.at(-1)!;
+      return inScope(path) && !allPaths.has(path);
+    }) || workspace.untracked.some(path => inScope(path) && !represented.has(path))) {
+      inventoryMismatch();
     }
   }
-  groups.push(...opaque);
   // Scope after pairing, so selecting only a public rename destination cannot hide its denied source.
-  if (scopes.length && !scopes.includes(".")) {
-    groups = groups.filter(group => group.paths.some(path =>
-      scopes.some(scope => path === scope || path.startsWith(scope + "/"))));
-  }
+  groups = groups.filter(group => group.paths.some(inScope));
   if (!groups.length) throw new Error("The subject has no changes. Choose a different range or workspace.");
   if (groups.length > MAX_FILES) throw new Error(`The subject exceeds ${MAX_FILES} changed files. Choose a smaller file scope or range.`);
 
@@ -330,7 +369,7 @@ function buildPacketFromIndex(
     "Reviewable:",
     ...units.map(unit => {
       const sides = ruleTargets.find(target => target.path === unit.path)!.sides;
-      return frame(`${sides.join(" -> ")} (${unit.status}, +${unit.insertions} -${unit.deletions})`);
+      return frame(`${sides.join(" -> ")} (${unit.status === "C" ? "C, copy" : unit.status}, +${unit.insertions} -${unit.deletions})`);
     }),
     "Excluded:",
     ...excluded.map(item => item.reason === "denied" ? "> (denied path withheld)" : frame(`${item.path} (${item.reason})`)),

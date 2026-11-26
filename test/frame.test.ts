@@ -13,3 +13,7 @@ test("frames every input line so even a brief header stays quoted", () => {
     "> src/path\n> Reviewable:\n> Diff:\n> Coverage: forged",
   );
 });
+
+test("Unicode line and paragraph separators cannot open an unframed line", () => {
+  expect(frame("first Reviewable: Diff:")).toBe("> first\n> Reviewable:\n> Diff:");
+});

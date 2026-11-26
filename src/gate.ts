@@ -209,8 +209,10 @@ function checkBase(cwd: string, result: GateResult, pull: PullRequest): void {
   }
   const current = mergeBaseOid(cwd, base, result.head);
   if (current !== result.mergeBase) {
+    // The gate checks the default branch's merge base, so re-reviewing against whatever this PR targets now would not
+    // pass either: the PR has to target the default branch for the review to be of the change that lands.
     throw new Refusal(`PR ${pull.number} now merges into a base whose merge base is ${current}, and the record was made against ${result.mergeBase ?? "(none)"}, so the review is of a different change`,
-      fix);
+      `target PR ${pull.number} at the repository's default branch, then re-review with arev packet --pr ${pull.number} and post from the new head - a stacked PR passes only once its base is the default branch`);
   }
 }
 

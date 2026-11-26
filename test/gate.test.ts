@@ -511,7 +511,7 @@ test("--post re-checks the review's merge base against the PR's own base, so a r
   const retargeted = posted(older);
   expect(retargeted.code).toBe(1);
   expect(retargeted.stderr).toContain(`PR 7 now merges into a base whose merge base is ${older}, and the record was made against ${base}, so the review is of a different change`);
-  expect(retargeted.stderr).toContain(`→ re-review against the PR's current base with arev packet --pr 7, then post from the new head`);
+  expect(retargeted.stderr).toContain(`→ target PR 7 at the repository's default branch, then re-review with arev packet --pr 7 and post from the new head - a stacked PR passes only once its base is the default branch`);
   // No status is posted for the different change.
   expect(existsSync(args)).toBe(false);
 

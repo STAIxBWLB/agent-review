@@ -458,6 +458,13 @@ export function recordCommand(cwd: string, args: readonly string[]): number {
       throw new Refusal(`cannot read the report ${file}`, "pass the path of the report JSON you wrote");
     }
     if (Buffer.byteLength(source) > MAX_REPORT_BYTES) throw new Refusal(`the report ${file} exceeds ${MAX_REPORT_BYTES} bytes`, "shorten the report's text and retry");
+    // A report is untrusted text and every refusal below can name a value out of it, so the file is screened before it is
+    // parsed and before any of it reaches a message. The ledger screens each event again as it is written; this screen is
+    // what keeps a secret-shaped value out of stderr, and it names no value at all.
+    if (secretShaped(source)) {
+      throw new Refusal(`the report ${file} matches a secret pattern, so nothing from it was recorded or shown`,
+        "remove the secret-shaped value from the report, then write it again");
+    }
     let raw: unknown;
     try {
       raw = JSON.parse(source);

@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { ledgerEventsView, parseReviewRecord, recordCommand } from "../src/record.ts";
-import { Refusal, type LedgerEvent, type PacketBlock } from "../src/ledger.ts";
+import { Refusal, secretShaped, type LedgerEvent, type PacketBlock } from "../src/ledger.ts";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -474,21 +474,34 @@ test("a refusal names the field, never the report text that filled it", () => {
     .toContain("findings[1].id bugs:missing-frame repeats an earlier finding's id");
 });
 
-test("a secret-shaped report value never reaches stderr", () => {
+test("a secret-shaped report is refused before it is parsed, and its value reaches neither stderr nor the ledger", () => {
   const { root, repo, home } = fixture();
   const write = (name: string, body: unknown) => {
     const path = join(root, name);
     writeFileSync(path, JSON.stringify(body));
     return path;
   };
+  // A finding id is identifier-shaped by design, so a credential prefix fits it: the whole file is screened before any
+  // field is read, which closes every place a report can carry a value into a refusal.
+  const secretId = `AKIA${"ABCDEFGHIJKLMNOP"}`;
+  expect(secretShaped(secretId)).toBe(true);
+  const id = run(repo, home, "record", write("id.json", reportFor(HEAD, { findings: [finding({ id: secretId })] })));
+  expect(id.code).toBe(1);
+  expect(id.stderr).toContain("matches a secret pattern, so nothing from it was recorded or shown");
+  expect(id.stderr).toContain("remove the secret-shaped value from the report");
+  expect(id.stderr).not.toContain(secretId);
 
-  // A head that cannot be a commit SHA is refused before it is echoed, so no packet event is needed.
+  // The same for the two fields whose refusals used to name the raw value: the head and the v number.
   const head = run(repo, home, "record", write("head.json", reportFor(HEAD, { packet: { id: PACKET, subject: { head: SECRET } } })));
   expect(head.code).toBe(1);
   expect(head.stderr).not.toContain(SECRET);
-  expect(head.stderr).toContain("has no full commit SHA at packet.subject.head");
+  expect(head.stderr).toContain("matches a secret pattern");
+  const v = run(repo, home, "record", write("v.json", reportFor(HEAD, { v: SECRET })));
+  expect(v.code).toBe(1);
+  expect(v.stderr).not.toContain(SECRET);
+  expect(v.stderr).toContain("matches a secret pattern");
 
-  // A report value is only reached once the ledger holds a packet for the head, so this is the real flow.
+  // A refused report writes nothing: after the packet build below there is a packet event and still no record event.
   const commit = (body: string, message: string) => {
     writeFileSync(join(repo, "a.ts"), body);
     git(repo, ["add", "a.ts"]);
@@ -500,14 +513,21 @@ test("a secret-shaped report value never reaches stderr", () => {
   const built = run(repo, home, "packet", "--from", base, "--to", packetHead, "--json");
   expect(built.code).toBe(0);
   const packet = JSON.parse(built.stdout);
-  const v = run(repo, home, "record", write("v.json", reportFor(packetHead, {
-    v: SECRET,
+  const ledgerText = readFileSync(join(home, "review", "github.com/owner/repo", "ledger.jsonl"), "utf8");
+  expect(ledgerText.split("\n").filter(Boolean).map(line => JSON.parse(line)).filter(event => event.type === "record")).toEqual([]);
+  expect(ledgerText).not.toContain(secretId);
+
+  // A value the screen does not catch is still named by its type, never echoed, and the head must be a full OID.
+  const plainHead = run(repo, home, "record", write("plain-head.json", reportFor(HEAD, { packet: { id: PACKET, subject: { head: "not-a-full-sha" } } })));
+  expect(plainHead.stderr).toContain("has no full commit SHA at packet.subject.head");
+  expect(plainHead.stderr).not.toContain("not-a-full-sha");
+  const plainV = run(repo, home, "record", write("plain-v.json", reportFor(packetHead, {
+    v: "one",
     packet: { id: packet.id, subject: packet.subject },
     coverage: { reviewed: packet.units.map((unit: { path: string }) => unit.path), skipped: [] },
   })));
-  expect(v.code).toBe(1);
-  expect(v.stderr).not.toContain(SECRET);
-  expect(v.stderr).toContain("the report's v must be the number 1 (got string)");
+  expect(plainV.code).toBe(1);
+  expect(plainV.stderr).toContain("the report's v must be the number 1 (got string)");
 });
 
 test("the view takes its base and packet from the record, not from a later packet for the same head", () => {

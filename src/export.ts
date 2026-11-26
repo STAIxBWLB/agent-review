@@ -9,9 +9,41 @@ import { commitOid } from "./review-git.ts";
 type RecordEvent = Extract<LedgerEvent, { type: "record" }>;
 type EffectiveFinding = ReviewView["findings"][number];
 
+/** The hub parses a finding's rationale as bounded text of 2048 bytes, counted on the bytes it receives. */
+const HUB_TEXT_MAX = 2048;
+const HUB_TEXT_MARKER = " [...]";
+
+/**
+ * `frame` gives every line a prefix, so a description that fits the record's own 2048-byte bound can exceed the hub's
+ * bound on the way out. Cut the framed form at a UTF-8 boundary and mark it, rather than hand the hub text it refuses.
+ */
+function framedRationale(body: string): string {
+  const framed = frame(body);
+  if (Buffer.byteLength(framed) <= HUB_TEXT_MAX) return framed;
+  const room = HUB_TEXT_MAX - Buffer.byteLength(HUB_TEXT_MARKER);
+  let bytes = 0;
+  let end = 0;
+  for (const char of framed) {
+    const size = Buffer.byteLength(char);
+    if (bytes + size > room) break;
+    bytes += size;
+    end += char.length;
+  }
+  return `${framed.slice(0, end)}${HUB_TEXT_MARKER}`;
+}
+
+/**
+ * One finding as a hub argument. A hub argument has no field for the description, and `rationale` is where the hub reads
+ * one, so that is the field this fills: OCR and brief imports store the description in `text` alone, and a finding
+ * carried forward from an earlier review has no matching original hub argument to take words from. Dropping `text` here
+ * exported such a finding with its id, path and disposition and nothing said about it.
+ *
+ * A rationale already on the finding is left exactly as it is, and the substitution is framed because the hub reads that
+ * field as untrusted text, within that field's bound.
+ */
 function hubFinding(finding: EffectiveFinding) {
-  const { text: _text, evidence: _evidence, ...args } = finding;
-  return args;
+  const { text, evidence: _evidence, ...args } = finding;
+  return finding.rationale === undefined && text !== undefined ? { ...args, rationale: framedRationale(text) } : args;
 }
 
 function exportHub(event: RecordEvent, view: ReviewView): unknown {

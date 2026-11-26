@@ -53,5 +53,5 @@ export function fixture(overrides: NodeJS.ProcessEnv = {}) {
   const cli = (...args: string[]) => spawnSync(process.execPath,
     [join(import.meta.dir, "../bin/arev.js"), ...args], { cwd: dir, encoding: "utf8", env });
   git("init", "-q", "-b", "main");
-  return { dir, git, write, cli };
+  return { dir, home, git, write, cli };
 }

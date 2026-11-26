@@ -1,0 +1,21 @@
+{
+  "schema_version": "1.0",
+  "reviewer": "ocr-reviewer",
+  "modelFamily": "fixture-family",
+  "call": { "ok": true },
+  "summary": { "total_files": 1, "reviewed_files": 1, "skipped_files": 0, "coverage_rate": 1 },
+  "files": [{ "path": "src/rules.ts", "status": "reviewed", "evidence": "Read at head." }],
+  "findings": [
+    {
+      "id": "bugs:empty-rules-cache",
+      "path": "src/rules.ts",
+      "start_line": 2,
+      "end_line": 3,
+      "category": "bug",
+      "severity": "high",
+      "disposition": "fixed",
+      "content": "Handle an empty result before caching it.",
+      "validator": { "checked": true }
+    }
+  ]
+}

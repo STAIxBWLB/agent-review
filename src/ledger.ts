@@ -21,9 +21,14 @@ export class Refusal extends Error {
 }
 
 /** Events a review writes. `gate` and `post` are the merge-time gate of `arev gate` (V1 T4); they share the file. */
+export interface ReviewSource {
+  format: "ocr" | "brief" | "hub";
+  report: Record<string, unknown>;
+}
+
 export type LedgerEvent =
   | { v: 1; type: "packet"; at: string; packet: PacketBlock; review?: { advisory_cap?: number } }
-  | { v: 1; type: "record"; at: string; id: string; record: ReviewRecordV1 }
+  | { v: 1; type: "record"; at: string; id: string; record: ReviewRecordV1; source?: ReviewSource }
   | { v: 1; type: "resolve"; at: string; head: string; finding: string; as: "fixed" | "false_positive" | "accepted"; pr?: number; evidence?: string[]; rationale?: string }
   | { v: 1; type: "gate"; at: string; head: string; base?: string; ok: boolean; record?: string; open?: string[] }
   | { v: 1; type: "post"; at: string; head: string; record: string; status: "success" };

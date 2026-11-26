@@ -1,0 +1,24 @@
+{
+  "reviewer": { "id": "hub-reviewer", "modelFamily": "fixture-family" },
+  "hub_review": {
+    "id": 3,
+    "verdict": "approved",
+    "note": "Reviewed the packet rules. One documentation improvement remains.",
+    "coverage": { "reviewed": ["src/rules.ts"], "skipped": [] },
+    "findings": [
+      {
+        "id": "compliance:port-behaviour-changes-unlisted",
+        "pass": "compliance",
+        "severity": "nit",
+        "disposition": "open",
+        "path": "src/rules.ts",
+        "rationale": "List the spec-driven changes to ported behavior.",
+        "anchor": {
+          "path": "src/rules.ts",
+          "side": "head",
+          "selectors": [{ "kind": "lineRange", "startLine": 2, "endLine": 2 }]
+        }
+      }
+    ]
+  }
+}

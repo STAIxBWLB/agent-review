@@ -13,6 +13,7 @@ import { types } from "node:util";
 import { EXIT, errorLine } from "@staix/cli-output";
 import { parseReviewAnchor, reviewAnchorErrorMessage, type ReviewAnchor } from "./anchor.ts";
 import { blocksApproval, findingTally, findingsForHead, positionalFindingId, type ReviewFinding, type ReviewFindingSet, type ReviewFindingTally } from "./findings.ts";
+import { deniedReportPath } from "./deny.ts";
 import { sanitize } from "./frame.ts";
 import { MAX_REPORT_BYTES, Refusal, appendEvent, readLedger, recordId, reviewProjectId, secretShaped, shown, stringsIn, type LedgerEvent, type PacketBlock, type RecordFinding, type ReviewRecordV1 } from "./ledger.ts";
 import { buildPacket, type PacketRequest } from "./packet.ts";
@@ -112,6 +113,7 @@ function text(raw: unknown, max: number, field: string, kind: "text" | "path" = 
   const trimmed = raw.trim();
   if (!trimmed || Buffer.byteLength(trimmed) > max) return refuse(`${field} must be 1-${max} UTF-8 bytes`, fix);
   if (kind === "path" && /[\p{Cc}\p{Cf}\\]/u.test(trimmed)) return refuse(`${field} must be a repository-relative path without control characters`, fix);
+  if (kind === "path" && deniedReportPath(trimmed)) return refuse(`${field} is a denied repository path`, fix);
   const clean = sanitize(trimmed);
   if (Buffer.byteLength(clean) > max) return refuse(`${field} exceeds ${max} UTF-8 bytes after framing`, fix);
   return clean;
@@ -138,6 +140,8 @@ function optionalText(row: Record<string, unknown>, key: string, max: number, fi
 }
 
 export interface RecordOptions {
+  /** Override the command named in report-validation repair guidance. */
+  retryCommand?: string;
   /** The packet arev built for this head, as the ledger holds it. */
   packet: PacketBlock;
   /** REVIEW.md's cap when the packet carries it, else `DEFAULT_ADVISORY_CAP`. */
@@ -157,6 +161,18 @@ export interface RecordOptions {
  * and never stated by a report. A `false_positive` without evidence is refused because AC4's gate could never pass on it.
  */
 export function parseReviewRecord(raw: unknown, options: RecordOptions): ReviewRecordV1 {
+  const { retryCommand } = options;
+  try {
+    return validateReviewRecord(raw, options);
+  } catch (error) {
+    if (retryCommand && error instanceof Refusal && error.next.includes("arev record")) {
+      throw new Refusal(error.message, error.next.replaceAll("arev record", () => retryCommand));
+    }
+    throw error;
+  }
+}
+
+function validateReviewRecord(raw: unknown, options: RecordOptions): ReviewRecordV1 {
   const cap = options.maxAdvisories ?? DEFAULT_ADVISORY_CAP;
   if (!Number.isSafeInteger(cap) || cap < 0 || cap > MAX_FINDINGS) refuse(`the advisory cap ${cap} is not an integer in 0-${MAX_FINDINGS}`, `fix review.advisory_cap in the packet, or omit it for the default ${DEFAULT_ADVISORY_CAP}`);
   const row = closed(raw, RECORD_FIELDS, "the report");
@@ -338,6 +354,38 @@ function rebuildRequest(subject: PacketBlock["subject"]): PacketRequest | undefi
   return undefined;
 }
 
+/** Check the exact packet ID and rebuild the subject before reusing its review obligations. */
+export function requireCurrentPacket(cwd: string, head: string, packetId: string, events = readLedger(cwd)) {
+  if (!FULL_OID.test(head) || !PACKET_ID.test(packetId)) {
+    throw new Refusal("The review does not name a full head and packet ID", "use the head and id from packet.json");
+  }
+  const packetEvent = [...events].reverse().find(event => event.type === "packet" && event.packet.id === packetId);
+  if (!packetEvent || packetEvent.type !== "packet") {
+    throw new Refusal(`no packet ${packetId} is in the ledger`,
+      `run arev packet for the head this report reviews (arev packet --pr N --out DIR), then write the report from its packet.json`);
+  }
+  if (packetEvent.packet.subject.head !== head) {
+    throw new Refusal(`the packet ${packetId} is for head ${packetEvent.packet.subject.head}, not ${head}`,
+      `write the report from the packet.json arev wrote for ${head}, or fix packet.subject.head to the head that packet describes`);
+  }
+  const request = rebuildRequest(packetEvent.packet.subject);
+  if (request) {
+    let rebuilt: string;
+    try {
+      rebuilt = buildPacket(cwd, request).packet.id;
+    } catch (error) {
+      // A packet that cannot be rebuilt cannot be shown to match, and an unrun check is not a pass.
+      throw new Refusal(`arev cannot rebuild the packet for head ${head} to check the report against: ${shown(error instanceof Error ? error.message : "unknown error")}`,
+        `fetch the reviewed commits and retry, or rerun arev packet for ${head} and rewrite the report from its packet.json`);
+    }
+    if (rebuilt !== packetEvent.packet.id) {
+      throw new Refusal(`the packet changed since arev packet (${packetEvent.packet.id} was recorded, ${rebuilt} is what arev builds for head ${head} now)`,
+        "rerun arev packet and rewrite the report from the new packet.json; a workspace subject counts every uncommitted file, the report included, so keep the report outside the worktree");
+    }
+  }
+  return packetEvent;
+}
+
 /** The review thread a packet belongs to: its PR number, or `undefined` for a packet built without one. */
 const threadOf = (subject: PacketBlock["subject"] | undefined): number | undefined => subject?.pr;
 
@@ -379,7 +427,7 @@ function recordedThreadsAtHead(events: readonly LedgerEvent[], head: string): (n
  * The review thread a caller names: a PR number, or `none` for the thread with no PR - the exact-head review a packet
  * built without `--pr` produces. `undefined` means undecided, never "the thread with no PR".
  */
-type ThreadSelector = number | "none";
+export type ThreadSelector = number | "none";
 
 /** The spellings to pass, in the ledger's own order, so a refusal's next step is a command a person can copy. */
 const prFlags = (threads: readonly (number | undefined)[]): string =>
@@ -443,7 +491,9 @@ function inThread(subjectThread: number | undefined, subjectHead: string, thread
  * head it was recorded at, carrying the severity and term of the latest report of it, so settling a blocking finding once
  * settles it for later heads of the same PR too. A resolve naming an id no report of the thread carried is ignored.
  */
-export function ledgerEventsView(events: readonly LedgerEvent[], head?: string, pr?: ThreadSelector): ReviewView {
+export function ledgerEventsView(
+  events: readonly LedgerEvent[], head?: string, pr?: ThreadSelector, options: { includeSettled?: boolean } = {},
+): ReviewView {
   // `--pr N` without `--head` reads that PR's newest review: a caller that knows the thread need not name a head, and a
   // head two PRs share cannot answer for both. `--pr none` is a thread too - the one with no PR - so it is `null` here
   // rather than `undefined`, which means "no thread named, take any".
@@ -506,7 +556,7 @@ export function ledgerEventsView(events: readonly LedgerEvent[], head?: string, 
     }
   }
 
-  const findings = findingsForHead(sets, target).map(finding => {
+  const findings = findingsForHead(sets, target, options.includeSettled).map(finding => {
     // The lifecycle merges a carried id across every record, so its path and anchor can describe a later head than the
     // one shown. Path, anchor and text all come from the last record at or before this head, like the evidence beside
     // them; only the disposition comes from the replay.
@@ -626,30 +676,7 @@ export function recordCommand(cwd: string, args: readonly string[]): number {
       throw new Refusal(`the report ${shown(file)} has no packet id at packet.id`,
         "write the report from the packet.json arev wrote: arev packet --pr N --out DIR");
     }
-    const packetEvent = [...events].reverse().find(event => event.type === "packet" && event.packet.id === packetId);
-    if (!packetEvent || packetEvent.type !== "packet") {
-      throw new Refusal(`no packet ${packetId} is in the ledger`,
-        `run arev packet for the head this report reviews (arev packet --pr N --out DIR), then write the report from its packet.json`);
-    }
-    if (packetEvent.packet.subject.head !== head) {
-      throw new Refusal(`the packet ${packetId} is for head ${packetEvent.packet.subject.head}, not ${head}`,
-        `write the report from the packet.json arev wrote for ${head}, or fix packet.subject.head to the head that packet describes`);
-    }
-    const request = rebuildRequest(packetEvent.packet.subject);
-    if (request) {
-      let rebuilt: string;
-      try {
-        rebuilt = buildPacket(cwd, request).packet.id;
-      } catch (error) {
-        // A packet that cannot be rebuilt cannot be shown to match, and an unrun check is not a pass.
-        throw new Refusal(`arev cannot rebuild the packet for head ${head} to check the report against: ${shown(error instanceof Error ? error.message : "unknown error")}`,
-          `fetch the reviewed commits and retry, or rerun arev packet for ${head} and rewrite the report from its packet.json`);
-      }
-      if (rebuilt !== packetEvent.packet.id) {
-        throw new Refusal(`the packet changed since arev packet (${packetEvent.packet.id} was recorded, ${rebuilt} is what arev builds for head ${head} now)`,
-          "rerun arev packet and rewrite the report from the new packet.json; a workspace subject counts every uncommitted file, the report included, so keep the report outside the worktree");
-      }
-    }
+    const packetEvent = requireCurrentPacket(cwd, head, packetId, events);
     const cap = packetEvent.review?.advisory_cap ?? DEFAULT_ADVISORY_CAP;
     const implementer = parsed.flags["--implementer"]?.at(-1);
     const record = parseReviewRecord(raw, { packet: packetEvent.packet, maxAdvisories: cap,

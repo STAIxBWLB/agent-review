@@ -296,3 +296,35 @@ test("an untracked nested repository is an opaque exclusion", () => {
   expect(bundle.diff).not.toContain("opaque fixture content");
   expect(bundle.diff).toContain("ordinary fixture content");
 });
+
+test("dirty submodules are visible as workspace exclusions", () => {
+  const source = fixture();
+  source.write("file.txt", "submodule content\n");
+  source.git("add", ".");
+  source.git("commit", "-qm", "base");
+
+  const { dir, git, write } = fixture();
+  git("-c", "protocol.file.allow=always", "submodule", "add", "-q", source.dir, "sub");
+  git("commit", "-qm", "add submodule");
+  write("sub/file.txt", "submodule edit\n");
+  const plain = git("diff", "HEAD", "--name-only", "-z").split("\0").filter(Boolean);
+  expect(plain).toEqual(["sub"]);
+  for (const bundle of [isolatedPacket(dir, { kind: "workspace" }),
+    isolatedPacket(dir, { kind: "files", paths: ["sub"] })]) {
+    assertParity(bundle.packet, plain);
+    expect(bundle.packet.excluded).toEqual([{ path: "sub", reason: "binary" }]);
+    expect(bundle.diff).not.toContain("submodule edit");
+  }
+});
+
+test("packet and rules report usage errors and identify unborn branches", () => {
+  const { cli } = fixture();
+  for (const args of [["packet", "--unknown"], ["packet", "--json", "--out", "out"],
+    ["packet", "--files"], ["rules", "check"]]) {
+    expect(cli(...args).status).toBe(2);
+  }
+  const unborn = cli("packet", "--workspace");
+  expect(unborn.status).toBe(1);
+  expect(unborn.stderr).toContain("no commits yet");
+  expect(unborn.stderr).toContain("Create an initial commit");
+});

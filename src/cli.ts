@@ -1,7 +1,7 @@
 import { EXIT, errorLine } from "@staix/cli-output";
 import { version } from "../package.json";
 import { commandUsage, commands, usage } from "./commands-table.ts";
-import { runPacket, runRules } from "./packet-cli.ts";
+import { PacketUsageError, runPacket, runRules } from "./packet-cli.ts";
 
 export function main(args: readonly string[]): number {
   const [first = "--help", ...extra] = args;
@@ -22,7 +22,7 @@ export function main(args: readonly string[]): number {
         tty: Boolean(process.stderr.isTTY),
         next: `arev ${command.name} --help`,
       })) console.error(line);
-      return EXIT.fail;
+      return error instanceof PacketUsageError ? EXIT.usage : EXIT.fail;
     }
   }
 

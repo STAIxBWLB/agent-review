@@ -5,37 +5,52 @@ import { buildPacket, repositoryPath, type PacketRequest } from "./packet.ts";
 import { commitOid, mergeBaseOid, repositoryRoot, reviewGit } from "./review-git.ts";
 import { readRules, renderRules } from "./rules.ts";
 
+export class PacketUsageError extends Error {}
+
+function packetArgs(args: readonly string[]) {
+  try {
+    return parseArgs({
+      args: [...args],
+      allowPositionals: true,
+      tokens: true,
+      options: {
+        pr: { type: "string" }, from: { type: "string" }, to: { type: "string" },
+        commit: { type: "string" }, workspace: { type: "boolean" }, files: { type: "boolean" },
+        profile: { type: "string" }, json: { type: "boolean" }, out: { type: "string" },
+      },
+    });
+  } catch {
+    throw new PacketUsageError("Invalid packet options. Use arev packet --help for accepted options and values.");
+  }
+}
+
 export function runPacket(cwd: string, args: readonly string[]): void {
-  const { values, positionals, tokens } = parseArgs({
-    args: [...args],
-    allowPositionals: true,
-    tokens: true,
-    options: {
-      pr: { type: "string" }, from: { type: "string" }, to: { type: "string" },
-      commit: { type: "string" }, workspace: { type: "boolean" }, files: { type: "boolean" },
-      profile: { type: "string" }, json: { type: "boolean" }, out: { type: "string" },
-    },
-  });
+  const { values, positionals, tokens } = packetArgs(args);
   const seen = new Set<string>();
   let takingFiles = false;
   for (const token of tokens) {
     if (token.kind === "option") {
-      if (seen.has(token.name)) throw new Error("A packet option was repeated. Use each option once.");
+      if (seen.has(token.name)) throw new PacketUsageError("A packet option was repeated. Use each option once.");
       seen.add(token.name);
       takingFiles = token.name === "files";
     } else if (token.kind === "positional" && !takingFiles) {
-      throw new Error("Unexpected packet path. Place each path after --files.");
+      throw new PacketUsageError("Unexpected packet path. Place each path after --files.");
     }
   }
-  if (values.profile !== undefined && values.profile !== "code") throw new Error("Unsupported profile. Use --profile code.");
-  if (values.json && values.out !== undefined) throw new Error("Choose either --json or --out DIR.");
+  if (values.profile !== undefined && values.profile !== "code") throw new PacketUsageError("Unsupported profile. Use --profile code.");
+  if (values.out === "") throw new PacketUsageError("Output directory is empty. Pass --out DIR.");
+  if (values.files && !positionals.length) throw new PacketUsageError("No file scope given. Pass paths after --files.");
+  if (values.pr !== undefined && !/^[1-9][0-9]*$/.test(values.pr)) {
+    throw new PacketUsageError("Invalid PR number. Pass a positive integer to --pr.");
+  }
+  if (values.json && values.out !== undefined) throw new PacketUsageError("Choose either --json or --out DIR.");
   const subjects = [values.pr !== undefined, values.from !== undefined || values.to !== undefined,
     values.commit !== undefined, values.workspace, values.files].filter(Boolean).length;
-  if (subjects > 1) throw new Error("Multiple packet subjects supplied. Choose one subject.");
+  if (subjects > 1) throw new PacketUsageError("Multiple packet subjects supplied. Choose one subject.");
   let request: PacketRequest;
   if (values.pr !== undefined) request = { kind: "pr", number: values.pr };
   else if (values.from !== undefined || values.to !== undefined) {
-    if (!values.from || !values.to) throw new Error("A range needs both endpoints. Pass --from A --to B.");
+    if (!values.from || !values.to) throw new PacketUsageError("A range needs both endpoints. Pass --from A --to B.");
     request = { kind: "range", base: values.from, head: values.to };
   } else if (values.commit !== undefined) request = { kind: "commit", commit: values.commit };
   else if (values.files) request = { kind: "files", paths: positionals };
@@ -44,7 +59,6 @@ export function runPacket(cwd: string, args: readonly string[]): void {
   const bundle = buildPacket(cwd, request);
   const json = JSON.stringify(bundle.packet, null, 2);
   if (values.out !== undefined) {
-    if (!values.out) throw new Error("Output directory is empty. Pass --out DIR.");
     const destination = resolve(cwd, values.out);
     const created: string[] = [];
     try {
@@ -74,7 +88,9 @@ export function runPacket(cwd: string, args: readonly string[]): void {
 export function runRules(cwd: string, args: readonly string[]): void {
   const check = args[0] === "check";
   const paths = check ? args.slice(1) : args;
-  if (!paths.length || (check && paths.length !== 1)) throw new Error("Specify paths with arev rules <path...> or arev rules check <path>.");
+  if (!paths.length || paths.some(path => path.startsWith("-")) || (check && paths.length !== 1)) {
+    throw new PacketUsageError("Specify paths with arev rules <path...> or arev rules check <path>.");
+  }
   const root = repositoryRoot(cwd);
   const head = commitOid(root, "HEAD");
   const defaultRef = ["origin/HEAD", "origin/main", "origin/master"].find(ref =>

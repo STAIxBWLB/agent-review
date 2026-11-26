@@ -170,7 +170,9 @@ export function buildPacket(cwd: string, request: PacketRequest): PacketBundle {
   ));
   const opaque: Group[] = [], intent: string[] = [];
   for (const path of untracked) {
-    const stat = lstatSync(resolve(root, path));
+    let stat;
+    try { stat = lstatSync(resolve(root, path)); }
+    catch { throw new Error("An untracked path became unreadable. Stabilize the worktree and retry."); }
     if (stat.isFile() || stat.isSymbolicLink()) intent.push(path);
     else opaque.push({ status: "A", paths: [path], opaque: true });
   }
@@ -178,11 +180,17 @@ export function buildPacket(cwd: string, request: PacketRequest): PacketBundle {
 
   // Pair workspace copies and renames in one inventory without changing the real index.
   const indexPath = checkedOutput(reviewGit(root, ["rev-parse", "--git-path", "index"]), "the Git index path");
-  const temp = mkdtempSync(join(tmpdir(), "arev-index-"));
+  let temp: string;
+  try { temp = mkdtempSync(join(tmpdir(), "arev-index-")); }
+  catch { throw new Error("Cannot create a temporary Git index directory. Check temporary directory permissions and retry."); }
   try {
     const indexFile = join(temp, "index");
     try { copyFileSync(resolve(root, indexPath.replace(/\r?\n$/, "")), indexFile); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw new Error("Cannot copy the repository's Git index. Check index permissions and retry.");
+      }
+    }
     checkedOutput(reviewGit(root, [...gitOptions, "add", "--intent-to-add", "--pathspec-from-file=-", "--pathspec-file-nul"], {
       indexFile, input: intent.join("\0") + "\0",
     }), "untracked entries in the temporary Git index");
@@ -224,6 +232,15 @@ function buildPacketFromIndex(
     throw new Error("Git changed-name inventory does not match the packet. Check for concurrent worktree edits and retry.");
   }
 
+  if (subject.kind === "workspace" || subject.kind === "files") {
+    const withSubmodules = names(checkedOutput(
+      diff(["--ignore-submodules=none", "--no-renames", "--name-only", "-z"], []),
+      "the changed paths including dirty submodules",
+    ));
+    for (const path of withSubmodules) {
+      if (!listed.has(path)) opaque.push({ status: "M", paths: [path], opaque: true });
+    }
+  }
   groups.push(...opaque);
   // Scope after pairing, so selecting only a public rename destination cannot hide its denied source.
   if (scopes.length && !scopes.includes(".")) {

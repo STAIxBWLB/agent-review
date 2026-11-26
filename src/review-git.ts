@@ -34,6 +34,9 @@ export function repositoryRoot(cwd: string): string {
 
 export function commitOid(cwd: string, ref: string): string {
   const result = reviewGit(cwd, ["rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`]);
+  if (ref === "HEAD" && result.status !== 0 && reviewGit(cwd, ["symbolic-ref", "-q", "HEAD"]).status === 0) {
+    throw new Error("The current branch has no commits yet. Create an initial commit and retry.");
+  }
   if (result.status !== 0) throw new Error("A specified commit is unavailable. Fetch the required refs or use a local commit.");
   return result.stdout.trim();
 }

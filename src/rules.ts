@@ -108,7 +108,7 @@ export function renderRules({ rules, missing, via }: RuleSet, includeText = true
       frame(rule.name),
       "Applies to:",
       frame(rule.appliesTo.join("\n") || "(no reviewable paths)"),
-      ...(includeText ? [frame(rule.text.trimEnd())] : [
+      ...(includeText ? ["Rule text:", frame(rule.text.trimEnd())] : [
         rule.name === "REVIEW.md" ? "Source: repository-wide REVIEW.md." :
           `Source: base-tree ${[...(via.get(rule.name) ?? [])].join(" or ")} attribute.`,
       ]),

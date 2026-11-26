@@ -79,20 +79,37 @@ export interface ReviewRecordV1 {
  * Ported from `@staix/agent-mem` `src/memory/screen.ts` at 0.40.0. A secret-looking string is refused before it is
  * written: the ledger outlives the session that wrote it.
  *
+ * These are the shapes that hold wherever they sit, so each is applied to every decoded string and to the serialized
+ * line as well: in a JSON line a key and its value are separate strings, and only the line holds both - `{"token":"x",
+ * "v":1}` is a secret the per-string screen never sees whole.
+ */
+const SHAPE_SECRETS = [/-----BEGIN [A-Z ]*PRIVATE KEY-----/, /\bAKIA[0-9A-Z]{16}\b/, /\bgh[pousr]_[A-Za-z0-9]{30,}/, /\bgithub_pat_[A-Za-z0-9_]{40,}/, /\bsk-[A-Za-z0-9_-]{20,}/,
+  /\bxox[abprs]-[A-Za-z0-9-]{10,}/, /\bAIza[0-9A-Za-z_-]{35}\b/, /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/, /\b(?:password|passwd|secret|api[_-]?key|token)\s*[:=]\s*\S{8,}/i];
+
+/**
  * The URL pattern is the local addition: a remote or a diagnostic can carry `scheme://user:password@host`, which no
  * token-shaped pattern catches. The colon before the `@` is what makes it a credential, so `ssh://git@host` (no
  * password) and `https://host:443/path` (no userinfo) stay clean. The user name may be empty - `https://:pw@host` is a
  * credential - and the authority ends at `/`, `?` or `#`, so `https://host:443?to=a@b` is a query, not userinfo.
  *
- * Both classes also stop at a quote, a comma and an angle bracket, because the line-level screen reads the serialized
- * event: a compact line puts two fields side by side, and `"text":"https://example.org:443","rationale":"a@b.example"`
- * reads as `...host:443","rationale":"a@b...` - a colon, then delimiters, then an `@`. Without those three characters a
- * record with no credential in it is refused.
+ * Userinfo may carry every sub-delim RFC 3986 allows, `,` and `'` among them, so both classes admit them: a password can
+ * be `pa,ss` or `it's`, and excluding those characters let such a credential through the screen. Only the two characters
+ * a URL cannot carry unencoded - a quote and an angle bracket - end the classes.
+ *
+ * That width is why this class is applied to one decoded string at a time and never to a serialized line: a JSON line
+ * puts two fields side by side, so `"text":"https://example.org:443","rationale":"a@b.example"` reads as
+ * `...host:443","rationale":"a@b...` - a colon, then the delimiters between the fields, then an `@`. `secretShaped`
+ * screens the strings and `lineShaped` screens the line, and a field delimiter therefore can never join two values.
  */
-const SECRETS = [/-----BEGIN [A-Z ]*PRIVATE KEY-----/, /\bAKIA[0-9A-Z]{16}\b/, /\bgh[pousr]_[A-Za-z0-9]{30,}/, /\bgithub_pat_[A-Za-z0-9_]{40,}/, /\bsk-[A-Za-z0-9_-]{20,}/,
-  /\bxox[abprs]-[A-Za-z0-9-]{10,}/, /\bAIza[0-9A-Za-z_-]{35}\b/, /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/, /\b(?:password|passwd|secret|api[_-]?key|token)\s*[:=]\s*\S{8,}/i,
-  /\b[a-z][a-z0-9+.-]*:\/\/[^\s\/?#:@\"'<>,]*:[^\s\/?#@\"'<>,]+@/i];
+const URL_USERINFO = /\b[a-z][a-z0-9+.-]*:\/\/[^\s\/?#:@\"<>]*:[^\s\/?#@\"<>]+@/i;
+/** Every pattern one decoded string is screened with, the URL class included. */
+const SECRETS = [...SHAPE_SECRETS, URL_USERINFO];
 export const secretShaped = (text: string): boolean => SECRETS.some(re => re.test(text));
+/**
+ * The screen of a serialized event line: the shape patterns only. The URL class belongs to a single decoded string,
+ * because a line is where two unrelated fields sit side by side.
+ */
+export const lineShaped = (line: string): boolean => SHAPE_SECRETS.some(re => re.test(line));
 
 /**
  * A validated string a refusal may print: the value itself, or `<withheld>` when it is secret-shaped. A `\u` escape
@@ -284,9 +301,10 @@ export function appendEvent(cwd: string, event: LedgerEvent, options: { home?: s
   if (cap !== undefined && Buffer.byteLength(line) > cap) throw new Refusal(`the ${event.type} event exceeds ${cap} bytes; shorten its text`, "arev show");
   if (event.type === "record") checkRecordPacket(event.record);
   // A tab or newline inside a string becomes the two characters `\t` / `\n` in the line, so an assignment the pattern
-  // needs whitespace for (`token<TAB>: <value>`) stops matching there. Every string is screened as it was written, and
-  // the line as well: serialization also joins a key to its value.
-  if ([...stringsIn(event)].some(secretShaped) || secretShaped(line)) {
+  // needs whitespace for (`token<TAB>: <value>`) stops matching there. Every string is screened as it was written with
+  // the full list, and the line with `lineShaped`: the line is where a key and its value sit together, and also where
+  // two unrelated fields sit together, so the URL class - which a decoded string may need in full - is left out of it.
+  if ([...stringsIn(event)].some(secretShaped) || lineShaped(line)) {
     throw new Refusal(`the ${event.type} event matches a secret pattern and was not written`,
       "remove the secret value from the report or rationale and retry");
   }

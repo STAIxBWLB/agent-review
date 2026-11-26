@@ -295,9 +295,11 @@ export function postStatus(head: string, record: string, repository: string, cwd
     { cwd, encoding: "utf8", timeout: GH_TIMEOUT_MS, maxBuffer: GH_WRITE_MAX_BUFFER, killSignal: GH_KILL_SIGNAL });
   if (failed(result)) {
     // A write that ran out of time may still have landed: the request reached GitHub and only the answer is missing, so
-    // the status is looked for before the same one is written again.
+    // the status is looked for before the same one is written again. The lookup has to name this write's record: an
+    // older arev/gate status can sit on the same head under the same context for a different review, and its presence
+    // would read as this write landing.
     throw new Refusal(`cannot post the ${STATUS_CONTEXT} status on ${head}: ${ghDetail(result, GH_WRITE_MAX_BUFFER)}`,
-      timedOut(result) ? `check for an existing ${STATUS_CONTEXT} status on ${head} (gh api --hostname github.com repos/${repository}/commits/${head}/statuses) - a write that ran out of time may already have landed, so ${retry}`
+      timedOut(result) ? `check for an existing ${STATUS_CONTEXT} status on ${head} whose description names record ${record} (gh api --hostname github.com repos/${repository}/commits/${head}/statuses) - a write that ran out of time may already have landed, and another record's status carries the same context, so ${retry}`
         : overBuffer(result) ? "check with gh auth status that the token may write commit statuses for this repository; gh's reply to the same write does not get smaller"
           : "check that gh is authenticated and the token may write commit statuses for this repository");
   }

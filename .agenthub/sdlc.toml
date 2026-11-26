@@ -1,1 +1,2 @@
 mode = "advise"
+required_checks = ["check (ubuntu-latest)", "check (macos-latest)"]

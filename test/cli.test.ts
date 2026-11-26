@@ -23,7 +23,7 @@ test("bootstraps outside the checkout and renders the command table", () => {
     expect(run(...args)).toEqual({ code: 0, stdout: `${usage()}\n`, stderr: "" });
   }
   expect(run("--version").stdout.trim()).toBe(version);
-  expect(run("status").stdout).toContain("pending");
+  expect(run("status").stdout).toContain("Packet and rules commands are available");
 });
 
 test("rejects unavailable commands and extra arguments", () => {

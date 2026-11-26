@@ -341,6 +341,31 @@ test("a secret separated from its key by a tab or a newline is refused, in a nes
   expect(readLedger(repo, { home })).toEqual([]);
 });
 
+test("a finding whose text is a bare host:port and whose rationale is an email records, because the line carries no credential", () => {
+  const { repo, home } = fixture();
+  // The two fields sit side by side in the serialized event: `...host:443","rationale":"a@b.example` is a colon, then
+  // the delimiters between the fields, then an `@`. A userinfo class that spans those delimiters reads one field's port
+  // and the next field's email as `user:password@host` and refuses a record with no credential in it - a real review
+  // finding over `https://example.org:443` with a rationale naming its author is the shape that hits it.
+  const event: LedgerEvent = {
+    v: 1, type: "record", at: "2026-11-26T00:00:00.000Z", id: "b".repeat(64),
+    record: {
+      v: 1,
+      packet: { id: "c".repeat(64), subject: { kind: "range", head: HEAD } },
+      reviewer: { id: "claude", modelFamily: "anthropic", started: "self", sameFamilyFallback: false },
+      coverage: { reviewed: ["src/gate.ts"], skipped: [] },
+      findings: [{ id: "bugs:one", term: "bugs", severity: "blocking", path: "src/gate.ts", text: "https://example.org:443",
+        disposition: "fixed", rationale: "a@b.example", origin: "introduced" }],
+      verdict: "approved", call: { ok: true },
+    },
+  };
+  appendEvent(repo, event, { home });
+  // The written line is what the screen reads, so the case pins it rather than the event object: this is the assertion
+  // the comma, quote and angle-bracket arms of the class exist for.
+  expect(secretShaped(readFileSync(ledgerPath(repo, { home }), "utf8").trim())).toBe(false);
+  expect(readLedger(repo, { home })).toEqual([event]);
+});
+
 test("an origin that does not name a plain repository path is refused, and nothing is written outside review", () => {
   const { repo, home } = fixture();
   git(repo, ["remote", "add", "origin", "https://github.com/../evil.git"]);

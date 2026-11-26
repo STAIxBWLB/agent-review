@@ -28,8 +28,7 @@ The standalone `arev rules` command compares against the default branch on `orig
 ### `arev gate`
 
 The gate answers for the current full head and the base it would merge into now:
-the merge base with `origin`'s default branch. A stacked pull request therefore
-passes only once its base is `main`.
+the merge base with `origin`'s default branch.
 
 `arev gate --post` writes one commit status, `arev/gate`, on the head, and only
 after a pass. It is the only GitHub write `arev` makes. Both the status and the
@@ -39,9 +38,11 @@ page. The status is refused when the head belongs to more than one review
 thread in the ledger or to an open pull request the gate was not asked about: a
 commit status is per commit, so it would show as a pass on every other pull
 request at that head, including one opened after the status was posted. For the
-pull request the review names, the gate also re-reads that pull request's base
-and refuses when its merge base with the head is not the reviewed one, so a
-retargeted pull request is re-reviewed rather than posted green.
+pull request the review names, the gate also re-reads that pull request's base,
+and the rule it applies is that the pull request's current merge base must equal
+the reviewed one. Both gh calls give up after 15 seconds, and a refusal that
+reaches that bound names it and the retry, with the same `--head` and `--pr` the
+run gated.
 
 GitHub lists open pull requests for this endpoint only while the commit is
 outside the default branch, so a head already on `main` has no open pull

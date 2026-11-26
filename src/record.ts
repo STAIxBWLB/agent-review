@@ -41,13 +41,25 @@ const COMMITISH = /^(?:[a-f0-9]{4,64})$/;
  * not a head here" are different facts. Callers shape-check the value with `COMMITISH` first, so this echo is hex.
  */
 function resolveHead(cwd: string, value: string): string {
-  if (FULL_OID.test(value)) return value;
   const result = reviewGit(cwd, ["rev-parse", "--verify", "-q", `${value}^{commit}`]);
-  if (result.status !== 0) {
-    throw new Refusal(`--head ${value} does not name a commit in this repository`,
-      "pass the full 40-character head SHA, or fetch that commit and retry");
-  }
-  return result.stdout.replace(/\r?\n$/, "");
+  if (result.status === 0) return result.stdout.replace(/\r?\n$/, "");
+  // What counts as full is the repository's own object format: 40 hexadecimal characters is a whole OID in a SHA-1
+  // repository and a prefix in a SHA-256 one, where git resolves it but a length test alone would read it as a head.
+  if (fullOidHere(cwd, value)) return value;
+  throw new Refusal(`--head ${value} does not name a commit in this repository`,
+    "pass the full head SHA (40 characters, or 64 in a SHA-256 repository), or fetch that commit and retry");
+}
+
+/**
+ * Whether `value` is written out in full for this repository, so a head the ledger records for a commit this checkout
+ * does not hold is still readable by its full OID. The format is read from git, and an unreadable one (no repository
+ * here) accepts either length: nothing on this side can then tell a prefix from a head.
+ */
+function fullOidHere(cwd: string, value: string): boolean {
+  if (!FULL_OID.test(value)) return false;
+  const format = reviewGit(cwd, ["rev-parse", "--show-object-format"]);
+  if (format.status !== 0) return true;
+  return value.length === (format.stdout.trim() === "sha256" ? 64 : 40);
 }
 /** A packet id is the sha256 of the packet's canonical JSON: a report's claim on it is checked before it is looked up. */
 const PACKET_ID = /^[a-f0-9]{64}$/;

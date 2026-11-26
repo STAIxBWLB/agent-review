@@ -20,12 +20,12 @@ function gitOut(cwd: string, args: string[]): string {
   return result.stdout.toString().trim();
 }
 
-function fixture(): { root: string; repo: string; home: string } {
+function fixture(objectFormat?: "sha256"): { root: string; repo: string; home: string } {
   const root = mkdtempSync(join(tmpdir(), "arev-record-"));
   roots.push(root);
   const repo = join(root, "repo"), home = join(root, "agenthub");
   mkdirSync(repo);
-  git(repo, ["init", "-q", "-b", "main"]);
+  git(repo, ["init", "-q", "-b", "main", ...(objectFormat === undefined ? [] : [`--object-format=${objectFormat}`])]);
   git(repo, ["remote", "add", "origin", "https://github.com/owner/repo.git"]);
   return { root, repo, home };
 }
@@ -518,8 +518,40 @@ test("an abbreviated --head selects the full recorded head, and one that names n
     const refused = run(repo, home, ...args);
     expect(refused.code, args.join(" ")).toBe(1);
     expect(refused.stderr, args.join(" ")).toContain("--head deadbeef1234 does not name a commit in this repository");
-    expect(refused.stderr, args.join(" ")).toContain("→ pass the full 40-character head SHA, or fetch that commit and retry");
+    expect(refused.stderr, args.join(" ")).toContain("→ pass the full head SHA (40 characters, or 64 in a SHA-256 repository), or fetch that commit and retry");
   }
+});
+
+test("in a SHA-256 repository a 40-character --head is a prefix, so it resolves and one naming no commit is refused", () => {
+  const { root, repo, home } = fixture("sha256");
+  const commit = (body: string, message: string) => {
+    writeFileSync(join(repo, "a.ts"), body);
+    git(repo, ["add", "a.ts"]);
+    git(repo, ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", message]);
+    return gitOut(repo, ["rev-parse", "HEAD"]);
+  };
+  const base = commit("export const a = 1;\n", "base");
+  const head = commit("export const a = 2;\n", "head");
+  // 40 characters is a prefix of this repository's OID, not one: a length test alone would compare it with the ledger's
+  // full head and answer the ledger's silence for a head arev never looked up.
+  expect(head).toHaveLength(64);
+  const built = JSON.parse(run(repo, home, "packet", "--from", base, "--to", head, "--json").stdout);
+  const report = join(root, "report.json");
+  writeFileSync(report, JSON.stringify(reportFor(head, {
+    packet: { id: built.id, subject: built.subject },
+    coverage: { reviewed: built.units.map((unit: { path: string }) => unit.path), skipped: [] },
+  })));
+  const recorded = JSON.parse(run(repo, home, "record", report, "--json").stdout);
+
+  const abbreviated = run(repo, home, "show", "--head", head.slice(0, 40), "--json");
+  expect(abbreviated.code).toBe(0);
+  expect(JSON.parse(abbreviated.stdout)).toMatchObject({ head, record: recorded.id });
+
+  // And a value of that length that names no commit here is refused by name: here it cannot be a head arev merely lacks
+  // the review for, because this repository spells heads with 64 characters.
+  const refused = run(repo, home, "show", "--head", "0".repeat(40), "--json");
+  expect(refused.code).toBe(1);
+  expect(refused.stderr).toContain(`--head ${"0".repeat(40)} does not name a commit in this repository`);
 });
 
 test("arev record --light keeps the flag on the record it appends, and show --json echoes it", () => {

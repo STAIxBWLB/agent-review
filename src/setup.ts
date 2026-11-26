@@ -13,7 +13,7 @@
  * registrations, removed one at a time.
  */
 import { createHash } from "node:crypto";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { EXIT } from "@staix/cli-output";
@@ -154,6 +154,12 @@ function withServer(text: string | null, host: SetupHost): string {
   if (servers !== undefined && (!servers || typeof servers !== "object" || Array.isArray(servers))) {
     throw new Refusal(`${host.config} has a non-object \`${host.key}\``, "fix that file and run arev setup again");
   }
+  // An `arev` entry with no receipt behind it was not written here: adopting it would let a later `--undo` delete or
+  // restore bytes this command never owned.
+  if (servers !== undefined && Object.hasOwn(servers as Record<string, unknown>, SERVER)) {
+    throw new Refusal(`${host.config} already has an \`${SERVER}\` entry that arev setup did not write`,
+      `remove that entry and run arev setup again, or keep it and register arev by hand`);
+  }
   const next = { ...(servers as Record<string, unknown> | undefined), [SERVER]: { command, args } };
   return `${JSON.stringify({ ...document, [host.key]: next }, null, 2)}\n`;
 }
@@ -177,15 +183,32 @@ function missingDirectories(path: string): string[] {
   return missing;
 }
 
-/** Put the config back the way it was before a half-finished `--apply`, so nothing stays registered without a receipt. */
-function unwindConfig(target: SetupHost, before: string | null): void {
-  if (before === null) {
-    try {
-      unlinkSync(target.config);
-    } catch { /* Already gone: there is nothing left to take back. */ }
-    return;
+/**
+ * Take back exactly this invocation's writes. Returns the paths it could not restore or remove, so the refusal names
+ * what a person has to clean up: a rollback that fails silently is worse than the failure it answers.
+ */
+function rollback(target: SetupHost, before: string | null, installed: readonly string[], created: readonly string[]): string[] {
+  const left: string[] = [];
+  try {
+    if (before === null) {
+      if (existsSync(target.config)) unlinkSync(target.config);
+    } else {
+      writeFileSync(target.config, before);
+    }
+  } catch {
+    left.push(target.config);
   }
-  attempt(() => writeFileSync(target.config, before), target.config, "restore");
+  for (const path of installed) {
+    try {
+      unlinkSync(path);
+    } catch {
+      if (existsSync(path)) left.push(path);
+    }
+  }
+  for (const dir of [...created].reverse()) {
+    try { rmdirSync(dir); } catch { /* A directory that still holds other files stays. */ }
+  }
+  return left;
 }
 
 export function setupCommand(cwd: string, args: readonly string[]): number {
@@ -261,43 +284,59 @@ export function setupCommand(cwd: string, args: readonly string[]): number {
         `edit the ${SERVER} entry in ${target.config} by hand, or put arev's own version back and run arev setup ${name} --undo`);
     }
     const after = withServer(before, target);
-    const created = missingDirectories(dirname(target.config));
-    attempt(() => {
-      mkdirSync(dirname(target.config), { recursive: true });
-      writeFileSync(target.config, after);
-    }, target.config, "write");
-
+    // Everything that can refuse is decided before the first byte: a destination collision discovered halfway would
+    // already have replaced somebody's file, and the undo that followed would delete it.
+    const receiptDirectory = dirname(receipt);
+    if (existsSync(receiptDirectory) && !statSync(receiptDirectory).isDirectory()) {
+      throw new Refusal(`${receiptDirectory} is not a directory, so no receipt can be written there`,
+        `move that file out of the way and run arev setup ${name} --apply again`);
+    }
     const skillSource = join(dirname(import.meta.dir), "skills", SKILL);
     if (!existsSync(skillSource)) {
-      unwindConfig(target, before);
       throw new Refusal(`the ${SKILL} skill is missing from this install`, "reinstall the package so skills/arev-review ships with it");
     }
+    const names = attempt(() => readdirSync(skillSource), skillSource, "read the skill directory in");
     const skillTarget = join(target.skills, SKILL);
-    const skillCreated = missingDirectories(skillTarget);
-    let files: ReceiptFile[];
-    try {
-      const names = attempt(() => readdirSync(skillSource), skillSource, "read the skill directory in");
-      attempt(() => mkdirSync(skillTarget, { recursive: true }), skillTarget, "create");
-      for (const file of names) {
-        attempt(() => copyFileSync(join(skillSource, file), join(skillTarget, file)), join(skillTarget, file), "write");
-      }
-      files = names.map(file => ({
-        name: file,
-        sha: attempt(() => sha256(readFileSync(join(skillTarget, file))), join(skillTarget, file), "read"),
-      }));
-    } catch (error) {
-      // A registration without the skill it was registered for is a broken host, not a half-installed one: take the
-      // config back so nothing is left behind without a receipt.
-      unwindConfig(target, before);
-      throw error;
+    const clash = names.map(file => join(skillTarget, file)).find(path => existsSync(path));
+    if (clash !== undefined) {
+      throw new Refusal(`${clash} already exists, and arev setup never overwrites a file it did not write`,
+        `move ${skillTarget} out of the way or delete it, then run arev setup ${name} --apply again`);
     }
 
+    const created = [...missingDirectories(dirname(target.config)), ...missingDirectories(skillTarget)];
+    // The skill hashes describe the bytes being installed, so the receipt is complete before the first write.
+    const files = names.map(file => ({
+      name: file,
+      sha: attempt(() => sha256(readFileSync(join(skillSource, file))), join(skillSource, file), "read"),
+    }));
     const saved: Receipt = { v: 2, host: name, config: { path: target.config, before, after },
-      skill: { dir: skillTarget, files }, created: [...created, ...skillCreated] };
-    attempt(() => {
-      mkdirSync(dirname(receipt), { recursive: true });
-      writeFileSync(receipt, `${JSON.stringify(saved, null, 2)}\n`, { mode: 0o600 });
-    }, receipt, "write the arev setup receipt to");
+      skill: { dir: skillTarget, files }, created };
+    const installed: string[] = [];
+    try {
+      attempt(() => {
+        mkdirSync(dirname(target.config), { recursive: true });
+        writeFileSync(target.config, after);
+      }, target.config, "write");
+      attempt(() => mkdirSync(skillTarget, { recursive: true }), skillTarget, "create");
+      for (const file of names) {
+        const path = join(skillTarget, file);
+        attempt(() => copyFileSync(join(skillSource, file), path), path, "write");
+        installed.push(path);
+      }
+      // The receipt is this invocation's only record, so it is written inside the rollback: a failure here takes the
+      // registration back rather than leaving a registered host with nothing to undo.
+      attempt(() => {
+        mkdirSync(receiptDirectory, { recursive: true });
+        writeFileSync(receipt, `${JSON.stringify(saved, null, 2)}\n`, { mode: 0o600 });
+      }, receipt, "write the arev setup receipt to");
+    } catch (error) {
+      const left = rollback(target, before, installed, [...created, skillTarget]);
+      if (left.length > 0) {
+        throw new Refusal(`arev setup did not finish, and could not take back ${left.join(", ")}`,
+          `remove those paths by hand, then run arev setup ${name} --apply again`);
+      }
+      throw error;
+    }
 
     console.log(`arev setup ${name}: applied; ${target.config} registers \`${SERVER}\`, skill in ${skillTarget}`);
     console.log(`arev setup ${name} --undo restores ${target.config} as it was`);

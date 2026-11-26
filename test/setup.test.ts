@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { setupCommand, setupHosts } from "../src/setup.ts";
@@ -146,6 +146,49 @@ test("each workspace keeps its own agy registration, and undo takes out only its
   const kept = JSON.parse(readFileSync(join(second, ".agents", "mcp_config.json"), "utf8")) as { mcpServers: Record<string, unknown> };
   expect(kept.mcpServers.arev).toBeDefined();
   expect(receipts()).toHaveLength(1);
+});
+
+test("a skill file that is already there is refused before anything is written", () => {
+  const installed = join(home, ".claude", "skills", "arev-review", "SKILL.md");
+  write(installed, "my own skill\n");
+  expect(setupCommand(home, ["claude", "--apply"])).toBe(1);
+  // Nothing was replaced and nothing was registered: the refusal comes before the first write.
+  expect(readFileSync(installed, "utf8")).toBe("my own skill\n");
+  expect(existsSync(join(home, ".claude.json"))).toBe(false);
+  expect(receipts()).toEqual([]);
+});
+
+test("an arev entry arev setup did not write is not adopted", () => {
+  const config = join(home, ".qwen", "settings.json");
+  const before = JSON.stringify({ mcpServers: { arev: { command: "theirs" } } });
+  write(config, before);
+  expect(setupCommand(home, ["qwen", "--apply"])).toBe(1);
+  // Adoption would let a later undo restore or delete bytes this command never owned.
+  expect(readFileSync(config, "utf8")).toBe(before);
+  expect(receipts()).toEqual([]);
+});
+
+test("a receipt path that is not a directory is refused before anything is written", () => {
+  write(join(state, "setup"), "not a directory\n");
+  expect(setupCommand(home, ["kimi", "--apply"])).toBe(1);
+  expect(existsSync(join(home, ".kimi-code"))).toBe(false);
+});
+
+test("a receipt that cannot be written takes the registration back", () => {
+  const receiptDirectory = join(state, "setup");
+  mkdirSync(receiptDirectory, { recursive: true });
+  chmodSync(receiptDirectory, 0o500);
+  const lines: string[] = [];
+  const stderr = spyOn(console, "error").mockImplementation((line: unknown) => { lines.push(String(line)); });
+  const code = setupCommand(home, ["kimi", "--apply"]);
+  stderr.mockRestore();
+  chmodSync(receiptDirectory, 0o700);
+  expect(code).toBe(1);
+  // The receipt is this invocation's only record, so a config or skill it cannot record is taken back, not left behind.
+  expect(existsSync(join(home, ".kimi-code", "mcp.json"))).toBe(false);
+  expect(existsSync(join(home, ".kimi-code", "skills", "arev-review"))).toBe(false);
+  expect(receipts()).toEqual([]);
+  expect(lines.some(line => line.includes("EACCES"))).toBe(true);
 });
 
 test("a filesystem failure names the path, the errno code and the next step", () => {

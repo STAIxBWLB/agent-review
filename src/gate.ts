@@ -7,7 +7,7 @@
 import { spawnSync } from "node:child_process";
 import { EXIT, errorLine } from "@staix/cli-output";
 import { Refusal, appendEvent, readLedger, type LedgerEvent, type ReviewRecordV1 } from "./ledger.ts";
-import { ledgerEventsView } from "./record.ts";
+import { PR_NUMBER, ledgerEventsView } from "./record.ts";
 import { parseReviewMd } from "./review-md.ts";
 import { commitOid, mergeBaseOid, reviewGit } from "./review-git.ts";
 import { readRules } from "./rules.ts";
@@ -56,16 +56,19 @@ const shownHead = (value: string): string =>
   HEX.test(value) ? ` (got ${value})` : ` (got ${value.length} characters that are not a hexadecimal commit SHA)`;
 
 /**
- * The gate's decision, with no output and no side effect. `head` defaults to the repository's current HEAD.
+ * The gate's decision, with no output and no side effect. `head` defaults to the repository's current HEAD, and `pr`
+ * names the review thread when more than one PR was reviewed at that head.
  */
-export function gateReport(cwd: string, options: { head?: string; home?: string } = {}): GateResult {
+export function gateReport(cwd: string, options: { head?: string; pr?: number; home?: string } = {}): GateResult {
   const head = options.head ?? commitOid(cwd, "HEAD");
   if (!FULL_OID.test(head)) throw new Refusal(`--head must be a full commit SHA${shownHead(head)}`, "pass the full 40-character head SHA");
   const mergeBase = currentMergeBase(cwd, head);
   const events = readLedger(cwd, { home: options.home });
-  const recordEvent = [...events].reverse().find((event): event is Extract<LedgerEvent, { type: "record" }> =>
-    event.type === "record" && event.record.packet.subject.head === head);
-  const view = ledgerEventsView(events, head);
+  // The view owns the choice of review thread, and it refuses a head two PRs share unless `--pr` names one: a gate that
+  // picked the newest record at the head would pass a PR on another PR's review of the same commit.
+  const view = ledgerEventsView(events, head, options.pr);
+  const recordEvent = view.record === undefined ? undefined : events.find((event): event is Extract<LedgerEvent, { type: "record" }> =>
+    event.type === "record" && event.id === view.record);
   const base = recordEvent ? ruleBase(recordEvent.record) : undefined;
   const open: string[] = [];
 
@@ -169,13 +172,16 @@ function parseFlags(args: readonly string[], spec: { value: readonly string[]; b
   return { flags };
 }
 
-/** `arev gate [--head SHA] [--post] [--json]`. */
+/** `arev gate [--head SHA] [--pr N] [--post] [--json]`. */
 export function gateCommand(cwd: string, args: readonly string[]): number {
-  const parsed = parseFlags(args, { value: ["--head"], boolean: ["--post", "--json"] });
-  if (!parsed) return usageError("gate takes --head SHA, --post and --json");
+  const parsed = parseFlags(args, { value: ["--head", "--pr"], boolean: ["--post", "--json"] });
+  if (!parsed) return usageError("gate takes --head <sha>, --pr <n>, --post and --json");
+  const prFlag = parsed.flags["--pr"]?.at(-1);
+  if (prFlag !== undefined && !PR_NUMBER.test(prFlag)) return usageError("Invalid PR number. Pass a positive integer to --pr.");
   try {
     const result = gateReport(cwd, {
       ...(parsed.flags["--head"]?.at(-1) === undefined ? {} : { head: parsed.flags["--head"]!.at(-1)! }),
+      ...(prFlag === undefined ? {} : { pr: Number(prFlag) }),
     });
     // The spec's ledger has a `gate` event, so each evaluation is recorded: it is written here, never inside the pure
     // decision, and it sits before the `post` event because a pass posts after this line. The decision reads only

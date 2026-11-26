@@ -11,7 +11,7 @@ export const commands = [
   { name: "show", aliases: [], description: "Show the recorded review for a head",
     syntax: "show [--head SHA] [--pr N|none] [--json]" },
   { name: "gate", aliases: [], description: "Answer whether this exact head is reviewed, and post the status with --post",
-    syntax: "gate [--head SHA] [--post] [--json]" },
+    syntax: "gate [--head SHA] [--pr N] [--post] [--json]" },
   { name: "--help", aliases: ["-h"], description: "Show usage" },
   { name: "--version", aliases: ["-v"], description: "Show version" },
 ] as const;

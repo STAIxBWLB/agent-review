@@ -63,8 +63,8 @@ function fullOidHere(cwd: string, value: string): boolean {
 }
 /** A packet id is the sha256 of the packet's canonical JSON: a report's claim on it is checked before it is looked up. */
 const PACKET_ID = /^[a-f0-9]{64}$/;
-/** A review thread is a PR number, in the shape `arev packet --pr` takes it. */
-const PR_NUMBER = /^[1-9][0-9]*$/;
+/** A review thread is a PR number, in the shape `arev packet --pr` takes it; `arev gate` reads it here too. */
+export const PR_NUMBER = /^[1-9][0-9]*$/;
 /** The JSON type of a report value: what a refusal says when it may not say the value itself. */
 const jsonType = (value: unknown): string =>
   value === null ? "null" : Array.isArray(value) ? "an array" : typeof value;

@@ -4,7 +4,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, wr
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { gateReport } from "../src/gate.ts";
-import { appendEvent, ledgerPath, recordId, type LedgerEvent, type PacketBlock, type ReviewRecordV1 } from "../src/ledger.ts";
+import { appendEvent, ledgerPath, recordId, Refusal, type LedgerEvent, type PacketBlock, type ReviewRecordV1 } from "../src/ledger.ts";
 import { parseReviewRecord } from "../src/record.ts";
 
 const roots: string[] = [];
@@ -89,7 +89,7 @@ const reportFor = (subject: Subject, changes: Record<string, unknown> = {}) => (
 
 /** The record a reviewer files for a packet, through the real validator, so a test can only seed what it accepts. */
 const recordFor = (subject: Subject, changes: Record<string, unknown> = {}, options: { light?: boolean } = {}): ReviewRecordV1 =>
-  parseReviewRecord(reportFor(subject, changes), { packet: packetFor(subject), person: false, ...(options.light ? { light: true } : {}) });
+  parseReviewRecord(reportFor(subject, changes), { packet: packetFor(subject), ...(options.light ? { light: true } : {}) });
 
 const blocking = (changes: Record<string, unknown> = {}) => ({
   id: "bugs:open-one", term: "bugs", severity: "blocking", disposition: "open", origin: "introduced",
@@ -194,9 +194,19 @@ test("an open blocking finding fails the gate by name until a disposition settle
   expect(gated(resolve("fixed", { evidence: ["src/a.ts:3"] })).ok).toBe(true);
   expect(gated(resolve("false_positive", { evidence: ["bun test test/findings.test.ts"] })).ok).toBe(true);
   expect(gated(resolve("accepted", { rationale: "the person accepted the risk" })).ok).toBe(true);
-  // An explicit disposition settles its id for every head (the ported lifecycle's rule), so settling elsewhere counts.
+  // Round 10's scope: with no PR named, a resolve counts at its own exact head, so one written at an unrelated head
+  // settles nothing here: a resolve is not a statement about reviews it never named.
   const elsewhere = gated({ ...resolve("fixed"), head: "f".repeat(40) } as LedgerEvent);
-  expect(elsewhere.open).toEqual([]);
+  expect(elsewhere.open).toEqual(["blocking findings are open: bugs:open-one"]);
+  // Inside one PR thread the resolve counts wherever the branch moved, which is what `resolve` writes on the event.
+  const threaded: Subject = { ...subject, pr: 7 };
+  const gatedThread = (...extra: LedgerEvent[]) => {
+    const home = temp("arev-hub-");
+    seed({ repo, home, subject: threaded, record: recordFor(threaded, { findings: [blocking()], verdict: "changes_requested" }), extra });
+    return gateReport(repo, { head, home });
+  };
+  expect(gatedThread().open).toEqual(["blocking findings are open: bugs:open-one"]);
+  expect(gatedThread({ ...resolve("fixed"), head: "f".repeat(40), pr: 7 } as LedgerEvent).open).toEqual([]);
 });
 
 test("a self-review needs both the fallback and [gate] same_family = allow; a declared fallback needs allow", () => {
@@ -237,6 +247,60 @@ test("a failed reviewer call fails the gate", () => {
   const result = gateReport(repo, { head, home });
   expect(result.ok).toBe(false);
   expect(result.open).toEqual(["the reviewer call failed: the reviewer call timed out"]);
+});
+
+test("a head two PRs share refuses without --pr, and each PR gates on its own record", () => {
+  const { repo, base, head, home } = fixture();
+  const seven: Subject = { kind: "range", base, head, mergeBase: base, pr: 7 };
+  const eight: Subject = { kind: "range", base, head, mergeBase: base, pr: 8 };
+  const sevenId = seed({ repo, home, subject: seven, record: recordFor(seven) });
+  const eightId = seed({ repo, home, subject: eight, record: recordFor(eight, {
+    findings: [blocking({ id: "bugs:eight-only" })], verdict: "changes_requested",
+  }) });
+
+  // One commit reviewed by two PRs: the newest record at the head is whichever was written last, so a gate that read it
+  // would pass PR 7 on PR 8's changes_requested or fail PR 8 on PR 7's approval. The gate refuses instead.
+  const outcome = (pr?: number): { message: string; next: string } | string => {
+    try {
+      gateReport(repo, { head, home, ...(pr === undefined ? {} : { pr }) });
+      return "passed";
+    } catch (error) {
+      if (!(error instanceof Refusal)) throw error;
+      return { message: error.message, next: error.next };
+    }
+  };
+  expect(outcome()).toEqual({
+    message: `head ${head} is reviewed in more than one thread (PR 7, PR 8), so arev cannot tell which review you mean`,
+    next: "pass --pr 7 or --pr 8 to choose the review thread",
+  });
+  // A --pr the head knows nothing about is refused too, rather than answered with an empty review of it.
+  expect(outcome(9)).toEqual({
+    message: `no packet or record at head ${head} belongs to PR 9`,
+    next: "pass --pr 7 or --pr 8 for this head",
+  });
+
+  // With the thread named, each PR reads only its own record, verdict and open findings.
+  expect(gateReport(repo, { head, home, pr: 7 })).toMatchObject({ head, ok: true, record: sevenId, verdict: "approved", open: [] });
+  expect(gateReport(repo, { head, home, pr: 8 })).toMatchObject({
+    head, ok: false, record: eightId, verdict: "changes_requested", open: ["blocking findings are open: bugs:eight-only"],
+  });
+
+  // Fail closed through the command too: no gate event, and never a status for a head the gate did not judge.
+  const refused = run(repo, { AGENTHUB_HOME: home }, "gate", "--head", head, "--post");
+  expect(refused.code).toBe(1);
+  expect(refused.stdout).toBe("");
+  expect(refused.stderr).toContain("is reviewed in more than one thread (PR 7, PR 8)");
+  expect(refused.stderr).toContain("→ pass --pr 7 or --pr 8 to choose the review thread");
+  expect(events(repo, home).filter(event => event.type === "gate" || event.type === "post")).toEqual([]);
+
+  // The flag reaches the decision through the command, and names the record it settled on.
+  const threadedRun = run(repo, { AGENTHUB_HOME: home }, "gate", "--head", head, "--pr", "7");
+  expect(threadedRun.code).toBe(0);
+  expect(threadedRun.stdout).toContain(`record ${sevenId}`);
+
+  const badPr = run(repo, { AGENTHUB_HOME: home }, "gate", "--pr", "seven");
+  expect(badPr.code).toBe(2);
+  expect(badPr.stderr).toContain("Invalid PR number. Pass a positive integer to --pr.");
 });
 
 test("REVIEW.md must be at the merge base unless the record says --light", () => {
@@ -324,7 +388,7 @@ test("the gate takes no --light flag, and a bad [gate] setting refuses by name",
   expect(run(repo, { AGENTHUB_HOME: home }, "gate", "--head", head).code).toBe(0);
   const flag = run(repo, { AGENTHUB_HOME: home }, "gate", "--light");
   expect(flag.code).toBe(2);
-  expect(flag.stderr).toContain("gate takes --head SHA, --post and --json");
+  expect(flag.stderr).toContain("gate takes --head <sha>, --pr <n>, --post and --json");
 
   // A key arev does not read is refused from REVIEW.md itself, through the one parser both commands use.
   const typo = fixture('# Review\n[gate] same_famly = "allow"\n');

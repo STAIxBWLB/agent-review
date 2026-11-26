@@ -8,7 +8,7 @@ export function main(args: readonly string[]): number {
     name === first || aliases.some(alias => alias === first));
 
   if (!command || extra.length > 0) {
-    for (const line of errorLine("arev", "invalid command or arguments", "", {
+    for (const line of errorLine("arev", command ? `${command.name} takes no arguments` : "unknown command", "", {
       tty: Boolean(process.stderr.isTTY),
       next: "arev --help",
     })) console.error(line);

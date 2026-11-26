@@ -2,7 +2,7 @@
 
 - Plan of record: entelecheia/ai-workspace#78. Implement the accepted phase spec (V1 is #1) on a branch with a draft PR. Change the spec first when the code must differ.
 - Source is in `src/`, the bootstrap in `bin/`, checks in `scripts/`, tests and synthetic fixtures in `test/`.
-- Strict TypeScript, `.ts` imports, `noUncheckedIndexedAccess`. Runtime imports: relative files, Node builtins, `bun:` and the exactly pinned first-party packages the spec names (`@staix/cli-output`, `@staix/mcp-stdio`, `@staix/agent-mem/platform`); `scripts/check-boundary.ts` enforces it.
+- Strict TypeScript, `.ts` imports, `noUncheckedIndexedAccess`. Runtime imports: relative files, Node builtins, `bun:` and `@staix/cli-output` and `@staix/mcp-stdio` at the spec's exact versions plus `@staix/agent-mem/platform` within the declared range; `scripts/check-boundary.ts` enforces it.
 - `src/commands-table.ts` is the single CLI source; usage, help and the README command list are generated from it. Add a command there first, and keep unimplemented phases out of it.
 - Verify with `bun install --frozen-lockfile && bun run check`, and paste the output in `hub_task_done`.
 - Ported code: a file ported from agent-hub names the agent-hub commit it came from in the PR. Port its tests with it; a test is dropped only with the reason in the PR. Do not change a ported behaviour in the same PR that ports it.

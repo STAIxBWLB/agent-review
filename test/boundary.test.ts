@@ -51,3 +51,17 @@ test("rejects a loosened pin and an extra manifest dependency", () => {
   const extra = { ...manifest.dependencies, thirdParty: "1.0.0" };
   expect(fixture("", "", extra)).toHaveLength(1);
 });
+
+test("permits named node:module helpers and rejects indirect runtime loaders", () => {
+  expect(fixture('import { isBuiltin as known } from "node:module";')).toEqual([]);
+  const errors = fixture(`
+    import { createRequire as load } from "node:module";
+    import * as moduleNamespace from "module";
+    export { createRequire as loadModule } from "node:module";
+    const dynamic = import("node:module");
+    const alias = require;
+  `);
+  expect(errors).toHaveLength(5);
+  expect(errors.slice(0, 4).every(error => error.includes("without createRequire"))).toBe(true);
+  expect(errors[4]).toContain("call require directly");
+});

@@ -9,6 +9,7 @@ const dependencies = {
   "@staix/mcp-stdio": "0.1.0",
 };
 const packages = new Set(["@staix/agent-mem/platform", "@staix/cli-output", "@staix/mcp-stdio"]);
+const moduleLoaders = new Set(["createRequire", "Module", "default"]);
 const extensions = new Set([".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs"]);
 
 export function checkBoundary(directory: string): string[] {
@@ -27,7 +28,12 @@ export function checkBoundary(directory: string): string[] {
   function checkFile(path: string): void {
     const source = ts.createSourceFile(path, readFileSync(path, "utf8"), ts.ScriptTarget.Latest, true);
 
-    function checkImport(node: ts.Node, specifier: ts.Node | undefined, typeOnly = false): void {
+    function checkImport(
+      node: ts.Node,
+      specifier: ts.Node | undefined,
+      typeOnly = false,
+      safeModuleBindings = false,
+    ): void {
       const line = source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1;
       const location = `${relative(root, path)}:${line}`;
       if (!specifier || !ts.isStringLiteralLike(specifier)) {
@@ -36,6 +42,10 @@ export function checkBoundary(directory: string): string[] {
       }
       const name = specifier.text;
       if (typeOnly && name === "@staix/agent-console/contract") return;
+      if ((name === "node:module" || name === "module") && !typeOnly && !safeModuleBindings) {
+        failures.push(`${location}: use explicit named imports from node:module without createRequire.`);
+        return;
+      }
       if (isBuiltin(name) || name.startsWith("bun:") || packages.has(name)) return;
       if (name.startsWith("./") || name.startsWith("../")) {
         try {
@@ -60,9 +70,16 @@ export function checkBoundary(directory: string): string[] {
         const typeOnly = clause?.isTypeOnly || (clause?.name === undefined && bindings !== undefined &&
           ts.isNamedImports(bindings) && bindings.elements.length > 0 &&
           bindings.elements.every(element => element.isTypeOnly));
-        checkImport(node, node.moduleSpecifier, typeOnly);
+        const safeModuleBindings = clause?.name === undefined && bindings !== undefined &&
+          ts.isNamedImports(bindings) && bindings.elements.every(element =>
+            element.isTypeOnly || !moduleLoaders.has((element.propertyName ?? element.name).text));
+        checkImport(node, node.moduleSpecifier, typeOnly, safeModuleBindings);
       } else if (ts.isExportDeclaration(node) && node.moduleSpecifier) {
-        checkImport(node, node.moduleSpecifier, node.isTypeOnly);
+        const exports = node.exportClause;
+        const safeModuleBindings = exports !== undefined && ts.isNamedExports(exports) &&
+          exports.elements.every(element =>
+            element.isTypeOnly || !moduleLoaders.has((element.propertyName ?? element.name).text));
+        checkImport(node, node.moduleSpecifier, node.isTypeOnly, safeModuleBindings);
       } else if (ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference)) {
         checkImport(node, node.moduleReference.expression, node.isTypeOnly);
       } else if (ts.isImportTypeNode(node)) {
@@ -71,6 +88,11 @@ export function checkBoundary(directory: string): string[] {
           (node.expression.kind === ts.SyntaxKind.ImportKeyword ||
            (ts.isIdentifier(node.expression) && node.expression.text === "require"))) {
         checkImport(node, node.arguments[0]);
+      }
+      if (ts.isIdentifier(node) && node.text === "require" &&
+          !(ts.isCallExpression(node.parent) && node.parent.expression === node)) {
+        const line = source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1;
+        failures.push(`${relative(root, path)}:${line}: call require directly with a literal or use an import declaration.`);
       }
       ts.forEachChild(node, visit);
     }

@@ -24,3 +24,8 @@ bun run check
 
 Regenerate the command list with `bun scripts/gen-readme.ts` after editing
 `src/commands-table.ts`.
+
+## AGENTS.md background
+
+- On 2026-11-26, aligned the dependency rule with AC10's declared range for
+  `@staix/agent-mem` and exact pins for the other two runtime packages.

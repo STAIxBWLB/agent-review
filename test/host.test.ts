@@ -70,6 +70,16 @@ test("the model comes from the host's own config file, top level only", () => {
     expect(modelOf("codex", join(home, "no-such-home"))).toBe("unknown");
     writeFileSync(join(home, ".codex/config.toml"), "approval_policy = \"never\"\n");
     expect(modelOf("codex", home)).toBe("unknown");
+    // A key TOML lets the host quote is still that key, in either quoting style.
+    writeFileSync(join(home, ".codex/config.toml"), '"model" = "gpt-5-codex"\n');
+    expect(modelOf("codex", home)).toBe("gpt-5-codex");
+    writeFileSync(join(home, ".kimi-code/config.toml"), `'default_model' = 'kimi-k2'\n`);
+    expect(modelOf("kimi", home)).toBe("kimi-k2");
+    // And a model written with TOML's escapes attests as the name it decodes to, not as the escapes.
+    writeFileSync(join(home, ".codex/config.toml"), 'model = "gpt\\u002D5-codex" # the dash is escaped\n');
+    expect(modelOf("codex", home)).toBe("gpt-5-codex");
+    writeFileSync(join(home, ".codex/config.toml"), 'model = "gpt-5-codex"');
+    expect(modelOf("codex", home)).toBe("gpt-5-codex");
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
@@ -79,7 +89,9 @@ test("a config value that is not a plain model name reads as unknown", () => {
   const home = temp("arev-host-unsafe-");
   try {
     mkdirSync(join(home, ".codex"), { recursive: true });
-    for (const value of ["", "gpt-\u001b[31mbad", "sk-abcdefghijklmnopqrstuvwx", "m".repeat(129)]) {
+    // The last two are escapes TOML does not define, or defines into a character no model name may carry.
+    for (const value of ["", "gpt-\u001b[31mbad", "sk-abcdefghijklmnopqrstuvwx", "m".repeat(129),
+      "gpt\\q5", "gpt\\u00005"]) {
       writeFileSync(join(home, ".codex/config.toml"), `model = "${value}"\n`);
       expect(modelOf("codex", home)).toBe("unknown");
     }
@@ -147,7 +159,37 @@ test("arev host without --implementer or --pr is refused, and an unknown host id
     }
     expect(run({ PATH: bin }, "host", "--pr", "448", "--implementer", "claude", "--hosts", "qwen").stderr)
       .toContain("claude, codex, kimi");
+    // An unknown id is caller text, so it is echoed only when it is an identity that is not secret-shaped.
+    const echoed = run({ PATH: bin }, "host", "--pr", "448", "--implementer", "claude", "--hosts", "sk-abcdefghijklmnopqrstuvwx");
+    expect(echoed.code).toBe(2);
+    expect(echoed.stderr).toContain("arev does not know the host <withheld>");
+    expect(echoed.stderr).not.toContain("sk-abcdefghijklmnopqrstuvwx");
+    const control = run({ PATH: bin }, "host", "--pr", "448", "--implementer", "claude", "--unavailable", "gpt\u001b[31m");
+    expect(control.stderr).toContain("arev does not know the host <withheld>");
+    expect(control.stderr).not.toContain("\u001b");
   } finally {
+    rmSync(bin, { recursive: true, force: true });
+  }
+});
+
+// `--unavailable` and `--hosts` take a list, so the flag itself may be given again: each value has to land, which is what
+// the duplicate-flag guard would have refused while it screened every flag the same way.
+test("a repeated --unavailable or --hosts excludes or orders each host it names", () => {
+  const home = temp("arev-host-repeat-"), bin = temp("arev-host-repeat-bin-");
+  try {
+    for (const host of HOST_ORDER) writeFileSync(join(bin, host), "#!/bin/sh\n", { mode: 0o755 });
+    const env = { HOME: home, PATH: bin };
+    // 449 % 3 = 2, so the rotation is kimi, claude, codex: excluding the first two by a repeated flag leaves codex.
+    const excluded = run(env, "host", "--pr", "449", "--implementer", "qwen", "--unavailable", "kimi", "--unavailable", "claude", "--json");
+    expect(excluded.code).toBe(0);
+    expect(JSON.parse(excluded.stdout)).toEqual({ host: "codex", reason: "fallback", considered: [
+      { host: "kimi", skipped: "unavailable" }, { host: "claude", skipped: "unavailable" }], model: "unknown" });
+    // And a repeated --hosts is one order built from both values, which keeps the rotation arithmetic on the list given.
+    const ordered = run(env, "host", "--pr", "449", "--implementer", "qwen", "--hosts", "claude", "--hosts", "kimi", "--json");
+    expect(ordered.code).toBe(0);
+    expect(JSON.parse(ordered.stdout)).toEqual({ host: "kimi", reason: "rotation", considered: [], model: "unknown" });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
     rmSync(bin, { recursive: true, force: true });
   }
 });

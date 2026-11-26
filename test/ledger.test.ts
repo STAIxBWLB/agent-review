@@ -56,6 +56,44 @@ test("the ledger lives under AGENTHUB_HOME/review/<project-id>/ and never in the
   expect(() => ledgerPath(repo, { home: join(repo, "ledger-home") })).toThrow("AGENTHUB_HOME resolves inside the reviewed worktree");
 });
 
+test("the containment refusal withholds a secret-shaped home or worktree root", () => {
+  const { repo } = fixture();
+  // Both paths are the caller's text: a directory named after a token is not arev's to print, and this refusal is the one
+  // that names them.
+  const secret = "ghp_" + "a".repeat(36);
+  const inside = join(repo, secret);
+  mkdirSync(inside);
+  const refused = (() => {
+    try {
+      ledgerPath(repo, { home: inside });
+      return undefined;
+    } catch (error) {
+      return error as Refusal;
+    }
+  })();
+  expect(refused?.message).toBe("AGENTHUB_HOME resolves inside the reviewed worktree (<withheld>); the ledger is never kept there");
+  expect(refused?.next).toBe(`set AGENTHUB_HOME to a directory outside ${comparablePath(repo)}`);
+  expect(refused?.message).not.toContain(secret);
+
+  // The worktree root is the other path in that message, and it is withheld on its own: a checkout named after a token
+  // inside a plainly named home.
+  const root = mkdtempSync(join(tmpdir(), "arev-ledger-secret-"));
+  roots.push(root);
+  const named = join(root, secret);
+  mkdirSync(named);
+  git(named, ["init", "-q", "-b", "main"]);
+  const other = (() => {
+    try {
+      ledgerPath(named, { home: join(named, "ledger-home") });
+      return undefined;
+    } catch (error) {
+      return error as Refusal;
+    }
+  })();
+  expect(other?.next).toBe("set AGENTHUB_HOME to a directory outside <withheld>");
+  expect(other?.next).not.toContain(secret);
+});
+
 test("a worktree whose path ends in a space is compared as it is, so a ledger inside it is still refused", () => {
   const root = mkdtempSync(join(tmpdir(), "arev-ledger-space-"));
   roots.push(root);

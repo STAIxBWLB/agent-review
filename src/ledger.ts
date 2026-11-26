@@ -215,8 +215,8 @@ export function ledgerPath(cwd: string, options: { home?: string } = {}): string
   if (top) {
     const root = comparablePath(top), inside = (candidate: string) => candidate === root || candidate.startsWith(root + sep);
     if (inside(comparablePath(path)) || inside(comparablePath(home))) {
-      throw new Refusal(`AGENTHUB_HOME resolves inside the reviewed worktree (${home}); the ledger is never kept there`,
-        `set AGENTHUB_HOME to a directory outside ${top}`);
+      throw new Refusal(`AGENTHUB_HOME resolves inside the reviewed worktree (${shown(home)}); the ledger is never kept there`,
+        `set AGENTHUB_HOME to a directory outside ${shown(top)}`);
     }
   } else if (gitMarkerAtOrAbove(cwd)) {
     // The probe failed where a `.git` exists, so this is a checkout whose root arev cannot read (dubious ownership, an

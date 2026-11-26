@@ -70,10 +70,17 @@ function packetRequest(args: Record<string, unknown>): PacketRequest {
 }
 
 /**
+ * AC9's tool list, named once: the handler record and the tool table are both keyed by it, so a tool can be neither
+ * served without a handler nor handled without a schema.
+ */
+export const MCP_TOOL_NAMES = ["arev_packet", "arev_rules", "arev_record", "arev_resolve", "arev_show", "arev_gate"] as const;
+export type McpToolName = typeof MCP_TOOL_NAMES[number];
+
+/**
  * The tool table and its handlers, bound to the repository `cwd`. Handlers are exported separately from `MCP_TOOLS` so
  * a test can drive a tool directly and assert that nothing was printed.
  */
-export function mcpHandlers(cwd: string): Record<string, Handler> {
+export function mcpHandlers(cwd: string): Record<McpToolName, Handler> {
   return {
     arev_packet: args => {
       const bundle = buildPacket(cwd, packetRequest(args));
@@ -95,16 +102,20 @@ export function mcpHandlers(cwd: string): Record<string, Handler> {
         return fail("arev_record needs report: the report body as an object", "pass report: the JSON you wrote for this packet");
       }
       const implementer = text(args.implementer);
-      return recordReview(cwd, report, { label: "the arev_record report", person: false,
+      return recordReview(cwd, report, { label: "argument", person: false,
         ...(implementer === undefined ? {} : { implementer }), ...(args.light === true ? { light: true } : {}) });
     },
     arev_resolve: args => {
       const finding = text(args.finding);
       if (finding === undefined) return fail("arev_resolve needs finding: the recorded finding id", "pass finding: an id from arev_show");
       const as = args.as;
+      // `accepted` is the person's decision, and a server has no terminal: the CLI refuses it there too.
+      if (as === "accepted") {
+        return fail("accepted is the person's decision and is refused over MCP",
+          `ask them to run arev resolve <id> --as accepted --rationale "<what was accepted>" at their terminal`);
+      }
       if (as !== "fixed" && as !== "false_positive") {
-        return fail("arev_resolve settles a finding as fixed or false_positive only",
-          "accepted is the person's decision: ask them to run arev resolve <id> --as accepted at their terminal");
+        return fail("arev_resolve settles a finding as fixed or false_positive", "pass as: fixed or false_positive");
       }
       const evidence = pathsArgument(args.evidence) ?? [];
       const rationale = text(args.rationale), head = text(args.head);
@@ -128,7 +139,7 @@ const REPORT_SCHEMA = {
   description: "The report body you wrote for this packet, as JSON.",
 } as const;
 
-export const MCP_TOOLS: readonly Tool[] = [
+export const MCP_TOOLS: readonly (Tool & { name: McpToolName })[] = [
   {
     name: "arev_packet",
     description: "Build the review packet for one subject: its units, excluded paths and framed review brief. Use arev packet --out DIR in the CLI when the diff is too large for one response.",

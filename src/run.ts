@@ -228,8 +228,9 @@ type Screening = { refused: string[]; warned: string[] };
 function screenReviewerFiles(out: string): Screening {
   const screening: Screening = { refused: [], warned: [] };
   for (const name of REVIEWER_FILES) {
-    // reviewer.stderr is a diagnostic log that is never recorded, so what the screen removes from it cannot leak
-    // into the review: it is named as a warning and the review still records. The two record-bearing files refuse.
+    // reviewer.stderr is a diagnostic log that is never recorded, so a redaction or the oversize marker there is named
+    // as a warning and the review still records. The two record-bearing files refuse, and so does every file the screen
+    // could not read or remove: that content was never screened, which no file's purpose excuses.
     const messages = name === STDERR_FILE ? screening.warned : screening.refused;
     const path = join(out, name);
     try {
@@ -257,9 +258,9 @@ function screenReviewerFiles(out: string): Screening {
       // Do not preserve unchecked output if the artifact cannot be opened or overwritten.
       try {
         unlinkSync(path);
-        messages.push(`${name}: removed after screening failed`);
+        screening.refused.push(`${name}: removed after screening failed`);
       } catch {
-        messages.push(`${name}: could not be screened or removed`);
+        screening.refused.push(`${name}: could not be screened or removed`);
       }
     }
   }

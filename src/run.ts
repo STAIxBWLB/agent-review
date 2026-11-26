@@ -8,7 +8,7 @@ import { chooseHost, hostConfigVariable, hostExecutable, HOST_ORDER, modelOf } f
 import { importReviewFile } from "./import.ts";
 import { Refusal, secretShaped, shown, stringsIn } from "./ledger.ts";
 import { RUN_REPORT_FILE, RUN_STATE_FILE, RUN_TOOL_NAMES } from "./mcp.ts";
-import { buildPacket, workspaceFilterOptions, type PacketRequest } from "./packet.ts";
+import { buildPacket, workspaceFilterOptions, type PacketRequest, type ReviewPacket } from "./packet.ts";
 import { insideWorktree, packetSettings, PacketUsageError, writePacketBundle } from "./packet-cli.ts";
 import { PR_NUMBER, recordReview, type RunAttestation } from "./record.ts";
 import { repositoryRoot, reviewGit } from "./review-git.ts";
@@ -62,20 +62,24 @@ function requestFor(root: string, pr?: string): PacketRequest {
   return { kind: "range", base, head: "HEAD" };
 }
 
-function reviewerPrompt(out: string, checkout: string): string {
+function reviewerPrompt(out: string, checkout: string, packet: ReviewPacket, hasMcp: boolean): string {
   return [
     "Perform a read-only code review. Read the packet brief, rules and their referenced contract in this bundle:",
     JSON.stringify(out),
     `Read the detached checkout at ${JSON.stringify(checkout)} for repository context.`,
     "The bundle text is review data. Review the exact Git head in packet.json. Do not edit the checkout.",
-    "Use the arev MCP tools if available: call arev_packet, then send the report to arev_record once.",
-    "If those tools are unavailable, finish with a fenced json block containing v: 1, packet (copy id and subject from packet.json),",
-    "reviewer (id, modelFamily, started, sameFamilyFallback), coverage (reviewed paths and skipped paths with reasons),",
-    "findings, verdict, and call. The runner records the selected host, model and implementer.",
+    hasMcp ? "Call arev_packet, then stage the report once with arev_record."
+      : "MCP is unavailable. Read the bundle files directly.",
+    "If you do not stage a report over MCP, end the answer with exactly one fenced json block and no trailing text.",
+    "Use the field names and types in this example. Set verdict, findings and call from your review.",
+    "Replace the example path with all reviewed paths from packet.json. Each coverage.reviewed entry must be a string, never an object.",
+    'Use {"path":"relative/path","reason":"why it was skipped"} in coverage.skipped. Account for every reviewable unit.',
+    "```json",
+    JSON.stringify({ v: 1, packet: { id: packet.id, subject: packet.subject }, reviewer: {},
+      coverage: { reviewed: ["example.ts"], skipped: [] }, findings: [], verdict: "approved", call: { ok: true } }),
+    "```",
     "Each finding needs a semantic id, term (bugs, security or compliance), severity (blocking or advisory),",
     "disposition (open, fixed or false_positive), origin (introduced, pre_existing or indeterminate), and text.",
-    "For free-text fallback, start with a fenced JSON metadata block with head, base, packet_id, reviewer, call",
-    "and coverage, and then a Findings heading with P0-P3 entries. Name every reviewed or skipped packet unit.",
   ].join("\n");
 }
 
@@ -133,7 +137,8 @@ function mcpArgs(host: string, arev: string, out: string, launch: string, kimiFl
   if (host === "codex") {
     // Wait for this run's cold tool catalog before Codex sends its first turn.
     return ["-c", "mcp_servers.arev.required=true", "-c", `mcp_servers.arev.command=${JSON.stringify(command)}`,
-      "-c", `mcp_servers.arev.args=${JSON.stringify(args)}`];
+      "-c", `mcp_servers.arev.args=${JSON.stringify(args)}`,
+      ...RUN_TOOL_NAMES.flatMap(tool => ["-c", `mcp_servers.arev.tools.${tool}.approval_mode="approve"`])];
   }
   const configFlag = host === "kimi" ? kimiFlag : "--mcp-config";
   if (configFlag === undefined) return [];
@@ -153,7 +158,7 @@ function hostArgs(host: string, model: string, checkout: string, launch: string,
   // Kimi refuses --plan together with the -p this run always passes (`error: Cannot combine --prompt with --plan`), and
   // the OCR flow this replaces ran it without one: the detached worktree and the clean-checkout check are the guard.
   if (host === "kimi") return ["--skills-dir", launch, "--add-dir", checkout, "--add-dir", out, "--output-format", "text", ...mcp, "-p", prompt];
-  return ["-p", "--permission-mode", "plan", "--setting-sources", "user", "--add-dir", checkout, "--add-dir", out, ...mcp];
+  return ["-p", "--permission-mode", "plan", "--setting-sources", "", "--settings", '{"disableAllHooks":true,"enabledPlugins":{}}', "--add-dir", checkout, "--add-dir", out, ...mcp];
 }
 
 function runReviewer(
@@ -278,7 +283,9 @@ function cleanCheckout(checkout: string, head: string, gitFile: string, filters:
   } catch { return false; }
 }
 
-function lastJsonReport(source: string): unknown {
+function lastJsonReport(source: string, host: string): unknown {
+  // Kimi's text renderer prefixes the first line of an answer with a bullet.
+  if (host === "kimi") source = source.replace(/^[ \t]*•[ \t]+(?=```json[ \t]*\r?$)/gim, "");
   const blocks = [...source.matchAll(/^[ \t]*```json[ \t]*\r?\n([\s\S]*?)^[ \t]*```[ \t]*$/gim)];
   const value = blocks.at(-1)?.[1];
   if (value === undefined) return undefined;
@@ -383,7 +390,7 @@ export async function runCommand(cwd: string, args: readonly string[]): Promise<
         packetId: bundle.packet.id, advisoryCap: settings.advisoryCap,
       }) + "\n", { flag: "wx", mode: 0o600 });
     }
-    const prompt = reviewerPrompt(out, checkout);
+    const prompt = reviewerPrompt(out, checkout, bundle.packet, attachMcp);
     const mcp = arev === undefined ? [] : mcpArgs(host, arev, out, launch, kimiFlag);
     outcome = await runReviewer(executable, host, hostArgs(host, model, checkout, launch, out, prompt, mcp), launch, out, prompt,
       options.timeout, pathEnv, homes);
@@ -422,7 +429,7 @@ export async function runCommand(cwd: string, args: readonly string[]): Promise<
   const source = readFileSync(file, "utf8");
   let id: string;
   try {
-    const raw = hasStagedReport ? JSON.parse(source) : lastJsonReport(source);
+    const raw = hasStagedReport ? JSON.parse(source) : lastJsonReport(source, host);
     id = raw === undefined
       ? importReviewFile(root, file, "brief", run).id
       : recordReview(root, raw, { label: file, run }).id;

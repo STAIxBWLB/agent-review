@@ -101,7 +101,8 @@ printf '%s\\n' '{"baseRefOid":"${base}","headRefOid":"${head}","title":"Review f
     writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(process.argv.slice(2)));
     writeFileSync(${JSON.stringify(runCwdFile)}, process.cwd());
     if (host === "claude") {
-      if (process.argv[process.argv.indexOf("--setting-sources") + 1] !== "user" ||
+      if (process.argv[process.argv.indexOf("--setting-sources") + 1] !== "" ||
+          JSON.parse(process.argv[process.argv.indexOf("--settings") + 1]).disableAllHooks !== true ||
           process.argv[process.argv.indexOf("--permission-mode") + 1] !== "plan") process.exit(9);
     } else if (host === "kimi") {
       // The real CLI refuses these two together (issue #42), and arev starts it in prompt mode only: the detached
@@ -148,7 +149,10 @@ printf '%s\\n' '{"baseRefOid":"${base}","headRefOid":"${head}","title":"Review f
     if (mode === "mcp" || mode === "mcp-dirty" || mode === "mcp-failed") {
       const config = Object.fromEntries(process.argv.filter(arg => arg.startsWith("mcp_servers.arev."))
         .map(arg => [arg.slice(0, arg.indexOf("=")), JSON.parse(arg.slice(arg.indexOf("=") + 1))]));
-      if (config["mcp_servers.arev.required"] !== true) process.exit(20);
+      const approvals = Object.keys(config).filter(key => key.endsWith(".approval_mode"));
+      const tools = ["arev_packet", "arev_rules", "arev_show", "arev_record"];
+      if (config["mcp_servers.arev.required"] !== true || approvals.length !== tools.length ||
+          tools.some(tool => config["mcp_servers.arev.tools." + tool + ".approval_mode"] !== "approve")) process.exit(20);
       const command = config["mcp_servers.arev.command"];
       const args = config["mcp_servers.arev.args"];
       const report = { v: 1, packet, reviewer, coverage, call, verdict: "approved", findings: [] };
@@ -204,10 +208,10 @@ printf '%s\\n' '{"baseRefOid":"${base}","headRefOid":"${head}","title":"Review f
       process.exit(0);
     }
     if (mode === "brief") {
-      console.log(fence + "json\\n" + JSON.stringify({ head: packet.subject.head, base: packet.subject.base,
+      console.log((host === "kimi" ? "• " : "") + fence + "json\\n" + JSON.stringify({ head: packet.subject.head, base: packet.subject.base,
         packet_id: packet.id, reviewer, coverage, call }) + "\\n" + fence + "\\n## Findings\\nP0: None.\\nP1: None.\\nP2: None.\\nP3: None.");
     } else {
-      console.log(fence + "json\\n" + JSON.stringify({ v: 1, packet, reviewer, coverage, call,
+      console.log((host === "kimi" ? "• " : "") + fence + "json\\n" + JSON.stringify({ v: 1, packet, reviewer, coverage, call,
         verdict: "approved", findings: [] }) + "\\n" + fence);
     }
   `);
@@ -381,7 +385,18 @@ test("Kimi without a supported MCP config flag falls back to stdout without an a
   });
   // Issue #42: kimi refuses --plan together with the -p this run passes, so the argv must not carry it - and the fake
   // host above fails the run when it does, the way the real CLI failed every kimi run.
-  expect(JSON.parse(readFileSync(argvFile, "utf8"))).not.toContain("--plan");
+  const argv = JSON.parse(readFileSync(argvFile, "utf8")) as string[];
+  expect(argv).not.toContain("--plan");
+  const prompt = argv[argv.indexOf("-p") + 1]!;
+  expect(prompt).toContain("exactly one fenced json block");
+  expect(prompt).toContain("coverage.reviewed entry must be a string");
+  const fence = String.fromCharCode(96).repeat(3);
+  const [sample] = prompt.split(fence + "json\n")[1]!.split("\n" + fence);
+  const packet = JSON.parse(readFileSync(join(out, "packet.json"), "utf8"));
+  expect(JSON.parse(sample!)).toEqual({
+    v: 1, packet: { id: packet.id, subject: packet.subject }, reviewer: {},
+    coverage: { reviewed: ["example.ts"], skipped: [] }, findings: [], verdict: "approved", call: { ok: true },
+  });
   // The selected host's home reaches the reviewer and the capability probe, and only that host's home does.
   expect(JSON.parse(readFileSync(hostHomesFile, "utf8"))).toEqual({ KIMI_CODE_HOME: kimiHome });
   expect(JSON.parse(readFileSync(probeHomesFile, "utf8"))).toEqual({ KIMI_CODE_HOME: kimiHome });
@@ -410,9 +425,14 @@ test("an unsuccessful reviewer with a staged report must rerun", () => {
 });
 
 
-test("Claude starts with user settings and reads the checkout as an added directory", () => {
-  const { cli, dir, home, out } = reviewer("json", "# Review\n", "claude");
+test("Claude disables user customizations and reads the checkout as an added directory", () => {
+  const { cli, dir, home, out, argvFile } = reviewer("json", "# Review\n", "claude");
   const result = cli("run", "--host", "claude", "--implementer", "qwen", "--out", out);
+  const argv = JSON.parse(readFileSync(argvFile, "utf8")) as string[];
+  expect(argv[argv.indexOf("--setting-sources") + 1]).toBe("");
+  expect(JSON.parse(argv[argv.indexOf("--settings") + 1]!)).toEqual({
+    disableAllHooks: true, enabledPlugins: {},
+  });
   expect(result.status, result.stderr).toBe(0);
   expect(readLedger(dir, { home }).at(-1)).toMatchObject({ type: "record",
     record: { reviewer: { id: "claude", started: "run" } },

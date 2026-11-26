@@ -29,19 +29,20 @@ export type LedgerEvent =
   | { v: 1; type: "post"; at: string; head: string; record: string; status: "success" };
 
 /**
- * `ReviewRecordV1.packet`: the packet the report was written against. `src/packet.ts` builds it (V1 T2), so this is an
- * open view of the spec's fields: the record stores the ledger's packet verbatim rather than re-validating its shape,
- * and only `id`, `subject.head` and the unit paths are read here.
+ * `ReviewRecordV1.packet`: the packet the report was written against, as `arev packet` built it. `src/packet.ts` owns
+ * the full shape, so this names only the fields a record reads (`id`, `subject.head`, the unit paths) and stores the
+ * packet byte for byte rather than re-validating it. It is deliberately narrow rather than index-signed: an index
+ * signature here would refuse the builder's own interfaces, and the extra fields travel in the record untouched
+ * whatever this type says.
  */
 export interface PacketBlock {
   id: string;
   profile?: string;
-  subject: { kind?: string; base?: string; head: string; mergeBase?: string; [key: string]: unknown };
-  units?: { path: string; [key: string]: unknown }[];
+  subject: { kind?: string; base?: string; head: string; mergeBase?: string };
+  units?: { path: string; status?: string; insertions?: number; deletions?: number }[];
   excluded?: { path: string; reason?: string }[];
   rules?: { name: string; sha256?: string; appliesTo?: string[] }[];
   contract?: { kind: string; ref: string; sha256: string };
-  [key: string]: unknown;
 }
 
 export type FindingDisposition = "open" | "fixed" | "false_positive" | "accepted";

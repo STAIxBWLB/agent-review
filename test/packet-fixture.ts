@@ -30,9 +30,12 @@ export function isolatedPacket(cwd: string, request: PacketRequest) {
 
 export function fixture(overrides: NodeJS.ProcessEnv = {}) {
   const dir = mkdtempSync(join(tmpdir(), "arev-packet-"));
-  cleanup.push(dir);
+  // The review ledger lives under AGENTHUB_HOME and is refused inside the reviewed worktree, so the fixture's home is
+  // a sibling temp directory rather than a path under `dir`.
+  const home = mkdtempSync(join(tmpdir(), "arev-hub-"));
+  cleanup.push(dir, home);
   const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", XDG_CONFIG_HOME: dir,
-    AGENTHUB_HOME: join(dir, ".fixture-hub"), GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t",
+    AGENTHUB_HOME: home, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t",
     GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t", ...overrides };
   const git = (...args: string[]) => {
     const result = spawnSync("git", ["-C", dir, "-c", "core.hooksPath=/dev/null", ...args], {

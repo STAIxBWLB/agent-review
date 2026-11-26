@@ -81,11 +81,12 @@ export interface ReviewRecordV1 {
  *
  * The URL pattern is the local addition: a remote or a diagnostic can carry `scheme://user:password@host`, which no
  * token-shaped pattern catches. The colon before the `@` is what makes it a credential, so `ssh://git@host` (no
- * password) and `https://host:443/path` (no userinfo) stay clean.
+ * password) and `https://host:443/path` (no userinfo) stay clean. The user name may be empty - `https://:pw@host` is a
+ * credential - and the authority ends at `/`, `?` or `#`, so `https://host:443?to=a@b` is a query, not userinfo.
  */
 const SECRETS = [/-----BEGIN [A-Z ]*PRIVATE KEY-----/, /\bAKIA[0-9A-Z]{16}\b/, /\bgh[pousr]_[A-Za-z0-9]{30,}/, /\bgithub_pat_[A-Za-z0-9_]{40,}/, /\bsk-[A-Za-z0-9_-]{20,}/,
   /\bxox[abprs]-[A-Za-z0-9-]{10,}/, /\bAIza[0-9A-Za-z_-]{35}\b/, /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/, /\b(?:password|passwd|secret|api[_-]?key|token)\s*[:=]\s*\S{8,}/i,
-  /\b[a-z][a-z0-9+.-]*:\/\/[^\s/:@]+:[^\s/@]+@/i];
+  /\b[a-z][a-z0-9+.-]*:\/\/[^\s\/?#:@]*:[^\s\/?#@]+@/i];
 export const secretShaped = (text: string): boolean => SECRETS.some(re => re.test(text));
 
 /**

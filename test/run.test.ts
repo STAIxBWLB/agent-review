@@ -25,7 +25,9 @@ function reviewer(mode: "json" | "dirty" | "timeout" | "brief" | "invalid" | "se
   mkdirSync(bin);
   mkdirSync(join(userHome, ".codex"), { recursive: true });
   writeFileSync(join(userHome, ".codex", "config.toml"), 'model = "fixture-model"\n');
-  const repo = fixture({ HOME: userHome, PATH: `${bin}:${process.env.PATH ?? ""}`, OPENAI_API_KEY: "fixture-not-for-reviewer" });
+  // A case that removes an executable the fixture provides means the run has none, so PATH is the fixture bin plus the
+  // system directories git and sh live in. Inheriting the host PATH lets an installed one answer a case that has none.
+  const repo = fixture({ HOME: userHome, PATH: `${bin}:/usr/bin:/bin`, OPENAI_API_KEY: "fixture-not-for-reviewer" });
   const { git, write } = repo;
   git("remote", "add", "origin", "https://github.com/owner/repo.git");
   write("REVIEW.md", review);

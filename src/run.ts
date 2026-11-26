@@ -4,7 +4,7 @@ import { homedir, tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { EXIT } from "@staix/cli-output";
-import { chooseHost, hostExecutable, HOST_ORDER, modelOf } from "./host.ts";
+import { chooseHost, hostConfigVariable, hostExecutable, HOST_ORDER, modelOf } from "./host.ts";
 import { importReviewFile } from "./import.ts";
 import { Refusal, secretShaped, shown, stringsIn } from "./ledger.ts";
 import { RUN_REPORT_FILE, RUN_STATE_FILE, RUN_TOOL_NAMES } from "./mcp.ts";
@@ -17,10 +17,6 @@ const RUN_USAGE = "Run arev run [--pr N] [--host ID] --implementer ID [--timeout
 const MAX_OUTPUT = 4 * 1024 * 1024;
 const IDENTITY = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const ENV_KEYS = ["HOME", "LANG", "LC_ALL", "LC_CTYPE", "USER", "LOGNAME", "TMPDIR"] as const;
-// A host keeps its login and its model in its own config home, and a person can relocate that with these variables. They
-// are directory paths, never credentials, and a host started without them reads the default home - which is the wrong
-// account when the person's login lives elsewhere.
-const CONFIG_HOME_KEYS = ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "KIMI_CODE_HOME"] as const;
 const RESPONSE_FILE = "reviewer-response.md";
 const STDOUT_FILE = "reviewer.stdout";
 const STDERR_FILE = "reviewer.stderr";
@@ -84,30 +80,31 @@ function reviewerPrompt(out: string, checkout: string): string {
 }
 
 /**
- * The host config homes the caller set, resolved against the caller's cwd so a relative value still names one directory.
+ * The config home of the selected host, when the caller set it, resolved against the caller's cwd so a relative value
+ * still names one directory. A host keeps its login and its model there, and a host started without it reads the default
+ * home - which is the wrong account when the person's login lives elsewhere.
  *
- * A home that resolves inside the source worktree is refused instead of passed: the reviewed head commits that tree, so a
+ * Only that host's variable is read: another host's home cannot fail a run that never starts that host. A home that
+ * resolves inside the source worktree is refused instead of passed, because the reviewed head commits that tree and a
  * host reading its startup configuration from there would start under a configuration the review content supplied.
  */
-function hostConfigHomes(cwd: string, root: string): NodeJS.ProcessEnv {
-  const homes: NodeJS.ProcessEnv = {};
-  for (const key of CONFIG_HOME_KEYS) {
-    const value = process.env[key];
-    if (value === undefined || value === "") continue;
-    const path = resolve(cwd, value);
-    if (insideWorktree(root, path)) {
-      throw new Refusal(`The ${key} directory is inside the source worktree`,
-        `point ${key} outside the reviewed worktree, or unset it`);
-    }
-    homes[key] = path;
+function hostConfigHomes(cwd: string, root: string, host: string): NodeJS.ProcessEnv {
+  const key = hostConfigVariable(host);
+  if (key === undefined) return {};
+  const value = process.env[key];
+  if (value === undefined || value === "") return {};
+  const path = resolve(cwd, value);
+  if (insideWorktree(root, path)) {
+    throw new Refusal(`The ${key} directory is inside the source worktree`,
+      `point ${key} outside the reviewed worktree, or unset it`);
   }
-  return homes;
+  return { [key]: path };
 }
 
 function reviewerEnv(pathEnv: string, homes: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { PATH: pathEnv };
   for (const key of ENV_KEYS) env[key] = process.env[key];
-  for (const key of CONFIG_HOME_KEYS) env[key] = homes[key];
+  for (const [key, value] of Object.entries(homes)) env[key] = value;
   // Git run by the reviewer inside the checkout must not run anything the reviewed head committed. A relative
   // core.hooksPath in the source config (Husky's `.husky/_`) resolves against the checkout, so the reviewer's own
   // `git status` refreshes the index and fires a committed post-index-change. Environment config is read after every
@@ -289,7 +286,6 @@ export async function runCommand(cwd: string, args: readonly string[]): Promise<
   // Resolve relative PATH entries before changing cwd; the checkout cannot change which binary runs.
   const pathEnv = (process.env.PATH ?? "").split(delimiter).filter(Boolean)
     .map(path => resolve(cwd, path)).filter(path => !insideWorktree(root, path)).join(delimiter);
-  const homes = hostConfigHomes(cwd, root);
   const executables = new Map<string, string>();
   for (const host of HOST_ORDER) {
     const executable = hostExecutable(host, pathEnv, path => !insideWorktree(root, path));
@@ -303,6 +299,7 @@ export async function runCommand(cwd: string, args: readonly string[]): Promise<
   if (host === undefined || executable === undefined) {
     throw new Refusal("No selected reviewer executable is available", "put claude, codex or kimi on PATH, or select an available --host");
   }
+  const homes = hostConfigHomes(cwd, root, host);
 
   const out = options.out === undefined ? mkdtempSync(join(tmpdir(), "arev-run-output-")) : resolve(cwd, options.out);
   if (insideWorktree(root, out)) {

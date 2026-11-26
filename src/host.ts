@@ -34,13 +34,22 @@ const IDENTITY = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const MAX_CONFIG_BYTES = 64 * 1024, MAX_MODEL_BYTES = 128;
 const BLOCKED = "blocked: no review host can run";
 /**
- * Where each host keeps the model it runs: the config file under its home, the variable that relocates that home, and the
- * top-level key naming the model (spec #24 AC2).
+ * Where each host keeps what it starts with: the variable that relocates its config home, and - for the hosts whose home
+ * carries a model file - the directory under that home and the top-level key naming the model (spec #24 AC2). Claude has
+ * no entry in `HOST_CONFIG` because its home holds no model to attest, but its home still relocates.
  */
-const HOST_CONFIG: Record<string, { directory: string; variable: string; file: string; key: string } | undefined> = {
-  codex: { directory: ".codex", variable: "CODEX_HOME", file: "config.toml", key: "model" },
-  kimi: { directory: ".kimi-code", variable: "KIMI_CODE_HOME", file: "config.toml", key: "default_model" },
+const CONFIG_HOME_VARIABLES: Record<string, string | undefined> = {
+  claude: "CLAUDE_CONFIG_DIR", codex: "CODEX_HOME", kimi: "KIMI_CODE_HOME",
 };
+const HOST_CONFIG: Record<string, { directory: string; file: string; key: string } | undefined> = {
+  codex: { directory: ".codex", file: "config.toml", key: "model" },
+  kimi: { directory: ".kimi-code", file: "config.toml", key: "default_model" },
+};
+
+/** The variable that relocates a host's own config home, or undefined for an id arev does not know. */
+export function hostConfigVariable(host: string): string | undefined {
+  return CONFIG_HOME_VARIABLES[host];
+}
 /**
  * The only flag value a refusal echoes: an identity in that charset that also matches no secret pattern. A flag value is
  * the caller's untrusted text and stderr is output, so anything else is named as withheld - and composing both screens
@@ -122,7 +131,8 @@ export function availableHosts(unavailable: ReadonlySet<string>, pathEnv: string
 export function modelOf(host: string, home: string, env: Readonly<Record<string, string | undefined>> = {}): string {
   const config = HOST_CONFIG[host];
   if (!config) return "unknown";
-  const relocated = env[config.variable];
+  const variable = hostConfigVariable(host);
+  const relocated = variable === undefined ? undefined : env[variable];
   const directory = relocated === undefined || relocated === "" ? join(home, config.directory) : relocated;
   let text: string;
   try {

@@ -7,7 +7,7 @@
  * path, the same shape amem falls back to.
  */
 import { createHash } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
+import { appendFileSync, lstatSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { reviewGit } from "./review-git.ts";
@@ -189,12 +189,24 @@ export function ledgerPath(cwd: string, options: { home?: string } = {}): string
   return path;
 }
 
-/** Whether a `.git` entry sits at or above `cwd`: the signal that separates a broken checkout from no repository at all. */
+/**
+ * Whether a `.git` entry sits at or above `cwd`: the signal that separates a broken checkout from no repository at all.
+ * `lstat` rather than `exists`, because a marker that exists but cannot be followed - a symlink to a target that is gone,
+ * a directory this process may not search - is exactly the checkout the refusal above is for. Reading it as absence
+ * would skip the containment check, which is the fail-open this signal was added to close.
+ */
 function gitMarkerAtOrAbove(cwd: string): boolean {
   let current = resolve(cwd);
   for (let step = 0; step < 64; step++) {
     // A `.git` directory, and the `.git` file a linked worktree or a submodule carries, both count.
-    if (existsSync(join(current, ".git"))) return true;
+    try {
+      lstatSync(join(current, ".git"));
+      return true;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      // Only "there is no such entry" continues upward; a read that was refused is a marker arev cannot rule out.
+      if (code !== "ENOENT" && code !== "ENOTDIR") return true;
+    }
     const parent = dirname(current);
     if (parent === current) return false;
     current = parent;

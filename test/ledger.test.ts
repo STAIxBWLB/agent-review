@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { canonicalJson, ledgerPath, readLedger, recordId, Refusal, reviewProjectId, secretShaped, appendEvent, type LedgerEvent, type PacketBlock, type ReviewRecordV1 } from "../src/ledger.ts";
@@ -181,6 +181,13 @@ test("a checkout whose worktree root cannot be read refuses the ledger rather th
   mkdirSync(broken);
   writeFileSync(join(broken, ".git"), "gitdir: /nonexistent/gitdir\n");
   expect(() => ledgerPath(broken, { home: join(root, "agenthub") }))
+    .toThrow("so where the ledger lives cannot be checked");
+  // A marker that exists but cannot be followed is the same checkout: a `.git` symlink whose target is gone reads as
+  // absent to a stat that follows links, and skipping the check there is the fail-open this signal exists to close.
+  const unlinked = join(root, "unlinked");
+  mkdirSync(unlinked);
+  symlinkSync(join(root, "gone"), join(unlinked, ".git"));
+  expect(() => ledgerPath(unlinked, { home: join(root, "agenthub") }))
     .toThrow("so where the ledger lives cannot be checked");
   const outside = join(root, "plain");
   mkdirSync(outside);

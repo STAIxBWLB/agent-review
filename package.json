@@ -1,0 +1,23 @@
+{
+  "name": "@staix/agent-review",
+  "version": "0.1.0",
+  "description": "Deterministic review tooling for coding agents",
+  "type": "module",
+  "license": "MIT",
+  "engines": { "bun": ">=1.4.4" },
+  "bin": { "arev": "./bin/arev.js" },
+  "files": ["bin", "src", "README.md", "LICENSE"],
+  "scripts": {
+    "check": "bun run typecheck && bun scripts/check-boundary.ts && bun scripts/gen-readme.ts --check && bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@staix/agent-mem": "^0.40.0",
+    "@staix/cli-output": "0.1.3",
+    "@staix/mcp-stdio": "0.1.0"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.4",
+    "typescript": "5.9.3"
+  }
+}

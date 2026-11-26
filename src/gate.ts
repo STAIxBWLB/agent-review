@@ -61,8 +61,14 @@ const shownHead = (value: string): string =>
  * The bound both gh calls take for time, the same one `arev packet --pr` gives its own `gh pr view` (src/packet.ts): a
  * metadata read or a status write that has not answered in fifteen seconds is a network that is not going to, and the
  * gate is meant to be runnable in a hook.
+ *
+ * The bound is a hard return because both calls pass `killSignal: "SIGKILL"`: `spawnSync`'s default signal is SIGTERM,
+ * and a child that ignores it keeps the call inside `spawnSync` until that child exits on its own (measured on Bun
+ * 1.4.4: a 500 ms bound returned after 2013 ms, with `status: 0` and the timeout in `error`). With SIGKILL the same
+ * probe returns at 502 ms with `status: null`, `signal: "SIGKILL"` and `error.code: "ETIMEDOUT"`.
  */
 const GH_TIMEOUT_MS = 15_000;
+const GH_KILL_SIGNAL = "SIGKILL" as const;
 /**
  * A status write answers with one small object, so its reply bound stays narrow. The pulls read cannot: the endpoint
  * returns whole pull request objects, bodies included - one open pull request with a 3,574-byte body measured 19,779
@@ -96,7 +102,9 @@ const failed = (call: GhCall): boolean => call.error !== undefined || call.statu
  * that ended it. The signal cannot decide on its own: a reply that fills `maxBuffer` also ends with the child signalled
  * (measured: `ENOBUFS` beside `SIGTERM`), and reading that as a timeout would name a bound it never reached.
  */
-const timedOut = (call: GhCall): boolean => errorCode(call) === "ETIMEDOUT" || (call.error === undefined && call.signal === "SIGTERM");
+const timedOut = (call: GhCall): boolean =>
+  errorCode(call) === "ETIMEDOUT" ||
+  (call.error === undefined && (call.signal === "SIGTERM" || call.signal === "SIGKILL"));
 
 /** A reply that reached `maxBuffer`, where what came back is a prefix of it. */
 const overBuffer = (call: GhCall): boolean => errorCode(call) === "ENOBUFS";
@@ -212,11 +220,11 @@ function openPrsAt(cwd: string, repository: string, head: string, retry: string)
   // `--hostname` is pinned because `GH_HOST` or gh's own default would send this read, and the status write with it, to
   // another host. `--paginate --slurp` reads every page: a second page can hold an open PR at this head too.
   const result = spawnSync("gh", ["api", "--hostname", "github.com", "--paginate", "--slurp", `repos/${repository}/commits/${head}/pulls`],
-    { cwd, encoding: "utf8", timeout: GH_TIMEOUT_MS, maxBuffer: GH_READ_MAX_BUFFER });
+    { cwd, encoding: "utf8", timeout: GH_TIMEOUT_MS, maxBuffer: GH_READ_MAX_BUFFER, killSignal: GH_KILL_SIGNAL });
   if (failed(result)) {
     throw new Refusal(`cannot read the open pull requests at ${head}: ${ghDetail(result, GH_READ_MAX_BUFFER)}`,
       timedOut(result) ? retry
-        : overBuffer(result) ? `read the same list by hand (gh api --hostname github.com repos/${repository}/commits/${head}/pulls); the reply is larger than arev keeps, and the same read returns the same list`
+        : overBuffer(result) ? `read the same list by hand (gh api --hostname github.com --paginate --slurp repos/${repository}/commits/${head}/pulls); the reply is larger than arev keeps, and the same read returns the same list`
           : "check that gh is authenticated and may read this repository's pull requests");
   }
   let parsed: unknown;
@@ -284,10 +292,12 @@ export function postStatus(head: string, record: string, repository: string, cwd
   // The host is pinned for the write as well: `GH_HOST` would otherwise decide where this status lands.
   const result = spawnSync("gh", ["api", "--hostname", "github.com", "--method", "POST", `repos/${repository}/statuses/${head}`,
     "-f", "state=success", "-f", `context=${STATUS_CONTEXT}`, "-f", `description=${description}`],
-    { cwd, encoding: "utf8", timeout: GH_TIMEOUT_MS, maxBuffer: GH_WRITE_MAX_BUFFER });
+    { cwd, encoding: "utf8", timeout: GH_TIMEOUT_MS, maxBuffer: GH_WRITE_MAX_BUFFER, killSignal: GH_KILL_SIGNAL });
   if (failed(result)) {
+    // A write that ran out of time may still have landed: the request reached GitHub and only the answer is missing, so
+    // the status is looked for before the same one is written again.
     throw new Refusal(`cannot post the ${STATUS_CONTEXT} status on ${head}: ${ghDetail(result, GH_WRITE_MAX_BUFFER)}`,
-      timedOut(result) ? retry
+      timedOut(result) ? `check for an existing ${STATUS_CONTEXT} status on ${head} (gh api --hostname github.com repos/${repository}/commits/${head}/statuses) - a write that ran out of time may already have landed, so ${retry}`
         : overBuffer(result) ? "check with gh auth status that the token may write commit statuses for this repository; gh's reply to the same write does not get smaller"
           : "check that gh is authenticated and the token may write commit statuses for this repository");
   }

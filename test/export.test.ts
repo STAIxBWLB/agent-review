@@ -127,3 +127,37 @@ test("hub export carries an earlier blocking finding into a later review with an
   expect(native.status).toBe(0);
   expect(JSON.parse(native.stdout).findings).toEqual([carried]);
 });
+
+test("hub export gives a carried OCR finding its text as the rationale it has none of", () => {
+  const { dir, home, cli, ingest, load, git, write, base, head } = exchangeFixture();
+  const savePacket = (head: string) => {
+    const { packet } = isolatedPacket(dir, { kind: "range", base, head, pr: 7 });
+    appendEvent(dir, { v: 1, type: "packet", at: "2026-11-26T00:00:00Z", packet }, { home });
+    return packet.id;
+  };
+  // An OCR review at the first head in PR 7, with a blocking finding left open. An OCR import stores the description in
+  // `text` alone - the fixture report has no rationale field - which is the shape that lost its words on the way out.
+  const ocr = load("ocr");
+  const findings = ocr.findings as Record<string, unknown>[];
+  expect(findings[0]?.rationale).toBeUndefined();
+  const blocking = { ...findings[0], severity: "high", disposition: "open" };
+  expect(ingest("ocr", { ...ocr, packet_id: savePacket(head), findings: [blocking] }).status).toBe(0);
+
+  write("src/rules.ts", "later rule text\n");
+  git("commit", "-qam", "later head");
+  const later = git("rev-parse", "HEAD").trim();
+  const packetId = savePacket(later);
+  const report = load("hub");
+  const hub = report.hub_review as Record<string, unknown>;
+  expect(ingest("hub", { ...report, head: later, packet_id: packetId,
+    hub_review: { ...hub, verdict: "changes_requested", findings: [] } }).status).toBe(0);
+
+  // The later record has no finding of its own, so every finding exported here is carried: there is no original hub
+  // argument to keep the OCR text in, and the rationale is the only field a hub finding has for a description.
+  const exported = cli("export", "--to", "hub", "--head", later, "--pr", "7");
+  expect(exported.status).toBe(0);
+  const [carried] = JSON.parse(exported.stdout).findings as Record<string, unknown>[];
+  expect(carried).toMatchObject({ id: "bugs:empty-rules-cache", pass: "bugs", severity: "important", disposition: "open",
+    rationale: "> Handle an empty result before caching it." });
+  expect(Object.hasOwn(carried!, "text")).toBe(false);
+});

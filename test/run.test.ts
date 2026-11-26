@@ -21,7 +21,7 @@ function hostGit(): string {
   return found ?? "/usr/bin/git";
 }
 
-function reviewer(mode: "json" | "dirty" | "timeout" | "brief" | "invalid" | "secret" | "escaped-secret" | "mcp" | "mcp-dirty" | "mcp-failed" | "hook", review = "# Review\n", host = "codex", separator = "", env: NodeJS.ProcessEnv = {}) {
+function reviewer(mode: "json" | "dirty" | "timeout" | "brief" | "invalid" | "secret" | "escaped-secret" | "mcp" | "mcp-dirty" | "mcp-failed" | "hook", review = "# Review\n", host = "codex", separator = "", env: NodeJS.ProcessEnv = {}, dotenv: string[] = []) {
   const sandbox = mkdtempSync(join(tmpdir(), "arev-run-test-"));
   scratch.push(sandbox);
   const bin = join(sandbox, "bin"), userHome = join(sandbox, "home"), out = join(sandbox, "out");
@@ -29,6 +29,7 @@ function reviewer(mode: "json" | "dirty" | "timeout" | "brief" | "invalid" | "se
   const hookMarker = join(sandbox, "hook-ran");
   const envFile = join(sandbox, "reviewer-env.json");
   const hostHomesFile = join(sandbox, "reviewer-homes.json");
+  const probeHomesFile = join(sandbox, "probe-homes.json");
   const argvFile = join(sandbox, "reviewer-argv.json");
   const probeCwdFile = join(sandbox, "probe-cwd");
   const runCwdFile = join(sandbox, "reviewer-cwd");
@@ -60,7 +61,7 @@ function reviewer(mode: "json" | "dirty" | "timeout" | "brief" | "invalid" | "se
   git("update-ref", "refs/remotes/origin/main", base);
   write("file.txt", "after\n");
   write("bunfig.toml", "# Reviewed configuration stays in the checkout.\n");
-  write(".env", "AREV_FIXTURE_CHECKOUT_ENV=loaded\n");
+  write(".env", ["AREV_FIXTURE_CHECKOUT_ENV=loaded", ...dotenv].join("\n") + "\n");
   git("add", ".");
   git("commit", "-qm", "head");
   const head = git("rev-parse", "HEAD").trim();
@@ -80,6 +81,9 @@ printf '%s\\n' '{"baseRefOid":"${base}","headRefOid":"${head}","title":"Review f
     const mode = ${JSON.stringify(mode)}, out = ${JSON.stringify(out)}, host = ${JSON.stringify(host)};
     if (process.argv.includes("--help")) {
       writeFileSync(${JSON.stringify(probeCwdFile)}, process.cwd());
+      // The probe is its own invocation, so what it received is written here rather than at the reviewer's later step.
+      writeFileSync(${JSON.stringify(probeHomesFile)}, JSON.stringify(Object.fromEntries(Object.entries(process.env)
+        .filter(([key]) => ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "KIMI_CODE_HOME"].includes(key)))));
       console.log("fixture help: --plan");
       process.exit(0);
     }
@@ -186,7 +190,7 @@ printf '%s\\n' '{"baseRefOid":"${base}","headRefOid":"${head}","title":"Review f
     }
   `);
   chmodSync(executable, 0o755);
-  return { ...repo, out, head, arev, sandbox, hookMarker, envFile, hostHomesFile, argvFile, probeCwdFile, runCwdFile };
+  return { ...repo, userHome, out, head, arev, sandbox, hookMarker, envFile, hostHomesFile, probeHomesFile, argvFile, probeCwdFile, runCwdFile };
 }
 
 test("run records the exact PR packet, attests the host, and gates", () => {
@@ -337,20 +341,24 @@ test("a staged report does not become a record when the MCP reviewer changes the
 });
 
 test("Kimi without a supported MCP config flag falls back to stdout without an arev executable", () => {
-  const { cli, dir, home, out, arev, argvFile, hostHomesFile, probeCwdFile, runCwdFile } = reviewer("json", "# Review\n", "kimi");
+  const kimiHome = mkdtempSync(join(tmpdir(), "arev-run-kimihome-"));
+  scratch.push(kimiHome);
+  writeFileSync(join(kimiHome, "config.toml"), 'default_model = "kimi-home-model"\n');
+  const { cli, dir, home, out, arev, argvFile, hostHomesFile, probeHomesFile, probeCwdFile, runCwdFile } =
+    reviewer("json", "# Review\n", "kimi", "", { KIMI_CODE_HOME: kimiHome });
   rmSync(arev);
   const result = cli("run", "--host", "kimi", "--implementer", "qwen", "--out", out);
   expect(result.status, result.stderr).toBe(0);
   expect(existsSync(join(out, ".arev-run.json"))).toBe(false);
   expect(readLedger(dir, { home }).at(-1)).toMatchObject({ type: "record",
-    record: { reviewer: { started: "run", id: "kimi", implementer: "qwen" } },
+    record: { reviewer: { started: "run", id: "kimi", implementer: "qwen", model: "kimi-home-model" } },
   });
   // Issue #42: kimi refuses --plan together with the -p this run passes, so the argv must not carry it - and the fake
   // host above fails the run when it does, the way the real CLI failed every kimi run.
   expect(JSON.parse(readFileSync(argvFile, "utf8"))).not.toContain("--plan");
-  // Nothing was relocated for this case, so the child receives none of the homes and the default ~/.codex stands: a
-  // caller's empty value is not a directory the host could read.
-  expect(JSON.parse(readFileSync(hostHomesFile, "utf8"))).toEqual({});
+  // The selected host's home reaches the reviewer and the capability probe, and only that host's home does.
+  expect(JSON.parse(readFileSync(hostHomesFile, "utf8"))).toEqual({ KIMI_CODE_HOME: kimiHome });
+  expect(JSON.parse(readFileSync(probeHomesFile, "utf8"))).toEqual({ KIMI_CODE_HOME: kimiHome });
   // The capability probe reads startup configuration from its cwd, so it gets a private directory of its own - never the
   // caller's --out - and that directory is gone once the probe returns. macOS reports tmpdir() as /var while the child
   // sees /private/var, so a plain string comparison here would pass whatever directory the probe was given.
@@ -444,7 +452,7 @@ test("claude is handed the arev MCP config and only the four arev tools", () => 
 
 // Issue #42: a host whose login lives in a relocated config home was started against the default one, so the reviewer ran
 // as the wrong account - and the model attested was the one in a file that host would never read.
-test("the reviewer receives the host config homes the caller set, and reads its model from CODEX_HOME", () => {
+test("the selected host receives its config home, and reads its model from it", () => {
   const homes = mkdtempSync(join(tmpdir(), "arev-run-homes-"));
   scratch.push(homes);
   const codexHome = join(homes, "codex"), claudeHome = join(homes, "claude"), kimiHome = join(homes, "kimi");
@@ -454,8 +462,8 @@ test("the reviewer receives the host config homes the caller set, and reads its 
     { CLAUDE_CONFIG_DIR: claudeHome, CODEX_HOME: codexHome, KIMI_CODE_HOME: kimiHome });
   const result = cli("run", "--host", "codex", "--implementer", "qwen", "--out", out);
   expect(result.status, result.stderr).toBe(0);
-  expect(JSON.parse(readFileSync(hostHomesFile, "utf8"))).toEqual({
-    CLAUDE_CONFIG_DIR: claudeHome, CODEX_HOME: codexHome, KIMI_CODE_HOME: kimiHome });
+  // All three are set, and only the selected host's home is forwarded: the other two relocate hosts this run never starts.
+  expect(JSON.parse(readFileSync(hostHomesFile, "utf8"))).toEqual({ CODEX_HOME: codexHome });
   // The attested model comes from $CODEX_HOME/config.toml, not from the fixture's ~/.codex/config.toml.
   expect(readLedger(dir, { home }).at(-1)).toMatchObject({ type: "record",
     record: { reviewer: { id: "codex", model: "codex-home-model" } } });
@@ -471,4 +479,40 @@ test("a host config home inside the source worktree refuses before anything is w
   expect(result.stderr).toContain("point CODEX_HOME outside the reviewed worktree, or unset it");
   expect(existsSync(out)).toBe(false);
   expect(readLedger(dir, { home })).toEqual([]);
+});
+
+// Issue #42 review round 2: a home is read and refused for the host this run starts, so another host's variable cannot
+// fail a run that never starts it - and claude's own home still gets through.
+test("an in-worktree CODEX_HOME does not refuse a run that starts claude", () => {
+  const claudeHome = mkdtempSync(join(tmpdir(), "arev-run-claudehome-"));
+  scratch.push(claudeHome);
+  const { cli, dir, home, out, hostHomesFile } = reviewer("json", "# Review\n", "claude", "",
+    { CLAUDE_CONFIG_DIR: claudeHome, CODEX_HOME: "." });
+  const result = cli("run", "--host", "claude", "--implementer", "qwen", "--out", out);
+  expect(result.status, result.stderr).toBe(0);
+  expect(result.stderr).not.toContain("inside the source worktree");
+  expect(JSON.parse(readFileSync(hostHomesFile, "utf8"))).toEqual({ CLAUDE_CONFIG_DIR: claudeHome });
+  expect(readLedger(dir, { home }).map(event => event.type)).toEqual(["packet", "record"]);
+});
+
+// Issue #42 review round 2: Bun loads a `.env` from the cwd, and arev runs from inside the reviewed checkout, so a
+// committed `.env` naming a host config home would otherwise be forwarded as if the caller had set it. The entry point
+// is started through its own shebang here, which is how the installed `arev` starts.
+test("a repository .env cannot supply a host config home", () => {
+  const dotenvHome = mkdtempSync(join(tmpdir(), "arev-run-dotenv-"));
+  scratch.push(dotenvHome);
+  writeFileSync(join(dotenvHome, "config.toml"), 'model = "dotenv-model"\n');
+  const { dir, home, userHome, out, sandbox, hostHomesFile } = reviewer("json", "# Review\n", "codex", "", {},
+    [`CODEX_HOME=${dotenvHome}`]);
+  const bin = join(sandbox, "bin");
+  // The shebang runs `bun` by name, so the fixture PATH needs one; nothing else is offered to the entry.
+  symlinkSync(process.execPath, join(bin, "bun"));
+  const result = spawnSync(join(import.meta.dir, "../bin/arev.js"),
+    ["run", "--host", "codex", "--implementer", "qwen", "--out", out],
+    { cwd: dir, encoding: "utf8", env: { HOME: userHome, AGENTHUB_HOME: home, PATH: `${bin}:/usr/bin:/bin` } });
+  expect(result.status, result.stderr).toBe(0);
+  // The caller set no home, and the checkout's .env is not the caller: neither one reaches the reviewer.
+  expect(JSON.parse(readFileSync(hostHomesFile, "utf8"))).toEqual({});
+  expect(readLedger(dir, { home }).at(-1)).toMatchObject({ type: "record",
+    record: { reviewer: { id: "codex", model: "fixture-model" } } });
 });

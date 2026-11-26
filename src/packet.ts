@@ -168,11 +168,18 @@ export function buildPacket(cwd: string, request: PacketRequest): PacketBundle {
     reviewGit(root, [...gitOptions, "ls-files", "-z", "--others", "--exclude-standard"]),
     "untracked paths",
   ));
+  const stagedDeletions = new Set(untracked.length === 0 ? [] : names(checkedOutput(
+    reviewGit(root, [...gitOptions, "diff", "--cached", "--no-renames", "--diff-filter=D",
+      "--name-only", "-z", subject.head, "--"]),
+    "staged deletions",
+  )));
   const opaque: Group[] = [], intent: string[] = [];
   for (const path of untracked) {
+    // A path removed from the index still exists in HEAD. Keep its staged deletion even if it remains on disk.
+    if (stagedDeletions.has(path)) continue;
     let stat;
     try { stat = lstatSync(resolve(root, path)); }
-    catch { throw new Error("An untracked path became unreadable. Stabilize the worktree and retry."); }
+    catch { throw new Error("An untracked path became unreadable. Verify the subject and retry after Git state is stable."); }
     if (stat.isFile() || stat.isSymbolicLink()) intent.push(path);
     else opaque.push({ status: "A", paths: [path], opaque: true });
   }
@@ -229,7 +236,7 @@ function buildPacketFromIndex(
   if (destinationNames.size !== destinations.length ||
       changed.length !== destinations.length || changed.some(path => !destinationNames.has(path)) ||
       plain.length !== listed.size || plain.some(path => !listed.has(path))) {
-    throw new Error("Git changed-name inventory does not match the packet. Check for concurrent worktree edits and retry.");
+    throw new Error("Git changed-name inventory does not match the packet. Verify the subject and retry after Git state is stable.");
   }
 
   if (subject.kind === "workspace" || subject.kind === "files") {
@@ -270,7 +277,7 @@ function buildPacketFromIndex(
     }
 
     const counts = trackedCounts.get(path);
-    if (!counts) throw new Error("Git file counts changed while building the packet. Stabilize the worktree and retry.");
+    if (!counts) throw new Error("Git file counts changed while building the packet. Verify the subject and retry after Git state is stable.");
     if (counts.binary) {
       excluded.push({ path, reason: "binary" });
       continue;

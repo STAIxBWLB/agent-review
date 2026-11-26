@@ -28,6 +28,9 @@ export function reviewBlob(cwd: string, object: string) {
 
 export function repositoryRoot(cwd: string): string {
   const result = reviewGit(cwd, ["rev-parse", "--show-toplevel"]);
+  if (result.status !== 0 && /dubious ownership/i.test(result.stderr)) {
+    throw new Error("Git refused the worktree because its owner differs from the current user. Run arev as the worktree owner; review Git calls isolate global trust settings.");
+  }
   if (result.status !== 0) throw new Error("No Git worktree found. Run arev from a repository.");
   return result.stdout.replace(/\r?\n$/, "");
 }

@@ -328,3 +328,20 @@ test("packet and rules report usage errors and identify unborn branches", () => 
   expect(unborn.stderr).toContain("no commits yet");
   expect(unborn.stderr).toContain("Create an initial commit");
 });
+
+test("workspace preserves a staged deletion when the path remains on disk", () => {
+  const { dir, git, write } = fixture();
+  write("removed.txt", "original contents\n");
+  git("add", ".");
+  git("commit", "-qm", "base");
+  git("rm", "--cached", "removed.txt");
+  for (const content of ["original contents\n", "unstaged edited contents\n"]) {
+    write("removed.txt", content);
+    expect(git("diff", "HEAD", "--name-status").trim()).toBe("D\tremoved.txt");
+    for (const bundle of [isolatedPacket(dir, { kind: "workspace" }),
+      isolatedPacket(dir, { kind: "files", paths: ["removed.txt"] })]) {
+      expect(bundle.packet.units).toEqual([{ path: "removed.txt", status: "D", insertions: 0, deletions: 1 }]);
+      expect(bundle.diff).not.toContain("unstaged edited contents");
+    }
+  }
+});

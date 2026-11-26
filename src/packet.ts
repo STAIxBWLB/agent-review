@@ -33,6 +33,7 @@ export interface ReviewPacket {
   subject: PacketSubject;
   units: PacketUnit[];
   excluded: PacketExcluded[];
+  diffSha256: string;
   rules: Omit<RuleText, "text">[];
   contract?: { kind: "issue" | "brief"; ref: string; sha256: string };
 }
@@ -50,14 +51,19 @@ const MAX_PACKET_BYTES = 8 * 1024 * 1024;
 const LOCKFILES = new Set(["bun.lock", "bun.lockb", "package-lock.json", "yarn.lock",
   "pnpm-lock.yaml", "Cargo.lock", "poetry.lock", "uv.lock", "go.sum", "composer.lock", "Gemfile.lock"]);
 const RENAME_OPTIONS = ["-l0", "-M", "-C", "--find-copies-harder"];
+const DIFF_CONFIG = ["-c", "core.quotePath=true", "-c", "diff.suppressBlankEmpty=false",
+  "-c", "core.bigFileThreshold=512m"];
 const DIFF_OPTIONS = ["--no-ext-diff", "--no-textconv", "--no-color", "--ignore-submodules=dirty",
-  "-O/dev/null", "-U3", "--inter-hunk-context=0", "--diff-algorithm=myers"];
+  "-O/dev/null", "-U3", "--inter-hunk-context=0", "--diff-algorithm=myers",
+  "--src-prefix=a/", "--dst-prefix=b/", "--indent-heuristic", "--full-index",
+  "--no-relative", "--no-color-moved", "--word-diff=none", "--submodule=short"];
 const FULL_OID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 interface Group { status: string; paths: string[]; opaque?: true }
 interface WorkspaceInventory {
   tracked: Group[];
   untracked: string[];
   opaque: Group[];
+  stagedDeletions: ReadonlySet<string>;
 }
 
 function prRefs(cwd: string, number: string): { base: string; head: string } {
@@ -204,13 +210,13 @@ export function buildPacket(cwd: string, request: PacketRequest): PacketBundle {
     "untracked paths",
   ));
   const tracked = pathGroups(checkedOutput(
-    reviewGit(root, [...gitOptions, `--attr-source=${subject.mergeBase}`, "diff", ...DIFF_OPTIONS,
+    reviewGit(root, [...gitOptions, ...DIFF_CONFIG, `--attr-source=${subject.mergeBase}`, "diff", ...DIFF_OPTIONS,
       "--ignore-submodules=none", ...RENAME_OPTIONS, "--name-status", "-z", subject.head, "--"]),
     "workspace paths in the real Git index",
   ));
   const renamed = new Set(tracked.filter(group => group.status === "R").map(group => group.paths[0]!));
   const stagedDeletions = new Set(untracked.length === 0 ? [] : names(checkedOutput(
-    reviewGit(root, [...gitOptions, "diff", "--cached", "--no-renames", "--diff-filter=D",
+    reviewGit(root, [...gitOptions, ...DIFF_CONFIG, "diff", "--cached", "--no-renames", "--diff-filter=D",
       "--name-only", "-z", subject.head, "--"]),
     "staged deletions",
   )));
@@ -225,7 +231,7 @@ export function buildPacket(cwd: string, request: PacketRequest): PacketBundle {
     if (stat.isFile() || stat.isSymbolicLink()) intent.push(path);
     else opaque.push({ status: "A", paths: [path], opaque: true });
   }
-  const workspaceInventory = { tracked, untracked, opaque };
+  const workspaceInventory = { tracked, untracked, opaque, stagedDeletions };
   if (!intent.length) return buildPacketFromIndex(root, subject, scopes, gitOptions, undefined, workspaceInventory);
 
   // Pair workspace copies and renames in one inventory without changing the real index.
@@ -269,7 +275,7 @@ function buildPacketFromIndex(
     // by escaping one leading character and all glob metacharacters.
     const exact = paths.map(path =>
       `:(top,glob)\\${path[0]!}${path.slice(1).replace(/[\\*?\[\]]/g, "\\$&")}`);
-    return reviewGit(root, [...gitOptions, `--attr-source=${subject.mergeBase}`, "diff", ...DIFF_OPTIONS,
+    return reviewGit(root, [...gitOptions, ...DIFF_CONFIG, `--attr-source=${subject.mergeBase}`, "diff", ...DIFF_OPTIONS,
       ...options, ...trees, "--", ...exact], {
       indexFile, literalPathspecs: exact.length === 0, maxBuffer: maxBuffer ?? 16 * 1024 * 1024,
     });
@@ -308,13 +314,18 @@ function buildPacketFromIndex(
     }
     const allPaths = new Set(groups.flatMap(group => group.paths));
     const expectedPaths = new Set([...workspace.tracked.flatMap(group => group.paths), ...workspace.untracked]);
+    const missingUntracked = workspace.untracked.filter(path => inScope(path) && !represented.has(path));
+    const renameSources = new Set(groups.filter(group => group.status === "R").map(group => group.paths[0]!));
+    if (missingUntracked.some(path => workspace.stagedDeletions.has(path) && renameSources.has(path))) {
+      throw new Error("Git paired a staged deletion with an untracked copy while the original path remains on disk. Restore the original path in the index with git restore --staged or git add, then rebuild the packet.");
+    }
     if (groups.some(group => {
       const path = group.paths.at(-1)!;
       return inScope(path) && !expectedPaths.has(path);
     }) || workspace.tracked.some(group => {
       const path = group.paths.at(-1)!;
       return inScope(path) && !allPaths.has(path);
-    }) || workspace.untracked.some(path => inScope(path) && !represented.has(path))) {
+    }) || missingUntracked.length > 0) {
       inventoryMismatch();
     }
   }
@@ -355,7 +366,7 @@ function buildPacketFromIndex(
       continue;
     }
     const patch = diff([...RENAME_OPTIONS, ...(group.status === "C" ? ["--diff-filter=CR"] : []),
-      "--patch", "--submodule=short"], group.paths, MAX_PATCH_BYTES + 1);
+      "--patch"], group.paths, MAX_PATCH_BYTES + 1);
     if ((patch.error as NodeJS.ErrnoException | undefined)?.code === "ENOBUFS" ||
         Buffer.byteLength(patch.stdout ?? "") > MAX_PATCH_BYTES) {
       excluded.push({ path, reason: "too large" });
@@ -370,11 +381,12 @@ function buildPacketFromIndex(
   }
 
   const ruleSet = readRules(root, subject.mergeBase, ruleTargets, attrs);
-  const body = { profile: "code" as const, subject, units, excluded,
+  const patch = patches.join("");
+  const diffSha256 = createHash("sha256").update(patch).digest("hex");
+  const body = { profile: "code" as const, subject, units, excluded, diffSha256,
     rules: ruleSet.rules.map(({ text: _text, ...rule }) => rule) };
   const id = createHash("sha256").update(canonicalJson(body)).digest("hex");
   const packet = { id, ...body };
-  const patch = patches.join("");
   const rules = renderRules(ruleSet);
   const brief = [
     `Review brief: head ${subject.head} against ${subject.base} (merge base ${subject.mergeBase}).`,
@@ -388,6 +400,9 @@ function buildPacketFromIndex(
     ...excluded.map(item => item.reason === "denied" ? "> (denied path withheld)" : frame(`${item.path} (${item.reason})`)),
     rules,
     "Diff:",
+    ...(units.some(unit => unit.status === "C")
+      ? ["Git can label a copy as a rename in the per-file patch when its source also disappears. Use the copy status listed above."]
+      : []),
     frame(patch.trimEnd()),
     "Coverage: record every reviewable path as reviewed or skipped with a reason.",
   ].join("\n\n");

@@ -4,8 +4,9 @@ import { copyFileSync, lstatSync, mkdtempSync, readFileSync, realpathSync, rmSyn
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { isDenied } from "@staix/agent-mem/platform";
+import { deniedReportPath } from "./deny.ts";
 import { frame } from "./frame.ts";
-import { githubRepository } from "./ledger.ts";
+import { githubRepository, secretShaped, shown, type PacketBlock } from "./ledger.ts";
 import { commitOid, globalIgnoreOptions, mergeBaseOid, repositoryRoot, reviewGit } from "./review-git.ts";
 import { readAttributes, readRules, renderRules, type RuleMissing, type RuleText } from "./rules.ts";
 
@@ -44,7 +45,11 @@ export interface PacketBundle {
   rules: string;
   rulesMissing: RuleMissing[];
   brief: string;
+  contractText?: string;
 }
+
+export interface PacketBuildOptions { contractFile?: string }
+interface ContractArtifact { metadata: NonNullable<ReviewPacket["contract"]>; text: string }
 
 const MAX_FILES = 500;
 const MAX_PATCH_BYTES = 256 * 1024;
@@ -67,39 +72,111 @@ interface WorkspaceInventory {
   stagedDeletions: ReadonlySet<string>;
 }
 
-function prRefs(cwd: string, number: string): { base: string; head: string } {
-  if (!/^[1-9][0-9]*$/.test(number)) throw new Error("Invalid PR number. Pass a positive integer to --pr.");
-  // The repository is pinned to the origin the ledger is keyed to: `GH_REPO` or gh's own resolution could read a fork's
-  // PR N, and the packet it built would then sit under origin's key while naming another repository's commit.
-  const repository = githubRepository(cwd);
-  if (repository === undefined) {
-    throw new Error("A PR packet names the GitHub repository origin gives, and this repository's origin does not name one. Set origin to the GitHub repository URL (gh repo view --json url prints it).");
+const MAX_CONTRACT_BYTES = 128 * 1024;
+const GH_REVIEW_TIMEOUT = 15_000;
+
+function contractSection(label: string, content: string, description = label): string {
+  const framed = frame(content);
+  if (secretShaped(content) || secretShaped(framed)) {
+    throw new Error(`Contract ${description} matches a secret pattern. Remove the sensitive value and rebuild the packet.`);
   }
-  const result = spawnSync("gh", ["pr", "view", number, "--repo", `github.com/${repository}`, "--json", "baseRefOid,headRefOid"], {
-    cwd, encoding: "utf8", timeout: 15_000, maxBuffer: 32_000,
+  return `## ${label}\n\n${framed}\n`;
+}
+
+function contractArtifact(kind: "issue" | "brief", ref: string, sections: string[]): ContractArtifact {
+  const text = sections.join("\n");
+  if (Buffer.byteLength(text) > MAX_CONTRACT_BYTES) {
+    throw new Error("The framed contract exceeds 128 KiB. Shorten the contract text and rebuild the packet.");
+  }
+  return { metadata: { kind, ref, sha256: createHash("sha256").update(text).digest("hex") }, text };
+}
+
+function localContract(cwd: string, file: string): ContractArtifact {
+  const path = resolve(cwd, file);
+  const name = basename(path);
+  if (deniedReportPath(path) || secretShaped(name)) {
+    throw new Error(`Local contract file ${shown(name)} is denied. Choose a readable contract file without sensitive data.`);
+  }
+  let actual: string, size: number;
+  try {
+    actual = realpathSync(path);
+    const stat = statSync(actual);
+    if (!stat.isFile()) throw new Error("not a regular file");
+    size = stat.size;
+  } catch {
+    throw new Error(`Cannot read local contract file ${shown(name)}. Pass a readable regular file to --contract.`);
+  }
+  if (deniedReportPath(actual)) {
+    throw new Error(`Local contract file ${shown(name)} resolves to a denied path. Choose a different file.`);
+  }
+  if (size > MAX_CONTRACT_BYTES) throw new Error("The contract file exceeds 128 KiB. Shorten it and rebuild the packet.");
+  let content: string;
+  try { content = readFileSync(actual, "utf8"); }
+  catch { throw new Error(`Cannot read local contract file ${shown(name)}. Check its permissions and retry.`); }
+  return contractArtifact("brief", name, [contractSection("Local brief", content, `file ${shown(name)}`)]);
+}
+
+function reviewMetadata(cwd: string, repository: string, kind: "pr" | "issue", number: string, fields: string, deadline: number) {
+  const timeout = deadline - Date.now();
+  if (timeout <= 0) throw new Error("GitHub contract reads timed out. Check gh connectivity and retry.");
+  const result = spawnSync("gh", [kind, "view", number, "--repo", `github.com/${repository}`, "--json", fields], {
+    cwd, encoding: "utf8", timeout, maxBuffer: 512 * 1024, killSignal: "SIGKILL",
     env: { ...process.env, GH_PROMPT_DISABLED: "1" },
   });
   if ((result.error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") {
     throw new Error("GitHub CLI gh is unavailable. Install gh or specify the range with --from and --to.");
   }
-  if (result.status !== 0) throw new Error("Cannot read PR metadata. Check gh authentication and the PR number.");
+  const label = `${kind === "pr" ? "PR" : "Issue"} #${number}`;
+  if (result.status !== 0) throw new Error(`Cannot read ${label} metadata. Check gh authentication and the reference.`);
   let data: unknown;
   try { data = JSON.parse(result.stdout); }
-  catch { throw new Error("gh returned invalid PR metadata. Check gh authentication and retry."); }
-  const { baseRefOid, headRefOid } = data && typeof data === "object"
-    ? data as Record<string, unknown> : {};
+  catch { throw new Error(`gh returned invalid metadata for ${label}. Check gh authentication and retry.`); }
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    throw new Error(`gh returned invalid metadata for ${label}. Check the reference and retry.`);
+  }
+  return data as Record<string, unknown>;
+}
+
+function prRefs(cwd: string, number: string): { base: string; head: string; contract: ContractArtifact } {
+  if (!/^[1-9][0-9]*$/.test(number) || !Number.isSafeInteger(Number(number))) {
+    throw new Error("Invalid PR number. Pass a positive integer to --pr.");
+  }
+  // Both the PR and its local issue references belong to the repository the ledger is keyed to.
+  const repository = githubRepository(cwd);
+  if (repository === undefined) {
+    throw new Error("A PR packet names the GitHub repository origin gives, and this repository's origin does not name one. Set origin to the GitHub repository URL (gh repo view --json url prints it).");
+  }
+  const deadline = Date.now() + GH_REVIEW_TIMEOUT;
+  const { baseRefOid, headRefOid, title, body } =
+    reviewMetadata(cwd, repository, "pr", number, "baseRefOid,headRefOid,title,body", deadline);
   if (typeof baseRefOid !== "string" || !FULL_OID.test(baseRefOid) ||
       typeof headRefOid !== "string" || !FULL_OID.test(headRefOid)) {
     throw new Error("PR metadata lacks full commit IDs. Check the PR in gh and retry.");
   }
-  return { base: baseRefOid, head: headRefOid };
+
+  const label = `PR #${number}`;
+  const prText = [typeof title === "string" ? title : "", typeof body === "string" ? body : ""].join("\n\n");
+  const sections = [contractSection(label, prText)];
+  const references = [...new Set([...prText.matchAll(/(?:^|[^\w/])#([1-9][0-9]*)\b/g)].map(match => match[1]!))];
+  let bytes = Buffer.byteLength(sections[0]!);
+  for (const issue of references) {
+    if (bytes > MAX_CONTRACT_BYTES) throw new Error("The framed contract exceeds 128 KiB. Shorten the contract text and rebuild the packet.");
+    const data = reviewMetadata(cwd, repository, "issue", issue, "body", deadline);
+    if (typeof data.body !== "string") throw new Error(`Issue #${issue} has no readable body. Check the issue in gh and retry.`);
+    const section = contractSection(`Issue #${issue}`, data.body);
+    sections.push(section);
+    bytes += Buffer.byteLength(section) + 1;
+  }
+  return {
+    base: baseRefOid, head: headRefOid,
+    contract: contractArtifact(references.length ? "issue" : "brief", label, sections),
+  };
 }
 
-function resolveSubject(cwd: string, request: PacketRequest): PacketSubject {
-  if (request.kind === "range" || request.kind === "pr") {
-    const refs = request.kind === "pr" ? prRefs(cwd, request.number) : request;
-    const pr = request.kind === "pr" ? Number(request.number) : request.pr;
-    const base = commitOid(cwd, refs.base), head = commitOid(cwd, refs.head);
+function resolveSubject(cwd: string, request: Exclude<PacketRequest, { kind: "pr" }>): PacketSubject {
+  if (request.kind === "range") {
+    const { pr } = request;
+    const base = commitOid(cwd, request.base), head = commitOid(cwd, request.head);
     return { kind: "range", base, head, mergeBase: mergeBaseOid(cwd, base, head), ...(pr === undefined ? {} : { pr }) };
   }
   if (request.kind === "commit") {
@@ -233,15 +310,41 @@ function canonicalJson(value: unknown): string {
   return JSON.stringify(value);
 }
 
-export function buildPacket(cwd: string, request: PacketRequest): PacketBundle {
+/** Reapply trusted contract metadata during an offline rebuild of a recorded packet. */
+export function bindPacketContract(packet: ReviewPacket, contract: PacketBlock["contract"]): ReviewPacket {
+  if (contract === undefined) return packet;
+  const { kind, ref, sha256 } = contract;
+  if ((kind !== "issue" && kind !== "brief") || !/^[a-f0-9]{64}$/.test(sha256)) {
+    throw new Error("The packet contract metadata is invalid. Rebuild the packet and its contract.");
+  }
+  const { id: _id, ...body } = packet;
+  const updated: Omit<ReviewPacket, "id"> = { ...body, contract: { kind, ref, sha256 } };
+  return { id: createHash("sha256").update(canonicalJson(updated)).digest("hex"), ...updated };
+}
+
+export function buildPacket(cwd: string, request: PacketRequest, options: PacketBuildOptions = {}): PacketBundle {
   const root = repositoryRoot(cwd);
-  const subject = resolveSubject(root, request);
+  let contract: ContractArtifact | undefined;
+  let subject: PacketSubject;
+  if (request.kind === "pr") {
+    if (options.contractFile !== undefined) throw new Error("Use --contract FILE without --pr.");
+    const pr = prRefs(root, request.number);
+    contract = pr.contract;
+    subject = resolveSubject(root, { kind: "range", base: pr.base, head: pr.head, pr: Number(request.number) });
+  } else {
+    subject = resolveSubject(root, request);
+    if (options.contractFile !== undefined) contract = localContract(cwd, options.contractFile);
+  }
+  const attachContract = (bundle: PacketBundle): PacketBundle => contract === undefined ? bundle : {
+    ...bundle, packet: bindPacketContract(bundle.packet, contract.metadata), contractText: contract.text,
+    brief: `${bundle.brief}\n\nContract: Read the framed contract.md beside this brief in the exported bundle. No GitHub access is needed.`,
+  };
   ensureBaseAttributes(root);
   const driverOptions = diffDriverOverrides(root);
   const workspace = request.kind === "workspace" || request.kind === "files";
   const scopes = request.kind === "files" ? request.paths.map(path => repositoryPath(cwd, root, path, true)) : [];
   if (request.kind === "files" && scopes.length === 0) throw new Error("No file scope given. Pass paths after --files.");
-  if (!workspace) return buildPacketFromIndex(root, subject, scopes, driverOptions);
+  if (!workspace) return attachContract(buildPacketFromIndex(root, subject, scopes, driverOptions));
   // Compare actual worktree line endings and mode bits regardless of checkout preferences.
   const gitOptions = [...driverOptions, ...workspaceFilterOptions(root), ...globalIgnoreOptions(root),
     "-c", "core.autocrlf=false", "-c", "core.fileMode=true",
@@ -273,7 +376,7 @@ export function buildPacket(cwd: string, request: PacketRequest): PacketBundle {
     else opaque.push({ status: "A", paths: [path], opaque: true });
   }
   const workspaceInventory = { tracked, untracked, opaque, stagedDeletions };
-  if (!intent.length) return buildPacketFromIndex(root, subject, scopes, gitOptions, undefined, workspaceInventory);
+  if (!intent.length) return attachContract(buildPacketFromIndex(root, subject, scopes, gitOptions, undefined, workspaceInventory));
 
   // Pair workspace copies and renames in one inventory without changing the real index.
   const indexPath = checkedOutput(reviewGit(root, ["rev-parse", "--git-path", "index"]), "the Git index path");
@@ -299,7 +402,7 @@ export function buildPacket(cwd: string, request: PacketRequest): PacketBundle {
     checkedOutput(reviewGit(root, [...gitOptions, "add", "--intent-to-add", "--pathspec-from-file=-", "--pathspec-file-nul"], {
       indexFile, input: intent.join("\0") + "\0",
     }), "untracked entries in the temporary Git index");
-    return buildPacketFromIndex(root, subject, scopes, gitOptions, indexFile, workspaceInventory);
+    return attachContract(buildPacketFromIndex(root, subject, scopes, gitOptions, indexFile, workspaceInventory));
   } finally {
     rmSync(temp, { recursive: true, force: true });
   }

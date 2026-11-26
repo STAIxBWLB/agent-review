@@ -254,3 +254,35 @@ test("MCP selects and resolves findings only in the requested PR thread", () => 
   expect(handlers.arev_show({ pr: 7 })).toMatchObject({ view: { openBlocking: [] } });
   expect(handlers.arev_gate({ pr: "none" })).toMatchObject({ ok: false });
 });
+
+test("MCP records a contract-bearing packet without rereading the original contract", () => {
+  const { dir, base } = repo();
+  const entry = join(import.meta.dir, "../bin/arev.js");
+  const contract = join(dir, "local-contract.md");
+  writeFileSync(contract, "Original fixture contract\n");
+  const built = spawnSync(process.execPath, [entry, "packet", "--from", base, "--to", "HEAD",
+    "--contract", contract, "--json"], { cwd: dir, encoding: "utf8" });
+  expect(built.status, built.stderr).toBe(0);
+  const packet = JSON.parse(built.stdout);
+  expect(packet.contract).toMatchObject({ kind: "brief", ref: "local-contract.md" });
+  rmSync(contract);
+  const report = {
+    v: 1, packet,
+    reviewer: { id: "fixture-reviewer", modelFamily: "fixture-family", started: "manual", sameFamilyFallback: false },
+    coverage: { reviewed: ["src/a.ts"], skipped: [] },
+    findings: [], verdict: "approved", call: { ok: true },
+  };
+  const input = [
+    { jsonrpc: "2.0", id: 1, method: "initialize",
+      params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "fixture", version: "1" } } },
+    { jsonrpc: "2.0", method: "notifications/initialized" },
+    { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "arev_record", arguments: { report } } },
+  ].map(message => JSON.stringify(message)).join("\n") + "\n";
+  const recorded = spawnSync(process.execPath, [entry, "mcp"], { cwd: dir, input, encoding: "utf8", timeout: 15_000 });
+  expect(recorded.status, recorded.stderr).toBe(0);
+  const response = JSON.parse(recorded.stdout.trim().split("\n").at(-1)!);
+  expect(response.result.isError).toBeUndefined();
+  expect(JSON.parse(response.result.content[0].text).id).toMatch(/^[a-f0-9]{64}$/);
+  const event = readLedger(dir).at(-1);
+  expect(event).toMatchObject({ type: "record", record: { packet: { id: packet.id, contract: packet.contract } } });
+});

@@ -41,7 +41,7 @@ function packetArgs(args: readonly string[]) {
       options: {
         pr: { type: "string" }, from: { type: "string" }, to: { type: "string" },
         commit: { type: "string" }, workspace: { type: "boolean" }, files: { type: "boolean" },
-        profile: { type: "string" }, json: { type: "boolean" }, out: { type: "string" },
+        profile: { type: "string" }, contract: { type: "string" }, json: { type: "boolean" }, out: { type: "string" },
       },
     });
   } catch {
@@ -64,6 +64,9 @@ export function runPacket(cwd: string, args: readonly string[]): number | void {
   }
   if (values.profile !== undefined && values.profile !== "code") throw new PacketUsageError("Unsupported profile. Use --profile code.");
   if (values.out === "") throw new PacketUsageError("Output directory is empty. Pass --out DIR.");
+  if (values.contract === "" || (values.contract !== undefined && values.pr !== undefined)) {
+    throw new PacketUsageError("Pass --contract FILE only without --pr.");
+  }
   if (values.files && !positionals.length) throw new PacketUsageError("No file scope given. Pass paths after --files.");
   if (values.pr !== undefined && !/^[1-9][0-9]*$/.test(values.pr)) {
     throw new PacketUsageError("Invalid PR number. Pass a positive integer to --pr.");
@@ -90,7 +93,7 @@ export function runPacket(cwd: string, args: readonly string[]): number | void {
       "choose a directory outside the worktree"));
   }
 
-  const bundle = buildPacket(cwd, request);
+  const bundle = buildPacket(cwd, request, { contractFile: values.contract });
   // `arev record` validates a report against the packet arev builds for that head, and the ledger's packet event is
   // where that packet is kept, so the event is written before this command returns, whatever it delivered. REVIEW.md's
   // settings are read from the whole merge-base rule text the packet was built from, and the cap is kept with the event
@@ -128,6 +131,7 @@ export function runPacket(cwd: string, args: readonly string[]): number | void {
         "diff.patch": bundle.diff,
         "rules.md": `${bundle.rules}\n`,
         "brief.md": `${bundle.brief}\n`,
+        ...(bundle.contractText === undefined ? {} : { "contract.md": bundle.contractText }),
       })) {
         const path = resolve(destination, name);
         const file = openSync(path, "wx", 0o600);

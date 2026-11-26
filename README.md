@@ -29,6 +29,10 @@ on `github.com`, never from the repository `gh` resolves for itself (`GH_REPO`,
 the working directory), and refuses an origin that names no GitHub repository.
 The standalone `arev rules` command compares against the default branch on `origin`.
 
+`arev packet --pr N --out DIR` includes a framed `contract.md` with the PR title,
+body, and referenced issue bodies. A reviewer can read this file without
+GitHub access. For a local subject, use `--contract FILE` to embed a local brief.
+
 ### `arev gate`
 
 The gate answers for the current full head and the base it would merge into now:

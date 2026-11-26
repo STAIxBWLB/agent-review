@@ -1,6 +1,6 @@
 export const commands = [
   { name: "packet", aliases: [], description: "Build a review packet",
-    syntax: "packet [--pr N | --from A --to B | --commit C | --workspace | --files P...] [--profile code] [--json | --out DIR]" },
+    syntax: "packet [--pr N | --from A --to B | --commit C | --workspace | --files P...] [--profile code] [--contract FILE] [--json | --out DIR]" },
   { name: "rules", aliases: [], description: "Read the rules that apply to paths",
     syntax: "rules [check] <path...>" },
   { name: "import", aliases: [], description: "Import a legacy review report",

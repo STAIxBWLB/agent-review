@@ -679,7 +679,10 @@ test("a packet and a report that each fit their bounds are appended, however muc
   const storedReason: string = JSON.parse(stored).record.coverage.skipped[0].reason;
   expect(storedReason).toContain("> \n> [agent-hub report]");
   expect(Buffer.byteLength(storedReason)).toBeLessThanOrEqual(2048);
-});
+  // This case builds a packet near its bound and runs `arev record` once over it, which takes about 3 s here and over 5 s
+  // on the CI macOS runner - bun's default bound, where it failed the run at a8967ce. The bound is raised on this case
+  // alone rather than globally, so the rest of the suite keeps the default.
+}, 30_000);
 
 test("arev record --light keeps the flag on the record it appends, and show --json echoes it", () => {
   const { root, repo, home } = fixture();

@@ -11,7 +11,7 @@ afterEach(() => {
   for (const path of scratch.splice(0)) rmSync(path, { recursive: true, force: true });
 });
 
-function reviewer(mode: "json" | "dirty" | "timeout" | "brief" | "invalid" | "secret" | "escaped-secret" | "mcp" | "mcp-dirty", review = "# Review\n", host = "codex", separator = "") {
+function reviewer(mode: "json" | "dirty" | "timeout" | "brief" | "invalid" | "secret" | "escaped-secret" | "mcp" | "mcp-dirty" | "mcp-failed", review = "# Review\n", host = "codex", separator = "") {
   const sandbox = mkdtempSync(join(tmpdir(), "arev-run-test-"));
   scratch.push(sandbox);
   const bin = join(sandbox, "bin"), userHome = join(sandbox, "home"), out = join(sandbox, "out");
@@ -28,7 +28,10 @@ function reviewer(mode: "json" | "dirty" | "timeout" | "brief" | "invalid" | "se
   const base = git("rev-parse", "HEAD").trim();
   git("update-ref", "refs/remotes/origin/main", base);
   write("file.txt", "after\n");
-  git("commit", "-qam", "head");
+  write("bunfig.toml", "# Reviewed configuration stays in the checkout.\n");
+  write(".env", "AREV_FIXTURE_CHECKOUT_ENV=loaded\n");
+  git("add", ".");
+  git("commit", "-qm", "head");
   const head = git("rev-parse", "HEAD").trim();
   const gh = join(bin, "gh");
   writeFileSync(gh, `#!/bin/sh
@@ -39,16 +42,23 @@ printf '%s\\n' '{"baseRefOid":"${base}","headRefOid":"${head}","title":"Review f
 
   const arev = join(bin, "arev");
   const cliEntry = new URL("../bin/arev.js", import.meta.url).href;
-  writeFileSync(arev, `#!${process.execPath}\nawait import(${JSON.stringify(cliEntry)});\n`, { mode: 0o755 });
+  writeFileSync(arev, `#!${process.execPath}\nif (process.env.AREV_FIXTURE_CHECKOUT_ENV || !process.cwd().endsWith("/launch")) process.exit(19);\nawait import(${JSON.stringify(cliEntry)});\n`, { mode: 0o755 });
   const executable = join(bin, host);
   writeFileSync(executable, `#!${process.execPath}
     import { readFileSync, writeFileSync } from "node:fs";
     const mode = ${JSON.stringify(mode)}, out = ${JSON.stringify(out)}, host = ${JSON.stringify(host)};
     if (process.argv.includes("--help")) { console.log("fixture help: --plan"); process.exit(0); }
+    const checkout = process.argv[process.argv.indexOf("--add-dir") + 1];
+    if (!checkout || checkout === process.cwd() || !process.cwd().endsWith("/launch") ||
+        process.env.AREV_FIXTURE_CHECKOUT_ENV || !readFileSync(checkout + "/bunfig.toml", "utf8").includes("Reviewed configuration")) process.exit(18);
     const packet = JSON.parse(readFileSync(out + "/packet.json", "utf8"));
-    if (!process.argv.includes(host === "kimi" ? "--plan" : "read-only") || process.env.OPENAI_API_KEY) process.exit(9);
+    if (process.env.OPENAI_API_KEY) process.exit(9);
+    if (host === "claude") {
+      if (process.argv[process.argv.indexOf("--setting-sources") + 1] !== "user" ||
+          process.argv[process.argv.indexOf("--permission-mode") + 1] !== "plan") process.exit(9);
+    } else if (!process.argv.includes(host === "kimi" ? "--plan" : "read-only")) process.exit(9);
     if (mode === "timeout") { await Bun.sleep(60_000); process.exit(1); }
-    if (mode === "dirty") writeFileSync("changed-by-reviewer.txt", "fixture edit");
+    if (mode === "dirty") writeFileSync(checkout + "/changed-by-reviewer.txt", "fixture edit");
     if (mode === "secret") {
       const canary = "ghp_" + "a".repeat(36);
       process.stdout.write(canary.slice(0, 10));
@@ -61,7 +71,7 @@ printf '%s\\n' '{"baseRefOid":"${base}","headRefOid":"${head}","title":"Review f
     const reviewer = { id: "untrusted-name", modelFamily: "untrusted-family", started: "self", sameFamilyFallback: false };
     const coverage = { reviewed: packet.units.map(unit => unit.path), skipped: [] };
     const call = { ok: true };
-    if (mode === "mcp" || mode === "mcp-dirty") {
+    if (mode === "mcp" || mode === "mcp-dirty" || mode === "mcp-failed") {
       const config = Object.fromEntries(process.argv.filter(arg => arg.startsWith("mcp_servers.arev."))
         .map(arg => [arg.slice(0, arg.indexOf("=")), JSON.parse(arg.slice(arg.indexOf("=") + 1))]));
       const command = config["mcp_servers.arev.command"];
@@ -79,7 +89,7 @@ printf '%s\\n' '{"baseRefOid":"${base}","headRefOid":"${head}","title":"Review f
         callTool(6, "arev_record", { report }),
         callTool(7, "arev_show", {}),
       ].map(value => JSON.stringify(value)).join("\\n") + "\\n";
-      const mcp = Bun.spawnSync([command, ...args], { stdin: Buffer.from(input) });
+      const mcp = Bun.spawnSync([command, ...args], { cwd: checkout, stdin: Buffer.from(input) });
       if (mcp.exitCode !== 0) process.exit(11);
       const replies = new Map(mcp.stdout.toString().trim().split("\\n").map(line => {
         const response = JSON.parse(line);
@@ -93,9 +103,9 @@ printf '%s\\n' '{"baseRefOid":"${base}","headRefOid":"${head}","title":"Review f
       if (!wrong.isError || !wrong.content[0].text.includes("packet id is not") ||
           replies.get(5).result.isError || !duplicate.isError || !duplicate.content[0].text.includes("already staged")) process.exit(14);
       if (!JSON.parse(replies.get(7).result.content[0].text).staged) process.exit(15);
-      if (mode === "mcp-dirty") writeFileSync("changed-by-reviewer.txt", "fixture edit");
+      if (mode === "mcp-dirty") writeFileSync(checkout + "/changed-by-reviewer.txt", "fixture edit");
       console.log("review was submitted via MCP");
-      process.exit(0);
+      process.exit(mode === "mcp-failed" ? 1 : 0);
     }
     const fence = String.fromCharCode(96).repeat(3);
     if (mode === "escaped-secret") {
@@ -278,5 +288,26 @@ test("Kimi without a supported MCP config flag falls back to stdout without an a
   expect(existsSync(join(out, ".arev-run.json"))).toBe(false);
   expect(readLedger(dir, { home }).at(-1)).toMatchObject({ type: "record",
     record: { reviewer: { started: "run", id: "kimi", implementer: "qwen" } },
+  });
+});
+
+
+test("an unsuccessful reviewer with a staged report must rerun", () => {
+  const { cli, dir, home, out } = reviewer("mcp-failed");
+  const result = cli("run", "--pr", "7", "--host", "codex", "--implementer", "qwen", "--out", out);
+  expect(result.status).toBe(1);
+  expect(result.stderr).toContain("rerun arev run with a fresh output directory");
+  expect(result.stderr).not.toContain("use arev record");
+  expect(existsSync(join(out, "report.json"))).toBe(true);
+  expect(readLedger(dir, { home }).map(event => event.type)).toEqual(["packet"]);
+});
+
+
+test("Claude starts with user settings and reads the checkout as an added directory", () => {
+  const { cli, dir, home, out } = reviewer("json", "# Review\n", "claude");
+  const result = cli("run", "--host", "claude", "--implementer", "qwen", "--out", out);
+  expect(result.status, result.stderr).toBe(0);
+  expect(readLedger(dir, { home }).at(-1)).toMatchObject({ type: "record",
+    record: { reviewer: { id: "claude", started: "run" } },
   });
 });

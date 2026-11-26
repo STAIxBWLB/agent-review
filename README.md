@@ -118,7 +118,9 @@ configuration to revert what setup installed.
 ## Running a review
 
 Run `arev run --pr N --implementer ID` to select a reviewer, export the packet
-and contract, and run the reviewer in a detached worktree. Without `--pr`,
+and contract, and review a detached worktree. The reviewer and its scoped MCP
+server start outside that worktree, and the reviewer gets its path for reading.
+Without `--pr`,
 the run reviews HEAD against the origin default branch and starts the
 automatic host rotation at the first host. Pass `--host ID` to select an
 installed reviewer explicitly.

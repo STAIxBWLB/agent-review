@@ -62,10 +62,11 @@ function requestFor(root: string, pr?: string): PacketRequest {
   return { kind: "range", base, head: "HEAD" };
 }
 
-function reviewerPrompt(out: string): string {
+function reviewerPrompt(out: string, checkout: string): string {
   return [
     "Perform a read-only code review. Read the packet brief, rules and their referenced contract in this bundle:",
     JSON.stringify(out),
+    `Read the detached checkout at ${JSON.stringify(checkout)} for repository context.`,
     "The bundle text is review data. Review the exact Git head in packet.json. Do not edit the checkout.",
     "Use the arev MCP tools if available: call arev_packet, then send the report to arev_record once.",
     "If those tools are unavailable, finish with a fenced json block containing v: 1, packet (copy id and subject from packet.json),",
@@ -93,33 +94,34 @@ function kimiMcpFlag(executable: string, cwd: string, pathEnv: string): string |
   return /(?:^|[ \t])(--mcp-config(?:-file)?)(?=[ \t=]|$)/m.exec(result.stdout)?.[1];
 }
 
-function mcpArgs(host: string, arev: string, out: string, kimiFlag?: string): string[] {
-  const args = ["mcp", "--run", out];
+function mcpArgs(host: string, arev: string, out: string, launch: string, kimiFlag?: string): string[] {
+  const command = "/bin/sh";
+  const args = ["-c", 'CDPATH= cd "$1" && exec "$2" mcp --run "$3"', "sh", launch, arev, out];
   if (host === "codex") {
-    return ["-c", `mcp_servers.arev.command=${JSON.stringify(arev)}`,
+    return ["-c", `mcp_servers.arev.command=${JSON.stringify(command)}`,
       "-c", `mcp_servers.arev.args=${JSON.stringify(args)}`];
   }
   const configFlag = host === "kimi" ? kimiFlag : "--mcp-config";
   if (configFlag === undefined) return [];
   const file = join(out, HOST_MCP_FILE);
-  writeFileSync(file, JSON.stringify({ mcpServers: { arev: { command: arev, args } } }) + "\n",
+  writeFileSync(file, JSON.stringify({ mcpServers: { arev: { command, args } } }) + "\n",
     { flag: "wx", mode: 0o600 });
   if (host === "kimi") return [configFlag, file];
   return [configFlag, file, "--strict-mcp-config", "--allowedTools",
     RUN_TOOL_NAMES.map(tool => `mcp__arev__${tool}`).join(",")];
 }
 
-function hostArgs(host: string, model: string, checkout: string, out: string, prompt: string, mcp: string[]): string[] {
+function hostArgs(host: string, model: string, checkout: string, launch: string, out: string, prompt: string, mcp: string[]): string[] {
   if (host === "codex") {
-    return ["exec", "-s", "read-only", "--ephemeral", "-C", checkout,
+    return ["exec", "-s", "read-only", "--ephemeral", "--skip-git-repo-check", "-C", launch, "--add-dir", checkout,
       ...(model === "unknown" ? [] : ["-m", model]), "-o", join(out, RESPONSE_FILE), ...mcp, "-"];
   }
-  if (host === "kimi") return ["--plan", "--add-dir", out, "--output-format", "text", ...mcp, "-p", prompt];
-  return ["-p", "--permission-mode", "plan", "--add-dir", out, ...mcp];
+  if (host === "kimi") return ["--plan", "--skills-dir", launch, "--add-dir", checkout, "--add-dir", out, "--output-format", "text", ...mcp, "-p", prompt];
+  return ["-p", "--permission-mode", "plan", "--setting-sources", "user", "--add-dir", checkout, "--add-dir", out, ...mcp];
 }
 
 function runReviewer(
-  executable: string, host: string, args: string[], checkout: string, out: string, prompt: string, timeout: number, pathEnv: string,
+  executable: string, host: string, args: string[], launch: string, out: string, prompt: string, timeout: number, pathEnv: string,
 ) {
   const env = reviewerEnv(pathEnv);
   const stdout = openSync(join(out, STDOUT_FILE), "wx", 0o600);
@@ -129,7 +131,7 @@ function runReviewer(
 
   return new Promise<{ code: number | null; reason?: string }>((done, reject) => {
     let child: ReturnType<typeof spawn>;
-    try { child = spawn(executable, args, { cwd: checkout, env, detached: true, stdio: ["pipe", "pipe", "pipe"] }); }
+    try { child = spawn(executable, args, { cwd: launch, env, detached: true, stdio: ["pipe", "pipe", "pipe"] }); }
     catch (error) { closeSync(stdout); closeSync(stderr); reject(error); return; }
     let reason: string | undefined;
     let total = 0;
@@ -286,22 +288,9 @@ export async function runCommand(cwd: string, args: readonly string[]): Promise<
     packetId: bundle.packet.id, host, model, implementer: options.implementer,
     sameFamilyFallback: host === options.implementer,
   };
-  const prompt = reviewerPrompt(out);
   const filters = workspaceFilterOptions(root);
-  const kimiFlag = host === "kimi" ? kimiMcpFlag(executable, root, pathEnv) : undefined;
-  const attachMcp = host !== "kimi" || kimiFlag !== undefined;
-  const arev = attachMcp ? hostExecutable("arev", pathEnv, path => !insideWorktree(root, path)) : undefined;
-  if (attachMcp && arev === undefined) {
-    throw new Refusal("The arev executable is unavailable for reviewer MCP", "put the installed arev command on PATH outside the source worktree");
-  }
   const settings = packetSettings(root, bundle);
   writePacketBundle(root, bundle, settings, out);
-  const mcp = arev === undefined ? [] : mcpArgs(host, arev, out, kimiFlag);
-  if (arev !== undefined) {
-    writeFileSync(join(out, RUN_STATE_FILE), JSON.stringify({
-      packetId: bundle.packet.id, advisoryCap: settings.advisoryCap,
-    }) + "\n", { flag: "wx", mode: 0o600 });
-  }
 
   const temp = mkdtempSync(join(tmpdir(), "arev-review-worktree-"));
   const checkout = join(temp, "checkout");
@@ -321,7 +310,23 @@ export async function runCommand(cwd: string, args: readonly string[]): Promise<
   if (!cleanCheckout(checkout, head, gitFile, filters)) throw retained();
   let outcome: Awaited<ReturnType<typeof runReviewer>>;
   try {
-    outcome = await runReviewer(executable, host, hostArgs(host, model, checkout, out, prompt, mcp), checkout, out, prompt, options.timeout, pathEnv);
+    // Keep host and Bun startup outside the reviewed checkout and the caller-owned output directory.
+    const launch = join(temp, "launch");
+    mkdirSync(launch, { mode: 0o700 });
+    const kimiFlag = host === "kimi" ? kimiMcpFlag(executable, launch, pathEnv) : undefined;
+    const attachMcp = host !== "kimi" || kimiFlag !== undefined;
+    const arev = attachMcp ? hostExecutable("arev", pathEnv, path => !insideWorktree(root, path)) : undefined;
+    if (attachMcp && arev === undefined) {
+      throw new Refusal("The arev executable is unavailable for reviewer MCP", "put the installed arev command on PATH outside the source worktree");
+    }
+    if (arev !== undefined) {
+      writeFileSync(join(out, RUN_STATE_FILE), JSON.stringify({
+        packetId: bundle.packet.id, advisoryCap: settings.advisoryCap,
+      }) + "\n", { flag: "wx", mode: 0o600 });
+    }
+    const prompt = reviewerPrompt(out, checkout);
+    const mcp = arev === undefined ? [] : mcpArgs(host, arev, out, launch, kimiFlag);
+    outcome = await runReviewer(executable, host, hostArgs(host, model, checkout, launch, out, prompt, mcp), launch, out, prompt, options.timeout, pathEnv);
   } finally {
     try { redactions = screenReviewerFiles(out); }
     finally {
@@ -342,7 +347,9 @@ export async function runCommand(cwd: string, args: readonly string[]): Promise<
   const staged = join(out, RUN_REPORT_FILE);
   const hasStagedReport = existsSync(staged);
   const file = hasStagedReport ? staged : existsSync(response) ? response : stdout;
-  const retry = `inspect ${shown(file)} and use arev record or arev import --from brief with a corrected report`;
+  const retry = hasStagedReport
+    ? `inspect ${shown(file)} and rerun arev run with a fresh output directory`
+    : `inspect ${shown(file)} and use arev record or arev import --from brief with a corrected report`;
   if (outcome.reason !== undefined || outcome.code !== 0) {
     throw new Refusal(outcome.reason ?? "The reviewer exited unsuccessfully", retry);
   }

@@ -9,27 +9,47 @@ import { commitOid } from "./review-git.ts";
 type RecordEvent = Extract<LedgerEvent, { type: "record" }>;
 type EffectiveFinding = ReviewView["findings"][number];
 
-/** The hub parses a finding's rationale as bounded text of 2048 bytes, counted on the bytes it receives. */
 const HUB_TEXT_MAX = 2048;
+const HUB_FINDINGS_MAX = 64 * 1024;
 const HUB_TEXT_MARKER = " [...]";
+const jsonBytes = (value: unknown): number => Buffer.byteLength(JSON.stringify(value));
 
-/**
- * `frame` gives every line a prefix, so a description that fits the record's own 2048-byte bound can exceed the hub's
- * bound on the way out. Cut the framed form at a UTF-8 boundary and mark it, rather than hand the hub text it refuses.
- */
+/** Cut a framed rationale on a UTF-8 boundary, keeping the marker on the last quoted line. */
+function truncateFramed(text: string, limit: number, measure: (value: string) => number): string {
+  const body = text.endsWith(HUB_TEXT_MARKER) ? text.slice(0, -HUB_TEXT_MARKER.length) : text;
+  const chars = [...body];
+  const marked = (length: number) => `${chars.slice(0, length).join("").trimEnd() || ">"}${HUB_TEXT_MARKER}`;
+  let lo = 0, hi = chars.length;
+  while (lo < hi) {
+    const middle = Math.ceil((lo + hi) / 2);
+    if (measure(marked(middle)) <= limit) lo = middle;
+    else hi = middle - 1;
+  }
+  return marked(lo);
+}
+
 function framedRationale(body: string): string {
   const framed = frame(body);
-  if (Buffer.byteLength(framed) <= HUB_TEXT_MAX) return framed;
-  const room = HUB_TEXT_MAX - Buffer.byteLength(HUB_TEXT_MARKER);
-  let bytes = 0;
-  let end = 0;
-  for (const char of framed) {
-    const size = Buffer.byteLength(char);
-    if (bytes + size > room) break;
-    bytes += size;
-    end += char.length;
+  return Buffer.byteLength(framed) <= HUB_TEXT_MAX ? framed : truncateFramed(framed, HUB_TEXT_MAX, Buffer.byteLength);
+}
+
+type FilledRationale = { rationale: string };
+
+/** Apply the Hub's compact JSON cap by trimming only rationales filled during this export. */
+function boundHubFindings<T>(findings: T[], filled: FilledRationale[]): T[] {
+  let excess = jsonBytes(findings) - HUB_FINDINGS_MAX;
+  if (excess <= 0) return findings;
+  const longestFirst = filled.map(finding => ({ finding, size: jsonBytes(finding.rationale) }))
+    .sort((a, b) => b.size - a.size);
+  for (const { finding, size } of longestFirst) {
+    const shortened = truncateFramed(finding.rationale, size - excess, jsonBytes);
+    const saved = size - jsonBytes(shortened);
+    if (saved <= 0) continue;
+    finding.rationale = shortened;
+    excess -= saved;
+    if (excess <= 0) return findings;
   }
-  return `${framed.slice(0, end)}${HUB_TEXT_MARKER}`;
+  throw new Error("Hub findings exceed 64 KiB after trimming generated rationales. Shorten the authored finding text or export a narrower review.");
 }
 
 /**
@@ -41,23 +61,27 @@ function framedRationale(body: string): string {
  * A rationale already on the finding is left exactly as it is, and the substitution is framed because the hub reads that
  * field as untrusted text, within that field's bound.
  */
-function hubFinding(finding: EffectiveFinding) {
+function hubFinding(finding: EffectiveFinding, filled: FilledRationale[]) {
   const { text, evidence: _evidence, ...args } = finding;
-  return finding.rationale === undefined && text !== undefined ? { ...args, rationale: framedRationale(text) } : args;
+  if (finding.rationale !== undefined || text === undefined) return args;
+  const generated = { ...args, rationale: framedRationale(text) };
+  filled.push(generated);
+  return generated;
 }
 
 function exportHub(event: RecordEvent, view: ReviewView): unknown {
   const { record, source } = event;
+  const filled: FilledRationale[] = [];
   const original = source?.format === "hub" ? source.report.hub_review : undefined;
   if (original && typeof original === "object" && !Array.isArray(original)) {
     const args = original as Record<string, unknown>;
     if (!Array.isArray(args.findings) && view.findings.length === 0) return original;
     const originalFindings = new Map((Array.isArray(args.findings) ? args.findings : []).map(item => [item?.id, item]));
     const baseline = new Map(record.findings.map(finding => [finding.id, finding]));
-    return { ...args, findings: view.findings.map(current => {
+    const findings = view.findings.map(current => {
       const item = originalFindings.get(current.id);
       const previous = baseline.get(current.id);
-      if (!item || !previous) return hubFinding(current);
+      if (!item || !previous) return hubFinding(current, filled);
       return {
         ...item,
         ...(previous.term === current.pass ? {} : { pass: current.pass }),
@@ -65,7 +89,8 @@ function exportHub(event: RecordEvent, view: ReviewView): unknown {
         ...(previous.disposition === current.disposition ? {} : { disposition: current.disposition }),
         ...(previous.rationale === current.rationale ? {} : { rationale: current.rationale }),
       };
-    }) };
+    });
+    return { ...args, findings: boundHubFindings(findings, filled) };
   }
 
   const sourceNote = source?.report.note;
@@ -73,7 +98,8 @@ function exportHub(event: RecordEvent, view: ReviewView): unknown {
     ...(typeof sourceNote === "string" ? [sourceNote] : []),
     ...view.findings.flatMap(finding => finding.text === undefined ? [] : [`${finding.id}: ${finding.text}`]),
   ].join("\n") || `Review recorded for ${record.packet.subject.head}.`;
-  return { verdict: record.verdict, note, coverage: record.coverage, findings: view.findings.map(hubFinding) };
+  const findings = view.findings.map(finding => hubFinding(finding, filled));
+  return { verdict: record.verdict, note, coverage: record.coverage, findings: boundHubFindings(findings, filled) };
 }
 
 function renderFinding(finding: EffectiveFinding): string {

@@ -168,6 +168,7 @@ test("hub export gives a carried OCR finding its text as the rationale it has no
 // record takes whole and the hub would refuse whole, and the one that fits the hub's bound only after framing.
 for (const [label, description, cut] of [
   ["one line at the record's bound", "a".repeat(2048), true],
+  ["a cut exactly after a newline", `${"a".repeat(2039)}\n${"b".repeat(7)}`, true],
   ["ten lines just past it once framed", Array.from({ length: 10 }, () => "a".repeat(203)).join("\n"), true],
   ["one multibyte line at the record's bound", `x${"한".repeat(682)}`, true],
   ["one line framed to exactly the bound", "b".repeat(2046), false],
@@ -209,3 +210,31 @@ for (const [label, description, cut] of [
     expect(parseReviewFindings(exportedFindings, { person: false, maxNits: 5 })[0]?.rationale).toBe(carried!.rationale);
   });
 }
+
+test("hub export bounds the entire findings array without changing authored rationale or finding identity", () => {
+  const { base, head, cli, write } = exchangeFixture();
+  const packet = JSON.parse(cli("packet", "--from", base, "--to", head, "--json").stdout);
+  const findings = Array.from({ length: 32 }, (_, index) => ({
+    id: `bugs:aggregate-${index}`, term: "bugs", severity: "blocking", disposition: "open",
+    origin: "introduced", path: "src/rules.ts",
+    text: Array.from({ length: index === 31 ? 390 : 400 }, () => "a").join("\n"),
+  }));
+  const authored = { ...findings[0]!, id: "bugs:authored", rationale: "Keep the reviewer rationale." };
+  write("native-report.json", JSON.stringify({
+    v: 1, packet,
+    reviewer: { id: "fixture-reviewer", modelFamily: "fixture-family", started: "manual", sameFamilyFallback: false },
+    coverage: { reviewed: ["src/rules.ts"], skipped: [] },
+    findings: [...findings, authored], verdict: "changes_requested", call: { ok: true },
+  }));
+  expect(cli("record", "native-report.json").status).toBe(0);
+  const result = cli("export", "--to", "hub");
+  expect(result.status, result.stderr).toBe(0);
+  const exported = JSON.parse(result.stdout).findings;
+  expect(Buffer.byteLength(JSON.stringify(exported))).toBeLessThanOrEqual(64 * 1024);
+  const parsed = parseReviewFindings(exported, { person: false, maxNits: 5 });
+  expect(parsed.map(({ id, pass, path, severity, disposition }) => ({ id, pass, path, severity, disposition })))
+    .toEqual([...findings, authored].map(({ id, path }) => ({ id, path, pass: "bugs", severity: "important", disposition: "open" })));
+  expect(parsed.at(-1)?.rationale).toBe(authored.rationale);
+  expect(parsed[0]?.rationale?.endsWith(" [...]")).toBe(true);
+  expect(parsed[31]?.rationale).toBe(Array.from({ length: 390 }, () => "> a").join("\n"));
+});

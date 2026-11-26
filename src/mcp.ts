@@ -206,12 +206,14 @@ export const MCP_TOOLS: readonly (Tool & { name: McpToolName })[] = [
   },
   {
     name: "arev_resolve",
-    description: "Settle one recorded finding as fixed or false_positive, with the evidence or rationale the disposition needs. accepted is not offered here: it is the person's decision at a terminal.",
+    description: "Settle one recorded finding as fixed or false_positive, with the evidence or rationale the disposition needs. accepted is refused with the terminal command because it is the person's decision.",
     inputSchema: {
       type: "object",
       properties: {
         finding: { type: "string", description: "The recorded finding id, as arev_show reports it." },
-        as: { type: "string", enum: ["fixed", "false_positive"] },
+        // Admit the spelling at the protocol boundary so the handler can give the terminal-only refusal.
+        as: { type: "string", enum: ["fixed", "false_positive", "accepted"],
+          description: "MCP can apply fixed or false_positive. For accepted, run arev resolve <id> --as accepted --rationale <reason> at your terminal." },
         evidence: { type: "array", items: { type: "string" }, maxItems: 16, description: "path:line or command output, required for false_positive." },
         rationale: { type: "string", description: "What was settled and why, at most 2048 bytes." },
         head: { type: "string", description: "Full head SHA to resolve against; defaults to the newest record's." },

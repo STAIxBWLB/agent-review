@@ -71,6 +71,13 @@ head and base.
   reflects subsequent finding resolutions.
 - `arev export --to markdown` prints the recorded review and finding lifecycle.
 
+## Setup receipts
+
+`arev setup <host> --apply` stores its undo receipt under
+`$AGENTHUB_HOME/setup/` (default `~/.agenthub/setup/`). The receipt is scoped
+to the host configuration path. Run `arev setup <host> --undo` in the same
+configuration to revert what setup installed.
+
 ## Development
 
 With Bun 1.4.4 or later, run:

@@ -83,6 +83,13 @@ const SECRETS = [/-----BEGIN [A-Z ]*PRIVATE KEY-----/, /\bAKIA[0-9A-Z]{16}\b/, /
   /\bxox[abprs]-[A-Za-z0-9-]{10,}/, /\bAIza[0-9A-Za-z_-]{35}\b/, /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/, /\b(?:password|passwd|secret|api[_-]?key|token)\s*[:=]\s*\S{8,}/i];
 export const secretShaped = (text: string): boolean => SECRETS.some(re => re.test(text));
 
+/**
+ * A validated string a refusal may print: the value itself, or `<withheld>` when it is secret-shaped. A `\u` escape
+ * decodes into a secret the raw-text screen cannot see, so this guard is what keeps the decoded value out of the message
+ * whichever field carried it.
+ */
+export const shown = (value: string): string => secretShaped(value) ? "<withheld>" : value;
+
 const MAX_EVENT_BYTES = 256 * 1024;
 /**
  * A packet event is larger than any other by construction: one unit per changed file plus, per rule, the paths that
@@ -93,11 +100,20 @@ const MAX_EVENT_BYTES = 256 * 1024;
 const MAX_PACKET_EVENT_BYTES = 1024 * 1024;
 export const MAX_REPORT_BYTES = 1024 * 1024;
 /**
+ * The stored shape of a report that fits the report bound is larger than the file it was read from: every text goes
+ * through `sanitize` (`src/frame.ts`), which prefixes `> ` to a line that looks like an untrusted header. The cheapest
+ * such line is `[agent-hub`, so the worst ratio is 12/10; `frame()`'s per-line `>` is a display transform in
+ * `src/rules.ts` and `src/packet.ts` and never reaches the ledger. A fifth of the bound covers that ratio.
+ */
+const STORED_REPORT_BYTES = MAX_REPORT_BYTES + Math.ceil(MAX_REPORT_BYTES / 5);
+/**
  * A record event embeds the packet it was validated against beside the report's own findings and coverage, so its bound
- * is both halves: a packet that fits the packet bound and a report that fits the report bound still measure their sum.
+ * is both halves: a packet that fits the packet bound and a report that fits the report bound, stored.
  * The other events keep the smaller bound.
  */
-const MAX_RECORD_EVENT_BYTES = MAX_PACKET_EVENT_BYTES + MAX_REPORT_BYTES;
+const MAX_RECORD_EVENT_BYTES = MAX_PACKET_EVENT_BYTES + STORED_REPORT_BYTES;
+/** The record bound, exported so a case can pin the refusal's own number instead of repeating it. */
+export const RECORD_EVENT_BOUND = MAX_RECORD_EVENT_BYTES;
 const eventCap = (type: LedgerEvent["type"]): number =>
   type === "packet" ? MAX_PACKET_EVENT_BYTES : type === "record" ? MAX_RECORD_EVENT_BYTES : MAX_EVENT_BYTES;
 /**
@@ -146,11 +162,13 @@ export const reviewHome = (home?: string): string => resolve(home ?? (process.en
 /** A path with its existing ancestors resolved, so a symlinked temp root compares as the worktree does. */
 export function comparablePath(path: string): string {
   let current = resolve(path), suffix = "";
-  for (let step = 0; step < 64; step++) {
+  for (;;) {
     try {
       return join(realpathSync(current), suffix);
     } catch { /* not there yet: compare its nearest existing parent */ }
     const parent = dirname(current);
+    // The filesystem root ends the walk. A fixed step count would stop mid-path, and the caller would then compare a
+    // path spelled through a symlink with the resolved one - the mismatch this resolution exists to prevent.
     if (parent === current) break;
     suffix = suffix ? join(basename(current), suffix) : basename(current);
     current = parent;
@@ -183,7 +201,7 @@ export function ledgerPath(cwd: string, options: { home?: string } = {}): string
     // The probe failed where a `.git` exists, so this is a checkout whose root arev cannot read (dubious ownership, an
     // unreadable gitdir) and the containment check would be skipped rather than answered. A refusal there is the only
     // fail-closed read; the same empty probe outside any repository is the supported case, which stays readable.
-    throw new Refusal(`arev cannot read the worktree root of ${cwd}, so where the ledger lives cannot be checked`,
+    throw new Refusal(`arev cannot read the worktree root of ${shown(cwd)}, so where the ledger lives cannot be checked`,
       "run arev from inside the checkout and make sure git can read it (git status)");
   }
   return path;

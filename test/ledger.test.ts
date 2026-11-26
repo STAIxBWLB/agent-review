@@ -1,8 +1,8 @@
 import { afterEach, expect, test } from "bun:test";
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
-import { canonicalJson, ledgerPath, readLedger, recordId, Refusal, reviewProjectId, secretShaped, appendEvent, type LedgerEvent, type PacketBlock, type ReviewRecordV1 } from "../src/ledger.ts";
+import { canonicalJson, comparablePath, ledgerPath, readLedger, RECORD_EVENT_BOUND, recordId, Refusal, reviewProjectId, secretShaped, appendEvent, type LedgerEvent, type PacketBlock, type ReviewRecordV1 } from "../src/ledger.ts";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -167,7 +167,7 @@ test("an event over its own bound is refused, and the refusal names the event ty
       coverage: { reviewed: [], skipped: [{ path: "src/a.ts", reason: "x".repeat(2 * 1024 * 1024) }] },
       findings: [], verdict: "approved", call: { ok: true },
     },
-  }, { home })).toThrow("the record event exceeds 2097152 bytes");
+  }, { home })).toThrow(`the record event exceeds ${RECORD_EVENT_BOUND} bytes`);
   expect(existsSync(ledgerPath(repo, { home }))).toBe(false);
 });
 
@@ -195,9 +195,35 @@ test("a checkout whose worktree root cannot be read refuses the ledger rather th
   mkdirSync(deep, { recursive: true });
   expect(() => ledgerPath(deep, { home: join(root, "agenthub") }))
     .toThrow("so where the ledger lives cannot be checked");
+  // The refusal names that directory only when it may be shown: a secret-shaped segment makes it `<withheld>`, the same
+  // screen every other refusal value goes through.
+  const secret = join(root, "sk-abcdefghijklmnopqrstuvwx");
+  mkdirSync(secret);
+  writeFileSync(join(secret, ".git"), "gitdir: /nonexistent/gitdir\n");
+  let refusal = "";
+  try {
+    ledgerPath(secret, { home: join(root, "agenthub") });
+  } catch (error) {
+    refusal = (error as Refusal).message;
+  }
+  expect(refusal).toContain("arev cannot read the worktree root of <withheld>");
+  expect(refusal).not.toContain("abcdefghijklmnopqrstuvwx");
   const outside = join(root, "plain");
   mkdirSync(outside);
   expect(ledgerPath(outside, { home: join(root, "agenthub") })).toContain(join("review"));
+});
+
+test("a missing path below a symlinked ancestor is resolved however deep it is", () => {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), "arev-ledger-deep-")));
+  roots.push(base);
+  const real = join(base, "real"), alias = join(base, "alias");
+  mkdirSync(real);
+  symlinkSync(real, alias);
+  // Nothing below the alias exists yet - a ledger file's own path is the usual case - so the walk has to reach the alias
+  // itself. A fixed step count stops short and answers with the unresolved spelling, which is the mismatch between a
+  // path spelled through a link and the worktree root this resolution exists to prevent.
+  const below = Array.from({ length: 70 }, (_, index) => `d${index}`);
+  expect(comparablePath(join(alias, ...below))).toBe(join(real, ...below));
 });
 
 test("a repository without an origin keeps one ledger across its linked worktrees", () => {

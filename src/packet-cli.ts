@@ -2,6 +2,7 @@ import { closeSync, mkdirSync, openSync, rmdirSync, unlinkSync, writeFileSync } 
 import { dirname, resolve, sep } from "node:path";
 import { parseArgs } from "node:util";
 import { EXIT, errorLine } from "@staix/cli-output";
+import { deniedReportPath } from "./deny.ts";
 import { Refusal, appendEvent, comparablePath } from "./ledger.ts";
 import { buildPacket, packetBrief, packetResult, repositoryPath, type PacketBundle, type PacketRequest } from "./packet.ts";
 import { parseReviewMd, type ReviewMdSettings } from "./review-md.ts";
@@ -173,7 +174,14 @@ export function runRules(cwd: string, args: readonly string[]): void {
     throw new PacketUsageError("Specify paths with arev rules <path...> or arev rules check <path>.");
   }
   const { base, rules } = rulesForPaths(cwd, paths);
-  console.log(`Rules at merge base ${base}:\n\n${renderRules(rules, !check)}`);
+  // A denied path never reaches the rules, so the block says "(no reviewable paths)" and the reader cannot tell an
+  // unknown path from a withheld one. The line names the denial; it counts the paths instead of echoing them, because a
+  // supplied path is the caller's untrusted text and this is output.
+  const withheld = paths.filter(path => deniedReportPath(path)).length;
+  const denied = withheld === 0
+    ? []
+    : [`${withheld} supplied ${withheld === 1 ? "path is" : "paths are"} withheld as denied, so no rule applies to ${withheld === 1 ? "it" : "them"}.`];
+  console.log([`Rules at merge base ${base}:`, ...denied, renderRules(rules, !check)].join("\n\n"));
 }
 
 /** Resolve paths and read the trusted base rules for the CLI and MCP. */

@@ -154,9 +154,9 @@ test("a report that states accepted is refused from any caller, and false_positi
   for (const report of [accepted(), accepted({ rationale: "owner decision" })]) {
     expect(() => parseReviewRecord(report, options)).toThrow("findings[0] states accepted");
   }
-  // The refusal names the finding and the one command that states the disposition.
+  // The refusal names the finding and the one command that states the disposition, which needs a report of the id first.
   expect(nextOf(accepted({ rationale: "owner decision" })))
-    .toBe(`run arev resolve bugs:owner-risk --as accepted --rationale "<what was accepted>" from your own terminal`);
+    .toBe(`record the finding as open, then run arev resolve bugs:owner-risk --as accepted --rationale "<what was accepted>" from your own terminal`);
   expect(() => parseReviewRecord(reportFor(HEAD, { findings: [finding({ disposition: "false_positive" })] }), options))
     .toThrow("false_positive without evidence");
   expect(parseReviewRecord(reportFor(HEAD, { findings: [finding({ disposition: "false_positive", evidence: ["src/a.ts:12"] })] }), options)

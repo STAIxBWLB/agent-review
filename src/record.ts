@@ -212,9 +212,10 @@ export function parseReviewRecord(raw: unknown, options: RecordOptions): ReviewR
     const evidence = evidenceRows?.map((ref, position) => text(ref, MAX_REF, `${at}.evidence[${position}]`));
     if (disposition === "accepted") {
       // A recorded report never carries this, at a terminal or anywhere else: running `arev record` is not the person's
-      // decision, and `arev gate` reads the disposition this writes. Only `arev resolve --as accepted` states it.
+      // decision, and `arev gate` reads the disposition this writes. Only `arev resolve --as accepted` states it, and that
+      // command needs a report of the id first, so the next step starts by recording the finding as open.
       refuse(`${at} states accepted; accepted is the person's decision and is not a report's to make`,
-        `run arev resolve ${id} --as accepted --rationale "<what was accepted>" from your own terminal`);
+        `record the finding as open, then run arev resolve ${id} --as accepted --rationale "<what was accepted>" from your own terminal`);
     }
     if (disposition === "false_positive" && !evidence?.length) {
       refuse(`${at} is a false_positive without evidence`, "add evidence (path:line or a command's output) that settles it, or record it as open");

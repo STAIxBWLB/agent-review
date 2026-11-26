@@ -4,8 +4,12 @@
   "description": "Deterministic review tooling for coding agents",
   "type": "module",
   "license": "MIT",
-  "engines": { "bun": ">=1.4.4" },
-  "bin": { "arev": "./bin/arev.js" },
+  "engines": {
+    "bun": ">=1.4.4"
+  },
+  "bin": {
+    "arev": "./bin/arev.js"
+  },
   "files": ["bin", "src", "README.md", "LICENSE"],
   "scripts": {
     "check": "bun run typecheck && bun scripts/check-boundary.ts && bun scripts/gen-readme.ts --check && bun test",
@@ -17,6 +21,7 @@
     "@staix/mcp-stdio": "0.1.0"
   },
   "devDependencies": {
+    "@staix/agent-console": "0.2.0",
     "@types/bun": "1.4.4",
     "typescript": "5.9.3"
   }

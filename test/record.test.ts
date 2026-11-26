@@ -585,6 +585,20 @@ test("a secret-shaped report is refused before it is parsed, and its value reach
   expect(unevidenced.stderr).toContain("--as false_positive needs --evidence");
   expect(unevidenced.stderr).toContain("<withheld>");
   expect(unevidenced.stderr).not.toContain(secretId);
+  // The accepted refusal runs before the ledger is even read, so the guard on that line is the only thing between the
+  // command line and stderr.
+  const accepted = run(repo, home, "resolve", secretId, "--as", "accepted", "--rationale", "accepted by the person");
+  expect(accepted.code).toBe(1);
+  expect(accepted.stderr).toContain("accepted is the person's decision and is refused outside an interactive terminal");
+  expect(accepted.stderr).toContain("<withheld>");
+  expect(accepted.stderr).not.toContain(secretId);
+  // The path a refusal names is guarded the same way: a directory named like a credential would otherwise print through it.
+  const secretDir = join(root, secretId);
+  mkdirSync(secretDir, { recursive: true });
+  const missing = run(repo, home, "record", join(secretDir, "report.json"));
+  expect(missing.code).toBe(1);
+  expect(missing.stderr).toContain("cannot read the report <withheld>");
+  expect(missing.stderr).not.toContain(secretId);
 
   // A value the screen does not catch is still named by its type, never echoed, and the head must be a full OID.
   const plainHead = run(repo, home, "record", write("plain-head.json", reportFor(HEAD, { packet: { id: PACKET, subject: { head: "not-a-full-sha" } } })));

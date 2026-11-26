@@ -513,7 +513,7 @@ export function recordCommand(cwd: string, args: readonly string[]): number {
     try {
       source = readFileSync(file, "utf8");
     } catch {
-      throw new Refusal(`cannot read the report ${file}`, "pass the path of the report JSON you wrote");
+      throw new Refusal(`cannot read the report ${shown(file)}`, "pass the path of the report JSON you wrote");
     }
     if (Buffer.byteLength(source) > MAX_REPORT_BYTES) throw new Refusal(`the report ${shown(file)} exceeds ${MAX_REPORT_BYTES} bytes`, "shorten the report's text and retry");
     // A report is untrusted text and every refusal below can name a value out of it, so the file is screened before it is
@@ -607,7 +607,7 @@ export function resolveCommand(cwd: string, args: readonly string[]): number {
     const evidence = (parsed.flags["--evidence"] ?? []).map((ref, index) => cliText(ref, MAX_REF, `--evidence[${index}]`));
     const rationale = parsed.flags["--rationale"]?.at(-1);
     if (as === "accepted" && !interactive()) {
-      throw new Refusal("accepted is the person's decision and is refused outside an interactive terminal", `run arev resolve ${id} --as accepted --rationale "<what was accepted>" from your own terminal`);
+      throw new Refusal("accepted is the person's decision and is refused outside an interactive terminal", `run arev resolve ${shown(id)} --as accepted --rationale "<what was accepted>" from your own terminal`);
     }
     if (as === "accepted" && rationale === undefined) throw new Refusal("--as accepted needs --rationale", `pass --rationale "<what was accepted>"`);
     if (as === "false_positive" && evidence.length === 0) {

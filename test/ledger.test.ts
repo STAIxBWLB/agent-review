@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { canonicalJson, ledgerPath, readLedger, recordId, Refusal, reviewProjectId, secretShaped, appendEvent, type LedgerEvent, type ReviewRecordV1 } from "../src/ledger.ts";
 
 const roots: string[] = [];
@@ -54,6 +54,30 @@ test("the ledger lives under AGENTHUB_HOME/review/<project-id>/ and never in the
   expect(ledgerPath(repo, { home })).toBe(join(home, "review", "github.com/owner/repo", "ledger.jsonl"));
   expect(() => ledgerPath(repo, { home: join(repo, "ledger-home") })).toThrow(Refusal);
   expect(() => ledgerPath(repo, { home: join(repo, "ledger-home") })).toThrow("AGENTHUB_HOME resolves inside the reviewed worktree");
+});
+
+test("the project key and the worktree check follow the reviewed checkout, not an inherited GIT_DIR", () => {
+  const { repo } = fixture();
+  // A second repository, named by GIT_DIR/GIT_WORK_TREE as a submodule or a hook would: the ledger must still describe
+  // the checkout `arev packet` describes, or the containment rule is checked against the wrong tree.
+  const other = join(dirname(repo), "other");
+  mkdirSync(other);
+  git(other, ["init", "-q", "-b", "main"]);
+  git(other, ["remote", "add", "origin", "https://github.com/other/repo.git"]);
+  git(repo, ["remote", "add", "origin", "https://github.com/owner/repo.git"]);
+  const previous = { GIT_DIR: process.env.GIT_DIR, GIT_WORK_TREE: process.env.GIT_WORK_TREE };
+  try {
+    process.env.GIT_DIR = join(other, ".git");
+    process.env.GIT_WORK_TREE = other;
+    expect(reviewProjectId(repo)).toBe("github.com/owner/repo");
+    expect(() => ledgerPath(repo, { home: join(repo, "ledger-home") })).toThrow("AGENTHUB_HOME resolves inside the reviewed worktree");
+    expect(ledgerPath(repo, { home: join(dirname(repo), "agenthub") })).toContain(join("review", "github.com", "owner", "repo"));
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
 });
 
 test("events are appended one JSON line each and an earlier line is never rewritten", () => {

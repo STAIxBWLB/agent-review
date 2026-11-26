@@ -10,7 +10,7 @@ import { createHash } from "node:crypto";
 import { appendFileSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
-import { memoryGitSync } from "@staix/agent-mem/platform";
+import { reviewGit } from "./review-git.ts";
 
 /** A refusal a person or agent can act on: the cause, and the command, setting or file that fixes it. */
 export class Refusal extends Error {
@@ -84,8 +84,12 @@ const SECRETS = [/-----BEGIN [A-Z ]*PRIVATE KEY-----/, /\bAKIA[0-9A-Z]{16}\b/, /
 export const secretShaped = (text: string): boolean => SECRETS.some(re => re.test(text));
 
 const MAX_EVENT_BYTES = 256 * 1024;
+/**
+ * Ledger reads go through `reviewGit`, so they describe the same checkout the packet does: an inherited `GIT_DIR` or
+ * `GIT_WORK_TREE` would key the ledger to one repository while `arev packet` built a packet for another.
+ */
 const git = (cwd: string, args: string[]): string | undefined => {
-  const result = memoryGitSync(["-C", cwd, ...args], { encoding: "utf8", timeout: 5000 });
+  const result = reviewGit(cwd, args, { literalPathspecs: false });
   return result.status === 0 ? result.stdout.trim() : undefined;
 };
 
@@ -121,7 +125,7 @@ export function reviewProjectId(cwd: string): string {
 export const reviewHome = (home?: string): string => resolve(home ?? (process.env.AGENTHUB_HOME?.trim() || join(homedir(), ".agenthub")));
 
 /** A path with its existing ancestors resolved, so a symlinked temp root compares as the worktree does. */
-function comparable(path: string): string {
+export function comparablePath(path: string): string {
   let current = resolve(path), suffix = "";
   for (let step = 0; step < 64; step++) {
     try {
@@ -151,8 +155,8 @@ export function ledgerPath(cwd: string, options: { home?: string } = {}): string
   }
   const top = git(cwd, ["rev-parse", "--show-toplevel"]);
   if (top) {
-    const root = comparable(top), inside = (candidate: string) => candidate === root || candidate.startsWith(root + sep);
-    if (inside(comparable(path)) || inside(comparable(home))) {
+    const root = comparablePath(top), inside = (candidate: string) => candidate === root || candidate.startsWith(root + sep);
+    if (inside(comparablePath(path)) || inside(comparablePath(home))) {
       throw new Refusal(`AGENTHUB_HOME resolves inside the reviewed worktree (${home}); the ledger is never kept there`,
         `set AGENTHUB_HOME to a directory outside ${top}`);
     }

@@ -93,6 +93,46 @@ test("the project key and the worktree check follow the reviewed checkout, not a
   }
 });
 
+test("a packet event at the 500-file ceiling fits its own bound, which the record-sized one would refuse", () => {
+  const { repo, home } = fixture();
+  // The largest packet a supported subject builds: 500 units with 160-byte paths, and three rules that each applied to
+  // all of them (REVIEW.md plus two rule files under it), which is what `MAX_FILES` in src/packet.ts allows.
+  const unitPath = (index: number) => `src/${String(index).padStart(3, "0")}/${"d".repeat(151)}.ts`;
+  const units = Array.from({ length: 500 }, (_, index) => ({ path: unitPath(index), status: "M", insertions: 12, deletions: 3 }));
+  const rules = ["REVIEW.md", "docs/review.md", ".github/review.md"].map(name => ({ name, sha256: "e".repeat(64), appliesTo: units.map(unit => unit.path) }));
+  appendEvent(repo, {
+    v: 1, type: "packet", at: "2026-11-26T00:00:00.000Z", review: { advisory_cap: 5 },
+    packet: { id: "d".repeat(64), subject: { kind: "range", base: HEAD, head: "b".repeat(40), mergeBase: HEAD }, units, rules },
+  }, { home });
+  const line = readFileSync(ledgerPath(repo, { home }), "utf8").trim();
+  // Over the bound every other event keeps and under the packet one: this is the size a supported subject reaches.
+  expect(Buffer.byteLength(line)).toBeGreaterThan(256 * 1024);
+  expect(Buffer.byteLength(line)).toBeLessThan(1024 * 1024);
+});
+
+test("an event over its own bound is refused, and the refusal names the event type", () => {
+  const { repo, home } = fixture();
+  expect(() => appendEvent(repo, resolveEvent("x".repeat(300 * 1024)), { home })).toThrow("the resolve event exceeds 262144 bytes");
+  // The larger bound is the packet event's alone.
+  expect(() => appendEvent(repo, {
+    v: 1, type: "packet", at: "2026-11-26T00:00:00.000Z",
+    packet: { id: "d".repeat(64), subject: { kind: "range", base: HEAD, head: HEAD, mergeBase: HEAD }, units: [{ path: "x".repeat(1024 * 1024) }] },
+  }, { home })).toThrow("the packet event exceeds 1048576 bytes");
+  expect(existsSync(ledgerPath(repo, { home }))).toBe(false);
+});
+
+test("a repository without an origin keeps one ledger across its linked worktrees", () => {
+  const { repo } = fixture();
+  git(repo, ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "base"]);
+  const linked = join(dirname(repo), "linked");
+  git(repo, ["worktree", "add", "-q", linked]);
+  expect(git(repo, ["remote"])).toBe("");
+  // The common git dir is the same in every worktree, so both checkouts key the same ledger; the worktree root alone
+  // would give each its own.
+  expect(reviewProjectId(linked)).toBe(reviewProjectId(repo));
+  expect(reviewProjectId(repo)).toMatch(/^repo@[a-f0-9]{8}$/);
+});
+
 test("events are appended one JSON line each and an earlier line is never rewritten", () => {
   const { repo, home } = fixture();
   const path = ledgerPath(repo, { home });

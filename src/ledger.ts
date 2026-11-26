@@ -85,6 +85,13 @@ export const secretShaped = (text: string): boolean => SECRETS.some(re => re.tes
 
 const MAX_EVENT_BYTES = 256 * 1024;
 /**
+ * A packet event is larger than any other by construction: one unit per changed file plus, per rule, the paths that
+ * rule applied to. The 500-file ceiling (`MAX_FILES` in `src/packet.ts`) with 160-byte paths and three rules covering
+ * them measures about 360 KB, so the packet event has the bound that ceiling needs and the others keep the smaller one.
+ */
+const MAX_PACKET_EVENT_BYTES = 1024 * 1024;
+const eventCap = (type: LedgerEvent["type"]): number => type === "packet" ? MAX_PACKET_EVENT_BYTES : MAX_EVENT_BYTES;
+/**
  * Ledger reads go through `reviewGit`, so they describe the same checkout the packet does: an inherited `GIT_DIR` or
  * `GIT_WORK_TREE` would key the ledger to one repository while `arev packet` built a packet for another.
  */
@@ -114,13 +121,13 @@ export function reviewProjectId(cwd: string): string {
   // Whitespace around a URL is not part of it, so the one value that is trimmed is this one; a path is never trimmed.
   const normalized = origin ? normalizeOrigin(origin.trim()) : undefined;
   if (normalized) return normalized;
-  const top = git(cwd, ["rev-parse", "--show-toplevel"]);
-  let root = cwd;
-  try {
-    root = top ? realpathSync(top) : realpathSync(cwd);
-  } catch {
-    root = top ?? resolve(cwd);
-  }
+  // Linked worktrees of one repository share `--git-common-dir`, and a key hashed from the worktree root gave each of
+  // them its own ledger, so one repository reviewed from two worktrees had two halves of one history. A common dir named
+  // `.git` makes its parent the working root, which every worktree of that repository agrees on - the resolution
+  // agent-mem's own project key uses. The common dir is printed relative to `cwd`, so it is resolved before it is read.
+  const common = git(cwd, ["rev-parse", "--git-common-dir"]);
+  const shared = common === undefined ? undefined : comparablePath(resolve(cwd, common));
+  const root = shared === undefined ? comparablePath(cwd) : basename(shared) === ".git" ? dirname(shared) : shared;
   return `${basename(root)}@${createHash("sha256").update(root).digest("hex").slice(0, 8)}`;
 }
 
@@ -182,7 +189,8 @@ export function* stringsIn(value: unknown): Generator<string> {
 /** One line per event, appended. The file is never rewritten, truncated or reordered. */
 export function appendEvent(cwd: string, event: LedgerEvent, options: { home?: string } = {}): void {
   const line = JSON.stringify(event);
-  if (Buffer.byteLength(line) > MAX_EVENT_BYTES) throw new Refusal(`the ${event.type} event exceeds ${MAX_EVENT_BYTES} bytes; shorten its text`, "arev show");
+  const cap = eventCap(event.type);
+  if (Buffer.byteLength(line) > cap) throw new Refusal(`the ${event.type} event exceeds ${cap} bytes; shorten its text`, "arev show");
   // A tab or newline inside a string becomes the two characters `\t` / `\n` in the line, so an assignment the pattern
   // needs whitespace for (`token<TAB>: <value>`) stops matching there. Every string is screened as it was written, and
   // the line as well: serialization also joins a key to its value.

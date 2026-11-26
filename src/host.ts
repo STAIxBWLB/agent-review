@@ -69,6 +69,9 @@ export function chooseHost(pr: number, implementer: string, available: ReadonlyS
 /** Whether `cli` is an executable file in one of the PATH directories, as a shell would run it. */
 export function onPath(cli: string, pathEnv: string): boolean {
   for (const directory of pathEnv.split(delimiter)) {
+    // An empty component means the current directory to a shell and to `which`, and this process runs inside the
+    // reviewed checkout: a `codex` planted there would be resolved and started. So an empty component is skipped,
+    // which is a deliberate difference from the shell rather than an oversight.
     if (!directory) continue;
     const candidate = join(directory, cli);
     try {
@@ -136,7 +139,8 @@ function ids(values: readonly string[] | undefined): string[] {
  * that would otherwise parse the lines.
  */
 export function hostCommand(_cwd: string, args: readonly string[]): number {
-  const usage = "Choose arev host --pr N --implementer ID [--hosts LIST] [--unavailable ID...] [--json].";
+  const usage = "Choose arev host --pr N --implementer ID [--hosts LIST] [--unavailable ID]... [--json]. "
+    + "Repeat --unavailable once per host, or comma-separate its ids; a bare second id is a positional and is refused.";
   const options = { pr: { type: "string" }, implementer: { type: "string" }, hosts: { type: "string", multiple: true },
     unavailable: { type: "string", multiple: true }, json: { type: "boolean" } } as const;
   let parsed;
@@ -173,17 +177,20 @@ export function hostCommand(_cwd: string, args: readonly string[]): number {
   const available = availableHosts(unavailable, process.env.PATH ?? "", order);
   const choice = chooseHost(Number(pr), implementer, available, order);
   const model = choice.host === undefined ? undefined : modelOf(choice.host, process.env.HOME ?? homedir());
+  // One instruction, two surfaces: `--json` carries it as `next` and the text branch prints it, so an agent reading the
+  // JSON learns the same step as a person reading the lines (issue #32).
+  const next = choice.host === undefined
+    ? `put one of ${order.join(", ")} on PATH and drop it from --unavailable, then run arev host again`
+    : undefined;
 
   if (values.json) {
-    console.log(JSON.stringify({ ...choice, ...(model === undefined ? {} : { model }) }, null, 2));
+    console.log(JSON.stringify({ ...choice, ...(model === undefined ? {} : { model }), ...(next === undefined ? {} : { next }) }, null, 2));
   } else {
     console.log(`host: ${choice.host ?? "none"}`);
     if (model !== undefined) console.log(`model: ${model}`);
     console.log(`reason: ${choice.reason}`);
     for (const item of choice.considered) console.log(`  ${item.host}: ${item.skipped}`);
-    if (choice.host === undefined) {
-      console.log(`next: put one of ${order.join(", ")} on PATH and drop it from --unavailable, then run arev host again`);
-    }
+    if (next !== undefined) console.log(`next: ${next}`);
   }
   return choice.host === undefined ? EXIT.fail : EXIT.ok;
 }

@@ -63,14 +63,20 @@ the implementer is skipped. A host whose CLI is not on `PATH`, or one named to
 last one left, as `same-family fallback`, so a review never runs on the AI that
 wrote the change unless nothing else can run.
 
+`--unavailable` and `--hosts` are list flags: give the flag once per id
+(`--unavailable kimi --unavailable claude`) or comma-separate the ids
+(`--unavailable kimi,claude`). A bare second id is a positional and is refused,
+so the flag itself has to repeat.
+
 The model is the `model` key of `~/.codex/config.toml`, the `default_model` key
 of `~/.kimi-code/config.toml`, and `unknown` for every other host. Only that
 key's value reaches the answer. A value that is not a plain name reads as
 `unknown` as well, and so does a config TOML itself does not accept; the command
 reads no repository and writes no ledger.
 
-`--json` prints `host`, `model`, `reason` and `considered`. When no host can run,
-it exits nonzero and names the next step.
+`--json` prints `host`, `model`, `reason`, `considered` and, when no host can
+run, `next` with the same instruction the lines carry. When no host can run it
+exits nonzero either way.
 
 ## Import and export
 

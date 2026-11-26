@@ -14,7 +14,7 @@ import { EXIT, errorLine } from "@staix/cli-output";
 import { parseReviewAnchor, reviewAnchorErrorMessage, type ReviewAnchor } from "./anchor.ts";
 import { blocksApproval, findingTally, findingsForHead, positionalFindingId, type ReviewFinding, type ReviewFindingSet, type ReviewFindingTally } from "./findings.ts";
 import { sanitize } from "./frame.ts";
-import { Refusal, appendEvent, readLedger, recordId, reviewProjectId, type LedgerEvent, type PacketBlock, type RecordFinding, type ReviewRecordV1 } from "./ledger.ts";
+import { Refusal, appendEvent, readLedger, recordId, reviewProjectId, secretShaped, type LedgerEvent, type PacketBlock, type RecordFinding, type ReviewRecordV1 } from "./ledger.ts";
 import { buildPacket, type PacketRequest } from "./packet.ts";
 
 /** The spec's default advisory cap; a packet event may carry REVIEW.md's value as `review.advisory_cap`. */
@@ -30,6 +30,18 @@ function refuse(message: string, next: string): never {
   throw new Refusal(message, next);
 }
 
+const FULL_OID = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
+/** The JSON type of a report value: what a refusal says when it may not say the value itself. */
+const jsonType = (value: unknown): string =>
+  value === null ? "null" : Array.isArray(value) ? "an array" : typeof value;
+/**
+ * The only report text a refusal echoes: a plain identifier in the finding-id charset that matches no secret pattern. A
+ * report is untrusted data and stderr is output, so any other value is named by its type instead (AGENTS.md: never
+ * write a secret value to output).
+ */
+const echoName = (value: unknown): string =>
+  typeof value === "string" && /^[A-Za-z0-9._:-]{1,96}$/.test(value) && !secretShaped(value) ? value : jsonType(value);
+
 /** A plain own-data object with only the named fields: accessors, proxies, hidden fields and inherited keys are refused. */
 function closed(raw: unknown, fields: readonly string[], what: string): Record<string, unknown> | undefined {
   if (!raw || typeof raw !== "object" || Array.isArray(raw) || types.isProxy(raw)
@@ -37,7 +49,7 @@ function closed(raw: unknown, fields: readonly string[], what: string): Record<s
   const descriptors = Object.getOwnPropertyDescriptors(raw);
   if (Object.values(descriptors).some(field => !Object.hasOwn(field, "value") || !field.enumerable)) return undefined;
   if (Object.keys(descriptors).some(key => !fields.includes(key))) {
-    refuse(`${what} has an unknown field (${Object.keys(descriptors).filter(key => !fields.includes(key)).join(", ")})`,
+    refuse(`${what} has an unknown field (${Object.keys(descriptors).filter(key => !fields.includes(key)).map(echoName).join(", ")})`,
       `use only: ${fields.join(", ")}`);
   }
   return raw as Record<string, unknown>;
@@ -114,7 +126,7 @@ export function parseReviewRecord(raw: unknown, options: RecordOptions): ReviewR
   if (!Number.isSafeInteger(cap) || cap < 0 || cap > MAX_FINDINGS) refuse(`the advisory cap ${cap} is not an integer in 0-${MAX_FINDINGS}`, "fix review.advisory_cap in the packet, or omit it for the default 5");
   const row = closed(raw, RECORD_FIELDS, "the report");
   if (!row) refuse("the report must be a plain JSON object with own data fields only", "write the report as JSON with no accessors, prototypes or hidden fields");
-  if (row.v !== 1) refuse(`the report's v is ${JSON.stringify(row.v)}; this arev reads v: 1`, "set v to 1 in the report");
+  if (row.v !== 1) refuse(`the report's v must be the number 1 (got ${jsonType(row.v)}); this arev reads v: 1`, "set v to 1 in the report");
 
   const claim = row.packet;
   const declaredId = own(claim, "id"), declaredHead = own(own(claim, "subject"), "head");
@@ -130,7 +142,7 @@ export function parseReviewRecord(raw: unknown, options: RecordOptions): ReviewR
   const declaredImplementer = optionalText(reviewerRow, "implementer", MAX_NAME, "reviewer.implementer");
   const flaggedImplementer = options.implementer === undefined ? undefined : cliText(options.implementer, MAX_NAME, "--implementer");
   if (declaredImplementer !== undefined && flaggedImplementer !== undefined && declaredImplementer !== flaggedImplementer) {
-    refuse(`--implementer ${flaggedImplementer} disagrees with the report's reviewer.implementer ${declaredImplementer}`,
+    refuse(`--implementer ${flaggedImplementer} disagrees with the report's reviewer.implementer ${echoName(declaredImplementer)}`,
       "drop one of them; --implementer overrides only when the report states none");
   }
   if (typeof reviewerRow.sameFamilyFallback !== "boolean") refuse("reviewer.sameFamilyFallback must be true or false", "set it in the report: true when the reviewer is the implementer's family and the gate may allow it");
@@ -173,10 +185,10 @@ export function parseReviewRecord(raw: unknown, options: RecordOptions): ReviewR
     if (!finding) refuse(`${at} must be a plain object with only ${FINDING_FIELDS.join(", ")}`, `correct ${at} in the report`);
     const id = text(finding.id, MAX_ID, `${at}.id`);
     if (!/^[A-Za-z0-9._:-]+$/.test(id)) refuse(`${at}.id must match ^[A-Za-z0-9._:-]{1,96}$`, "use a semantic id such as compliance:unpinned-dependency");
-    if (ids.has(id)) refuse(`${at}.id ${id} repeats an earlier finding's id`, "give each finding its own id");
+    if (ids.has(id)) refuse(`${at}.id ${echoName(id)} repeats an earlier finding's id`, "give each finding its own id");
     ids.add(id);
     if (positionalFindingId(id)) {
-      refuse(`${at}.id ${id} is a positional label, which names a different finding on every review`,
+      refuse(`${at}.id ${echoName(id)} is a positional label, which names a different finding on every review`,
         "rename it to a semantic id (the defect, not its number), such as security:denied-path-in-brief");
     }
     const path = optionalText(finding, "path", MAX_PATH, `${at}.path`, "path");
@@ -322,12 +334,16 @@ export function ledgerEventsView(events: readonly LedgerEvent[], head?: string):
     ...(latest.get(finding.id)?.text === undefined ? {} : { text: latest.get(finding.id)!.text }),
     ...(evidence.has(finding.id) ? { evidence: evidence.get(finding.id)! } : {}),
   }));
-  const subject = packetEvent?.type === "packet" ? packetEvent.packet.subject : undefined;
+  // A record's own packet is the one its report was validated against, so it wins over the newest packet event for the
+  // head: a later packet (a re-run, a new base) describes a review this head's record never saw.
+  const recordedPacket = recordEvent?.type === "record" ? recordEvent.record.packet : undefined;
+  const subject = recordedPacket?.subject ?? (packetEvent?.type === "packet" ? packetEvent.packet.subject : undefined);
+  const packetId = recordedPacket?.id ?? (packetEvent?.type === "packet" ? packetEvent.packet.id : undefined);
   return {
     ...(target === undefined ? {} : { head: target }),
     ...(typeof subject?.base === "string" ? { base: subject.base } : {}),
     ...(typeof subject?.mergeBase === "string" ? { mergeBase: subject.mergeBase } : {}),
-    ...(packetEvent?.type === "packet" ? { packet: packetEvent.packet.id } : {}),
+    ...(packetId === undefined ? {} : { packet: packetId }),
     ...(recordEvent?.type === "record" ? { record: recordEvent.id } : {}),
     ...(recordEvent?.type === "record" ? { verdict: recordEvent.record.verdict, call: recordEvent.record.call } : {}),
     findings,
@@ -392,8 +408,10 @@ export function recordCommand(cwd: string, args: readonly string[]): number {
       throw new Refusal(`${file} is not valid JSON`, "fix the report file and run arev record again");
     }
     const head = own(own(own(raw, "packet"), "subject"), "head");
-    if (typeof head !== "string" || !head) {
-      throw new Refusal(`the report ${file} has no packet.subject.head`, "write the report from the packet.json arev wrote: arev packet --pr N --out DIR");
+    // The head is checked before it is ever echoed: it is report text, and the refusals below print it.
+    if (typeof head !== "string" || !FULL_OID.test(head)) {
+      throw new Refusal(`the report ${file} has no full commit SHA at packet.subject.head`,
+        "write the report from the packet.json arev wrote: arev packet --pr N --out DIR");
     }
     const events = readLedger(cwd);
     const packetEvent = [...events].reverse().find(event => event.type === "packet" && event.packet.subject.head === head);

@@ -139,10 +139,27 @@ test("denied finding paths are rejected after normalization, leaving the ledger 
   const before = readFileSync(ledger);
   const report = load("ocr");
   const findings = report.findings as Record<string, unknown>[];
-  for (const location of [{ path: " .env " }, { path: "./.env" }, { path: undefined, location: " ./private.key :1" }]) {
+  for (const location of [{ path: " .env " }, { path: "./.env" }, { path: ".ENV" }, { path: ".ＥＮＶ" },
+    { path: undefined, location: " ./private.key :1" }]) {
     const result = ingest("ocr", { ...report, findings: [{ ...findings[0], ...location }] });
     expect(result.status).toBe(1);
     expect(result.stderr).toMatch(/denied path|path is invalid or denied/);
     expect(readFileSync(ledger)).toEqual(before);
   }
+});
+
+test("compound credential keys in hub arguments are refused before they enter the ledger", () => {
+  const { dir, home, ingest, load, cli } = exchangeFixture();
+  const ledger = ledgerPath(dir, { home });
+  const before = readFileSync(ledger);
+  const report = load("hub");
+  const hub = report.hub_review as Record<string, unknown>;
+  for (const key of ["client_secret", "clientSecret", "private_key"]) {
+    const rejected = ingest("hub", { ...report, hub_review: { ...hub, [key]: "dummy-canary-value" } });
+    expect(rejected.status).toBe(1);
+    expect(rejected.stderr).toContain("credential field");
+    expect(rejected.stderr).not.toContain("dummy-canary-value");
+    expect(readFileSync(ledger)).toEqual(before);
+  }
+  expect(cli("export", "--to", "hub").status).toBe(1);
 });

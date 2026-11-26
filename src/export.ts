@@ -21,24 +21,24 @@ function hubFinding(finding: RecordFinding, effective?: EffectiveFinding) {
   };
 }
 
-function exportHub(event: RecordEvent, events: LedgerEvent[], view: ReviewView): unknown {
+function exportHub(event: RecordEvent, view: ReviewView): unknown {
   const { record, source } = event;
   const original = source?.format === "hub" ? source.report.hub_review : undefined;
+  const effective = new Map(view.findings.map(finding => [finding.id, finding]));
   if (original && typeof original === "object" && !Array.isArray(original)) {
-    const changes = events.slice(events.lastIndexOf(event) + 1).filter(item =>
-      item.type === "resolve" && item.head === record.packet.subject.head && item.pr === record.packet.subject.pr);
-    if (!changes.length) return original;
     const args = original as Record<string, unknown>;
-    if (Array.isArray(args.findings)) {
-      return { ...args, findings: args.findings.map(item => {
-        const changed = changes.findLast(change => change.type === "resolve" && change.finding === item?.id);
-        return changed?.type === "resolve" ? {
-          ...item, disposition: changed.as,
-          ...(changed.rationale === undefined ? {} : { rationale: changed.rationale }),
-        } : item;
-      }) };
-    }
-    return original;
+    if (!Array.isArray(args.findings)) return original;
+    const baseline = new Map(record.findings.map(finding => [finding.id, finding]));
+    return { ...args, findings: args.findings.map(item => {
+      const previous = baseline.get(item?.id);
+      const current = effective.get(item?.id);
+      if (!previous || !current ||
+          (previous.disposition === current.disposition && previous.rationale === current.rationale)) return item;
+      return {
+        ...item, disposition: current.disposition,
+        ...(current.rationale === undefined ? {} : { rationale: current.rationale }),
+      };
+    }) };
   }
 
   const sourceNote = source?.report.note;
@@ -46,8 +46,7 @@ function exportHub(event: RecordEvent, events: LedgerEvent[], view: ReviewView):
     ...(typeof sourceNote === "string" ? [sourceNote] : []),
     ...record.findings.map(finding => `${finding.id}: ${finding.text}`),
   ].join("\n") || `Review recorded for ${record.packet.subject.head}.`;
-  const findings = record.findings.map(finding => hubFinding(finding,
-    view.findings.find(effective => effective.id === finding.id)));
+  const findings = record.findings.map(finding => hubFinding(finding, effective.get(finding.id)));
   return { verdict: record.verdict, note, coverage: record.coverage, findings };
 }
 
@@ -108,12 +107,12 @@ export function exportCommand(cwd: string, args: readonly string[]): void {
   }
   const events = readLedger(cwd);
   const head = values.head === undefined ? undefined : commitOid(cwd, values.head);
-  const view = ledgerEventsView(events, head);
+  const view = ledgerEventsView(events, head, undefined, { includeSettled: values.to === "hub" });
   const event = events.findLast((item): item is RecordEvent =>
     item.type === "record" && item.id === view.record && item.record.packet.subject.head === view.head);
   if (!event) throw new Error("No review record matches the head. Import or record a review first.");
   if (values.to === "hub") {
-    const output = exportHub(event, events, view);
+    const output = exportHub(event, view);
     assertSafeExchange(output);
     console.log(JSON.stringify(output, null, 2));
   } else {

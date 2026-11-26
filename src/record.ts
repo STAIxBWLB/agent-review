@@ -13,6 +13,7 @@ import { types } from "node:util";
 import { EXIT, errorLine } from "@staix/cli-output";
 import { parseReviewAnchor, reviewAnchorErrorMessage, type ReviewAnchor } from "./anchor.ts";
 import { blocksApproval, findingTally, findingsForHead, positionalFindingId, type ReviewFinding, type ReviewFindingSet, type ReviewFindingTally } from "./findings.ts";
+import { deniedReportPath } from "./deny.ts";
 import { sanitize } from "./frame.ts";
 import { MAX_REPORT_BYTES, Refusal, appendEvent, readLedger, recordId, reviewProjectId, secretShaped, shown, stringsIn, type LedgerEvent, type PacketBlock, type RecordFinding, type ReviewRecordV1 } from "./ledger.ts";
 import { buildPacket, type PacketRequest } from "./packet.ts";
@@ -112,6 +113,7 @@ function text(raw: unknown, max: number, field: string, kind: "text" | "path" = 
   const trimmed = raw.trim();
   if (!trimmed || Buffer.byteLength(trimmed) > max) return refuse(`${field} must be 1-${max} UTF-8 bytes`, fix);
   if (kind === "path" && /[\p{Cc}\p{Cf}\\]/u.test(trimmed)) return refuse(`${field} must be a repository-relative path without control characters`, fix);
+  if (kind === "path" && deniedReportPath(trimmed)) return refuse(`${field} is a denied repository path`, fix);
   const clean = sanitize(trimmed);
   if (Buffer.byteLength(clean) > max) return refuse(`${field} exceeds ${max} UTF-8 bytes after framing`, fix);
   return clean;
@@ -475,7 +477,9 @@ function inThread(subjectThread: number | undefined, subjectHead: string, thread
  * head it was recorded at, carrying the severity and term of the latest report of it, so settling a blocking finding once
  * settles it for later heads of the same PR too. A resolve naming an id no report of the thread carried is ignored.
  */
-export function ledgerEventsView(events: readonly LedgerEvent[], head?: string, pr?: ThreadSelector): ReviewView {
+export function ledgerEventsView(
+  events: readonly LedgerEvent[], head?: string, pr?: ThreadSelector, options: { includeSettled?: boolean } = {},
+): ReviewView {
   // `--pr N` without `--head` reads that PR's newest review: a caller that knows the thread need not name a head, and a
   // head two PRs share cannot answer for both. `--pr none` is a thread too - the one with no PR - so it is `null` here
   // rather than `undefined`, which means "no thread named, take any".
@@ -538,7 +542,7 @@ export function ledgerEventsView(events: readonly LedgerEvent[], head?: string, 
     }
   }
 
-  const findings = findingsForHead(sets, target).map(finding => {
+  const findings = findingsForHead(sets, target, options.includeSettled).map(finding => {
     // The lifecycle merges a carried id across every record, so its path and anchor can describe a later head than the
     // one shown. Path, anchor and text all come from the last record at or before this head, like the evidence beside
     // them; only the disposition comes from the replay.

@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 import { posix, resolve, win32 } from "node:path";
 import { parseArgs } from "node:util";
-import { isDenied } from "@staix/agent-mem/platform";
+import { deniedReportPath, foldPathSegment } from "./deny.ts";
 import { appendEvent, readLedger, recordId, Refusal, secretShaped, shown, type LedgerEvent, type ReviewSource } from "./ledger.ts";
 import { PacketUsageError } from "./packet-cli.ts";
 import { parseReviewRecord, requireCurrentPacket } from "./record.ts";
@@ -10,7 +10,8 @@ import { parseReviewRecord, requireCurrentPacket } from "./record.ts";
 type Row = Record<string, unknown>;
 const SHA = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const MAX_SOURCE_BYTES = 128 * 1024;
-const SENSITIVE_KEY = /^(?:password|passwd|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|token|authorization|credential)s?$/i;
+const SENSITIVE_KEY = /secret|password|passwd|token|apikey|privatekey|credential|auth/;
+const credentialKey = (key: string) => SENSITIVE_KEY.test(foldPathSegment(key).replace(/[_-]/g, ""));
 
 function invalid(message: string): never {
   throw new Refusal(shown(message), "correct the input report and run arev import again");
@@ -26,22 +27,17 @@ function requireRows(raw: unknown, field: string): unknown[] {
   return raw;
 }
 
-/** Apply the record reader's trim before checking the equivalent repository-relative path. */
-function deniedExchangePath(value: string): boolean {
-  return isDenied(posix.normalize(value.trim()));
-}
-
 export function assertSafeExchange(value: unknown): void {
   const pending = [value];
   while (pending.length > 0) {
     const item = pending.pop();
     if (typeof item === "string") {
-      if (secretShaped(item) || deniedExchangePath(item)) {
+      if (secretShaped(item) || deniedReportPath(item)) {
         throw new Error("The review exchange contains a denied path or secret-shaped value. Remove it before exchanging the report.");
       }
     } else if (item && typeof item === "object") {
       for (const [key, entry] of Object.entries(item)) {
-        if (SENSITIVE_KEY.test(key) && entry != null && entry !== "") {
+        if (credentialKey(key) && entry != null && entry !== "") {
           throw new Error("The review exchange contains a credential field. Remove it before exchanging the report.");
         }
         pending.push(key, entry);
@@ -142,7 +138,7 @@ function mapFinding(raw: unknown, format: ReviewSource["format"]): Row {
   const text = item.text ?? item.content ?? item.title ?? item.description ??
     (format === "hub" ? item.rationale ?? item.id : undefined);
   if (typeof text !== "string" || !text.trim()) invalid("A finding needs a description");
-  if (path !== undefined && (typeof path !== "string" || !path || deniedExchangePath(path) ||
+  if (path !== undefined && (typeof path !== "string" || !path || deniedReportPath(path) ||
       posix.isAbsolute(path) || win32.isAbsolute(path) || path.split("/").includes(".."))) {
     invalid("A finding path is invalid or denied");
   }

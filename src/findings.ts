@@ -146,7 +146,9 @@ function merged(prior: ReviewFinding | undefined, item: ReviewFinding): ReviewFi
  * Nits belong only to their head bucket, including the explicit undefined bucket.
  * Open Important is an obligation across heads until an explicit disposition resolves its ID globally.
  */
-export function findingsForHead(sets: readonly ReviewFindingSet[], head?: string): ReviewFinding[] {
+export function findingsForHead(
+  sets: readonly ReviewFindingSet[], head?: string, includeSettled = false,
+): ReviewFinding[] {
   interface Entry { item: ReviewFinding; order: number }
   const current = new Map<string, Entry>(), important = new Map<string, Entry>();
   let order = 0;
@@ -166,7 +168,10 @@ export function findingsForHead(sets: readonly ReviewFindingSet[], head?: string
     else {
       const seen = current.get(key);
       // Settling on B also settles older A when A is queried again. A later new nit/open remains a head-local nit.
-      if (seen?.item.disposition === "open" && seen.order <= entry.order) current.delete(key);
+      if (seen?.item.disposition === "open" && seen.order <= entry.order) {
+        if (includeSettled) current.set(key, entry);
+        else current.delete(key);
+      }
     }
   }
   return [...current.values()].map(entry => ({ ...entry.item }));

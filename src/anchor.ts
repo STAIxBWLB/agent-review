@@ -1,6 +1,6 @@
 import { types } from "node:util";
 import type { ReviewAnchor, ReviewSelector } from "@staix/agent-console/contract";
-import { isDenied } from "@staix/agent-mem/platform";
+import { deniedReportPath, foldPathSegment } from "./deny.ts";
 import { sanitize } from "./frame.ts";
 export type { ReviewAnchor, ReviewSelector, ReviewThread } from "@staix/agent-console/contract";
 
@@ -15,7 +15,6 @@ export type ReviewMaterial =
 /**
  * One spelling per name, as a case-insensitive disk sees it (agent-hub `src/hub/permission-mode.ts`).
  */
-const foldSegment = (segment: string): string => segment.normalize("NFKC").replace(/\p{Default_Ignorable_Code_Point}/gu, "").toLowerCase().toUpperCase().toLowerCase();
 
 /**
  * The part of agent-hub's `projectionPath` that keeps an anchored path inside the repository it names: relative, no
@@ -24,10 +23,10 @@ const foldSegment = (segment: string): string => segment.normalize("NFKC").repla
  * `@staix/agent-mem/platform` list is the whole rule.
  */
 function insideRepo(path: string): boolean {
-  const parts = path.split("/"), folded = parts.map(foldSegment).join("/");
+  const parts = path.split("/");
   return !!path && !path.startsWith("/")
-    && parts.every(part => !!part && part !== "." && part !== ".." && ![".git", ".agenthub"].includes(foldSegment(part)))
-    && !isDenied(path) && !isDenied(folded);
+    && parts.every(part => !!part && part !== "." && part !== ".." && ![".git", ".agenthub"].includes(foldPathSegment(part)))
+    && !deniedReportPath(path);
 }
 
 /** Conformance bounds belong to the published acon contract; hub write byte bounds are a separate layer below. */

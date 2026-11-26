@@ -22,10 +22,10 @@ function report(body: unknown): string {
 }
 
 /** A repository with one reviewed change, so `arev packet` has a range to build. */
-function reviewedFlow() {
+function reviewedFlow(review = "# Review\nEvery change gets a packet and a record.\n") {
   const repo = fixture();
   const { git, write } = repo;
-  write("REVIEW.md", "# Review\nEvery change gets a packet and a record.\n");
+  write("REVIEW.md", review);
   write("src/a.ts", "export const a = 1;\n");
   git("add", ".");
   git("commit", "-qm", "base");
@@ -69,6 +69,26 @@ test("arev packet writes the packet event, so arev record accepts the report wri
   expect(shown.head).toBe(head);
   expect(shown.packet).toBe(packet.id);
   expect(shown.verdict).toBe("approved");
+});
+
+test("the packet event keeps REVIEW.md's advisory_cap, so the report is capped by the file at the merge base", () => {
+  const { base, head, cli } = reviewedFlow("# Review\n\n[review] advisory_cap = 1\n");
+  const packet = JSON.parse(cli("packet", "--from", base, "--to", head, "--json").stdout) as BuiltPacket;
+  const advisories = [0, 1].map(index => ({
+    id: `bugs:advisory-${index}`, term: "bugs", severity: "advisory", disposition: "open", origin: "introduced", text: `advisory ${index}`,
+  }));
+  const refused = cli("record", report(reportFor(packet, { findings: advisories, verdict: "changes_requested" })));
+  expect(refused.status).toBe(1);
+  expect(refused.stderr).toContain("2 advisory findings exceed the cap of 1");
+});
+
+test("a REVIEW.md section arev does not read refuses the packet and writes no packet event", () => {
+  const { base, head, cli } = reviewedFlow("# Review\n\n[review] advisory_capp = 3\n");
+  const refused = cli("packet", "--from", base, "--to", head, "--json");
+  expect(refused.status).toBe(1);
+  expect(refused.stderr).toContain("REVIEW.md sets [review] advisory_capp, which arev does not read");
+  // The section is read before the event is written, so a refused packet leaves the ledger empty.
+  expect(cli("show").stdout).toContain("no review ledger");
 });
 
 test("a report whose packet id is not the packet arev built for that head is refused", () => {

@@ -3,6 +3,7 @@ import { dirname, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { appendEvent } from "./ledger.ts";
 import { buildPacket, repositoryPath, type PacketRequest } from "./packet.ts";
+import { parseReviewMd } from "./review-md.ts";
 import { commitOid, mergeBaseOid, repositoryRoot, reviewGit } from "./review-git.ts";
 import { readRules, renderRules } from "./rules.ts";
 
@@ -59,8 +60,11 @@ export function runPacket(cwd: string, args: readonly string[]): void {
 
   const bundle = buildPacket(cwd, request);
   // `arev record` validates a report against the packet arev builds for that head, and the ledger's packet event is
-  // where that packet is kept, so it is written before the reviewer can hold a packet.json without one.
-  appendEvent(cwd, { v: 1, type: "packet", at: new Date().toISOString(), packet: bundle.packet });
+  // where that packet is kept, so it is written before the reviewer can hold a packet.json without one. REVIEW.md's
+  // settings are read from the same merge-base rule text the packet was built from, and the cap is kept with the event
+  // so the report is checked against the REVIEW.md this packet was built under.
+  const settings = parseReviewMd(readRules(repositoryRoot(cwd), bundle.packet.subject.mergeBase, []).rules);
+  appendEvent(cwd, { v: 1, type: "packet", at: new Date().toISOString(), packet: bundle.packet, review: { advisory_cap: settings.advisoryCap } });
   const json = JSON.stringify(bundle.packet, null, 2);
   if (values.out !== undefined) {
     const destination = resolve(cwd, values.out);

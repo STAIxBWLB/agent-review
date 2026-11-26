@@ -66,6 +66,62 @@ test("oversized rule display is bounded while its digest represents the entire b
   expect(second.packet.rules[0]?.sha256).not.toBe(first.packet.rules[0]?.sha256);
 });
 
+// Issue #9: a denied path never reaches the rules, so without this line the block reads "(no reviewable paths)" - the
+// same words an unknown path gives - and the reader cannot tell a withheld path from one that no rule applies to. The
+// line counts the paths instead of echoing them, because a supplied path is the caller's text and this is output.
+test("rules names withheld paths by count and never echoes their spelling", () => {
+  const { git, write, cli } = fixture();
+  write("REVIEW.md", "ROOT_BASE\n");
+  git("add", ".");
+  git("commit", "-qm", "base");
+  git("update-ref", "refs/remotes/origin/main", "HEAD");
+  write("src/host.ts", "export const x = 1;\n");
+  git("add", ".");
+  git("commit", "-qm", "head");
+
+  // One withheld path, in the singular, and its spelling appears nowhere: the block it would have applied to is the
+  // empty one, which is the answer rather than a failure, so the exit stays 0.
+  const one = cli("rules", ".env");
+  expect(one.status).toBe(0);
+  expect(one.stdout).toContain("1 supplied path is withheld as denied, so no rule applies to it.");
+  expect(one.stdout).toContain("(no reviewable paths)");
+  expect(one.stdout).not.toContain(".env");
+
+  const two = cli("rules", ".env", "id_rsa");
+  expect(two.status).toBe(0);
+  expect(two.stdout).toContain("2 supplied paths are withheld as denied, so no rule applies to them.");
+
+  // A reviewable path beside a withheld one keeps its rules and still reports the denial.
+  const mixed = cli("rules", ".env", "src/host.ts");
+  expect(mixed.status).toBe(0);
+  expect(mixed.stdout).toContain("1 supplied path is withheld as denied");
+  expect(mixed.stdout).toContain("src/host.ts");
+  expect(mixed.stdout).not.toContain(".env");
+
+  // A denied path spelled differently is denied too - the deny match folds case and width and reads a backslash as a
+  // separator - so it gets the same line and reaches neither `Applies to:` nor the output at all. This is the arm worth
+  // pinning: the rule reader screens with the case-sensitive isDenied, so without the filter in rulesForPaths these three
+  // were echoed under `Applies to:` and took the root rule while the line said they were withheld.
+  for (const spelling of [".ENV", ".ＥＮＶ", "docs\\.env"]) {
+    const folded = cli("rules", spelling);
+    expect(folded.status).toBe(0);
+    expect(folded.stdout).toContain("1 supplied path is withheld as denied, so no rule applies to it.");
+    expect(folded.stdout).toContain("(no reviewable paths)");
+    expect(folded.stdout).not.toContain(spelling);
+  }
+  const foldedMixed = cli("rules", ".ENV", "src/host.ts");
+  expect(foldedMixed.status).toBe(0);
+  expect(foldedMixed.stdout).toContain("1 supplied path is withheld as denied");
+  expect(foldedMixed.stdout).toContain("src/host.ts");
+  expect(foldedMixed.stdout).not.toContain(".ENV");
+
+  // And a query that withheld nothing says nothing about denials.
+  const clean = cli("rules", "src/host.ts");
+  expect(clean.status).toBe(0);
+  expect(clean.stdout).not.toContain("withheld");
+  expect(clean.stdout).toContain("src/host.ts");
+});
+
 test("rules refuses to use HEAD when the origin default branch is unavailable", () => {
   const { git, write, cli } = fixture();
   write("REVIEW.md", "HEAD_ONLY");

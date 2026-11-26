@@ -2,6 +2,7 @@ import { closeSync, mkdirSync, openSync, rmdirSync, unlinkSync, writeFileSync } 
 import { dirname, resolve, sep } from "node:path";
 import { parseArgs } from "node:util";
 import { EXIT, errorLine } from "@staix/cli-output";
+import { deniedReportPath } from "./deny.ts";
 import { Refusal, appendEvent, comparablePath } from "./ledger.ts";
 import { buildPacket, packetBrief, packetResult, repositoryPath, type PacketBundle, type PacketRequest } from "./packet.ts";
 import { parseReviewMd, type ReviewMdSettings } from "./review-md.ts";
@@ -173,7 +174,15 @@ export function runRules(cwd: string, args: readonly string[]): void {
     throw new PacketUsageError("Specify paths with arev rules <path...> or arev rules check <path>.");
   }
   const { base, rules } = rulesForPaths(cwd, paths);
-  console.log(`Rules at merge base ${base}:\n\n${renderRules(rules, !check)}`);
+  // A denied path contributes no rule, so the block is the empty one and the reader cannot tell an unknown path from a
+  // withheld one. The line names the denial; it counts the paths instead of echoing them, because a supplied path is the
+  // caller's untrusted text and this is output. The same predicate keeps them out of `Applies to:` in rulesForPaths, so
+  // the count and the block cannot disagree about which spellings are withheld.
+  const withheld = paths.filter(path => deniedReportPath(path)).length;
+  const denied = withheld === 0
+    ? []
+    : [`${withheld} supplied ${withheld === 1 ? "path is" : "paths are"} withheld as denied, so no rule applies to ${withheld === 1 ? "it" : "them"}.`];
+  console.log([`Rules at merge base ${base}:`, ...denied, renderRules(rules, !check)].join("\n\n"));
 }
 
 /** Resolve paths and read the trusted base rules for the CLI and MCP. */
@@ -187,7 +196,11 @@ export function rulesForPaths(cwd: string, paths: readonly string[]) {
       "Fetch origin and set its default branch with git remote set-head origin --auto.");
   }
   const base = mergeBaseOid(root, commitOid(root, defaultRef), head);
-  const targets = [...new Set(paths.map(path => repositoryPath(cwd, root, path)))].map(path => ({ path, sides: [path] }));
+  // The rule reader screens with the case-sensitive isDenied, so a denied path spelled differently - folded case or
+  // width, or a backslash separator - would reach `Applies to:` and take the root rule while the caller is told the path
+  // is withheld. Every supplied spelling is matched here the way the packet matches it, before it becomes a rule target.
+  const reviewable = paths.filter(path => !deniedReportPath(path));
+  const targets = [...new Set(reviewable.map(path => repositoryPath(cwd, root, path)))].map(path => ({ path, sides: [path] }));
   const rules = readRules(root, base, targets);
   return { base, rules };
 }

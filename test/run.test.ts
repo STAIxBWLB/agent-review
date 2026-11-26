@@ -11,7 +11,7 @@ afterEach(() => {
   for (const path of scratch.splice(0)) rmSync(path, { recursive: true, force: true });
 });
 
-function reviewer(mode: "json" | "dirty" | "timeout" | "brief" | "invalid" | "secret" | "escaped-secret", review = "# Review\n") {
+function reviewer(mode: "json" | "dirty" | "timeout" | "brief" | "invalid" | "secret" | "escaped-secret", review = "# Review\n", separator = "") {
   const sandbox = mkdtempSync(join(tmpdir(), "arev-run-test-"));
   scratch.push(sandbox);
   const bin = join(sandbox, "bin"), userHome = join(sandbox, "home"), out = join(sandbox, "out");
@@ -61,7 +61,7 @@ printf '%s\\n' '{"baseRefOid":"${base}","headRefOid":"${head}","title":"Review f
     if (mode === "escaped-secret") {
       const canary = "ghp_" + "b".repeat(36);
       const findings = [{ id: "bugs:fixture", term: "bugs", severity: "blocking",
-        disposition: "open", origin: "introduced", text: canary }];
+        disposition: "open", origin: "introduced", text: "prefix " + ${JSON.stringify(separator)} + canary }];
       const report = JSON.stringify({ v: 1, packet, reviewer, coverage, call,
         verdict: "changes_requested", findings }, null, 2);
       const escaped = report.replace(canary, () => String.fromCharCode(92) + "u0067" + canary.slice(1));
@@ -180,22 +180,23 @@ test("reviewer secrets are removed from stdout, stderr and the response artifact
   expect(readLedger(dir, { home }).some(event => event.type === "record")).toBe(false);
 });
 
-test("escaped secrets in pretty-printed reviewer reports are removed before recording", () => {
-  const { cli, dir, home, out } = reviewer("escaped-secret");
-  const canary = "ghp_" + "b".repeat(36);
-  const escaped = String.fromCharCode(92) + "u0067" + canary.slice(1);
-  const result = cli("run", "--host", "codex", "--implementer", "qwen", "--out", out);
-  expect(result.status).toBe(1);
-  for (const name of ["reviewer.stdout", "reviewer-response.md"]) {
-    expect(result.stderr).toContain(name + ": 1 redacted line(s)");
-    expect(readFileSync(join(out, name), "utf8")).toContain("[redacted reviewer output]");
-  }
-  for (const name of readdirSync(out)) {
-    const content = readFileSync(join(out, name), "utf8");
-    expect(content).not.toContain(canary);
-    expect(content).not.toContain(escaped);
-  }
-  expect(result.stdout + result.stderr).not.toContain(canary);
-  expect(result.stdout + result.stderr).not.toContain(escaped);
-  expect(readLedger(dir, { home }).some(event => event.type === "record")).toBe(false);
+test.each([["ordinary text", ""], ["line separator", " "], ["paragraph separator", " "]])(
+  "escaped secrets in pretty-printed reviewer reports are removed before recording (%s)", (_, separator) => {
+    const { cli, dir, home, out } = reviewer("escaped-secret", "# Review\n", separator);
+    const canary = "ghp_" + "b".repeat(36);
+    const escaped = String.fromCharCode(92) + "u0067" + canary.slice(1);
+    const result = cli("run", "--host", "codex", "--implementer", "qwen", "--out", out);
+    expect(result.status).toBe(1);
+    for (const name of ["reviewer.stdout", "reviewer-response.md"]) {
+      expect(result.stderr).toContain(name + ": 1 redacted line(s)");
+      expect(readFileSync(join(out, name), "utf8")).toContain("[redacted reviewer output]");
+    }
+    for (const name of readdirSync(out)) {
+      const content = readFileSync(join(out, name), "utf8");
+      expect(content).not.toContain(canary);
+      expect(content).not.toContain(escaped);
+    }
+    expect(result.stdout + result.stderr).not.toContain(canary);
+    expect(result.stdout + result.stderr).not.toContain(escaped);
+    expect(readLedger(dir, { home }).some(event => event.type === "record")).toBe(false);
 });

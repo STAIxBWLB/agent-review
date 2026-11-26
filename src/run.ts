@@ -164,7 +164,8 @@ function screenReviewerFiles(out: string): string[] {
       }
       let count = 0;
       const source = readFileSync(path, "utf8");
-      const screened = source.replace(/[^\r\n\p{Zl}\p{Zp}]+/gu, line => {
+      // JSON strings can contain raw Unicode line and paragraph separators.
+      const screened = source.replace(/[^\n]+/g, line => {
         if (!hasSecret(line)) return line;
         count++;
         return OUTPUT_MARKER;

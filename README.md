@@ -16,6 +16,7 @@
 
 Run `arev packet --help` for subject and output options. Packet and rule
 commands require Git with support for `--attr-source` and `check-attr --source`.
+The standalone `arev rules` command compares against the default branch on `origin`.
 
 ## Development
 

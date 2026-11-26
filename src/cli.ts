@@ -42,7 +42,7 @@ export function main(args: readonly string[]): number {
       console.log(version);
       break;
     case "status":
-      console.log("Review workflow implementation is pending.");
+      console.log("Packet and rules commands are available.");
       break;
   }
   return EXIT.ok;

@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
-import { readFileSync, rmSync } from "node:fs";
+import { readFileSync, rmSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
-import { buildPacket, coverageGap, type ReviewPacket } from "../src/packet.ts";
+import { buildPacket, coverageGap, repositoryPath, type ReviewPacket } from "../src/packet.ts";
 import { fixture } from "./packet-fixture.ts";
 
 function portedFixture() {
@@ -141,14 +141,45 @@ test("reviewing a root commit uses the empty base tree", () => {
 
 test("workspace inventory does not run repository-defined checkout filters", () => {
   const { dir, git, write } = fixture();
-  write(".gitattributes", "file.txt filter=marker\n");
+  write(".gitattributes", "*.txt filter=marker\n");
   write("file.txt", "before\n");
   git("add", ".");
   git("commit", "-qm", "base");
   git("config", "filter.marker.clean", "touch filter-executed && cat");
   git("config", "filter.marker.required", "true");
   write("file.txt", "after\n");
+  write("untracked.txt", "untracked fixture\n");
   const bundle = buildPacket(dir, { kind: "workspace" });
   expect(bundle.diff).toContain("+after");
+  expect(bundle.diff).toContain("+untracked fixture");
   expect(git("ls-files", "--others", "--exclude-standard")).not.toContain("filter-executed");
+});
+
+test("a copy patch excludes a separately modified generated source", () => {
+  const { dir, git, write } = fixture();
+  const content = "shared source fixture\n".repeat(10);
+  write(".gitattributes", "*.gen.js linguist-generated\n");
+  write("source.gen.js", content);
+  git("add", ".");
+  git("commit", "-qm", "base");
+  write("source.gen.js", content + "only in generated source\n");
+  write("copy.js", content);
+  git("add", ".");
+  git("commit", "-qm", "head");
+  const bundle = buildPacket(dir, { kind: "commit", commit: "HEAD" });
+  expect(bundle.packet.units).toContainEqual({ path: "copy.js", status: "C", insertions: 0, deletions: 0 });
+  expect(bundle.diff).toContain("copy to copy.js");
+  expect(bundle.diff).not.toContain("only in generated source");
+});
+
+test("a worktree alias resolves absolute paths even when the selected file is absent", () => {
+  const { dir, git } = fixture();
+  const root = git("rev-parse", "--show-toplevel").trimEnd();
+  const alias = join(dir, "../", `${dir.split("/").at(-1)}-alias`);
+  symlinkSync(dir, alias, "dir");
+  try {
+    expect(repositoryPath(dir, root, join(alias, "deleted", "missing.ts"))).toBe("deleted/missing.ts");
+  } finally {
+    rmSync(alias);
+  }
 });

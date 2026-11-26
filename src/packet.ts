@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { lstatSync, realpathSync } from "node:fs";
-import { basename, isAbsolute, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
 import { isDenied } from "@staix/agent-mem/platform";
 import { frame } from "./frame.ts";
 import { commitOid, mergeBaseOid, repositoryRoot, reviewGit } from "./review-git.ts";
@@ -56,8 +56,13 @@ function prRefs(cwd: string, number: string): { base: string; head: string } {
     env: { ...process.env, GH_PROMPT_DISABLED: "1" },
   });
   if (result.status !== 0) throw new Error("Cannot read PR metadata. Check gh authentication and the PR number.");
-  const { baseRefOid, headRefOid } = JSON.parse(result.stdout);
-  if (!FULL_OID.test(baseRefOid) || !FULL_OID.test(headRefOid)) {
+  let data: unknown;
+  try { data = JSON.parse(result.stdout); }
+  catch { throw new Error("gh returned invalid PR metadata. Check gh authentication and retry."); }
+  const { baseRefOid, headRefOid } = data && typeof data === "object"
+    ? data as Record<string, unknown> : {};
+  if (typeof baseRefOid !== "string" || !FULL_OID.test(baseRefOid) ||
+      typeof headRefOid !== "string" || !FULL_OID.test(headRefOid)) {
     throw new Error("PR metadata lacks full commit IDs. Check the PR in gh and retry.");
   }
   return { base: baseRefOid, head: headRefOid };
@@ -86,15 +91,25 @@ function resolveSubject(cwd: string, request: PacketRequest): PacketSubject {
 }
 
 export function repositoryPath(cwd: string, root: string, path: string): string {
-  const resolved = resolve(cwd, path);
-  // Git canonicalizes the worktree root. Canonicalize cwd too, even for paths deleted from disk.
-  const canonical = isAbsolute(path) && relative(cwd, resolved).startsWith("../")
-    ? resolved : resolve(realpathSync(cwd), relative(cwd, resolved));
-  const target = relative(root, canonical);
-  if (!target || target === ".." || target.startsWith("../") || isAbsolute(target) || target.includes("\0")) {
-    throw new Error("Invalid repository path. Pass a non-root path inside the worktree.");
+  const resolved = isAbsolute(path) ? resolve(path) : resolve(realpathSync(cwd), path);
+  const inside = (target: string) => Boolean(target) && target !== ".." &&
+    !target.startsWith("../") && !isAbsolute(target);
+
+  if (!path.includes("\0")) {
+    const direct = relative(root, resolved);
+    if (inside(direct)) return direct;
+    // Resolve an external alias of the worktree without dereferencing the selected file itself.
+    for (let ancestor = dirname(resolved); dirname(ancestor) !== ancestor; ancestor = dirname(ancestor)) {
+      try {
+        const target = relative(root, resolve(realpathSync(ancestor), relative(ancestor, resolved)));
+        if (inside(target)) return target;
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== "ENOENT" && code !== "ENOTDIR") break;
+      }
+    }
   }
-  return target;
+  throw new Error("The path does not identify a file or directory inside the worktree. Choose a repository-relative path.");
 }
 
 function names(stdout: string): string[] {
@@ -151,8 +166,9 @@ export function buildPacket(cwd: string, request: PacketRequest): PacketBundle {
   const plain = names(checkedOutput(diff(["--no-renames", "--name-only", "-z"], []), "the plain changed-name list"));
   const destinations = groups.map(group => group.paths.at(-1)!);
   const listed = new Set(groups.flatMap(group => group.status === "R" ? group.paths : [group.paths.at(-1)!]));
-  if (new Set(destinations).size !== destinations.length ||
-      changed.length !== destinations.length || changed.some(path => !destinations.includes(path)) ||
+  const destinationNames = new Set(destinations);
+  if (destinationNames.size !== destinations.length ||
+      changed.length !== destinations.length || changed.some(path => !destinationNames.has(path)) ||
       plain.length !== listed.size || plain.some(path => !listed.has(path))) {
     throw new Error("Git changed-name inventory does not match the packet. Check for concurrent worktree edits and retry.");
   }
@@ -190,9 +206,9 @@ export function buildPacket(cwd: string, request: PacketRequest): PacketBundle {
     }
 
     const readDiff = (option: string[], limit?: number) => group.untracked
-      ? reviewGit(root, [`--attr-source=${subject.mergeBase}`, "diff", ...DIFF_OPTIONS, "--no-index", ...option,
+      ? reviewGit(root, [...gitOptions, `--attr-source=${subject.mergeBase}`, "diff", ...DIFF_OPTIONS, "--no-index", ...option,
           "--", "/dev/null", path], { maxBuffer: limit ?? 16 * 1024 * 1024 })
-      : diff([...RENAME_OPTIONS, ...option], group.paths, limit);
+      : diff([...RENAME_OPTIONS, ...(group.status === "C" ? ["--diff-filter=C"] : []), ...option], group.paths, limit);
     const diffText = (result: ReturnType<typeof reviewGit>, label: string) =>
       group.untracked && result.status === 1 ? result.stdout : checkedOutput(result, label);
 

@@ -65,7 +65,7 @@ export function runPacket(cwd: string, args: readonly string[]): void {
     }
   } else {
     if (values.json && bundle.rulesMissing.some(rule => rule.source === "REVIEW.md")) {
-      console.error("arev: REVIEW.md is unavailable at the merge base. Inspect the packet brief for details.");
+      console.error("arev: REVIEW.md is unavailable at the merge base. Rerun without --json or use --out DIR for the brief.");
     }
     console.log(values.json ? json : bundle.brief);
   }
@@ -79,7 +79,10 @@ export function runRules(cwd: string, args: readonly string[]): void {
   const head = commitOid(root, "HEAD");
   const defaultRef = ["origin/HEAD", "origin/main", "origin/master"].find(ref =>
     reviewGit(root, ["rev-parse", "--verify", "-q", `${ref}^{commit}`]).status === 0);
-  const base = defaultRef ? mergeBaseOid(root, commitOid(root, defaultRef), head) : head;
+  if (!defaultRef) {
+    throw new Error("No origin default branch is available. Fetch origin and set its default branch with git remote set-head origin --auto.");
+  }
+  const base = mergeBaseOid(root, commitOid(root, defaultRef), head);
   const targets = [...new Set(paths.map(path => repositoryPath(cwd, root, path)))].map(path => ({ path, sides: [path] }));
   const rules = readRules(root, base, targets);
   console.log(`Rules at merge base ${base}:\n\n${renderRules(rules, !check)}`);

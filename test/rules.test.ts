@@ -66,3 +66,15 @@ test("oversized rule display is bounded while its digest represents the entire b
   expect(second.rules).toBe(first.rules);
   expect(second.packet.rules[0]?.sha256).not.toBe(first.packet.rules[0]?.sha256);
 });
+
+test("rules refuses to use HEAD when the origin default branch is unavailable", () => {
+  const { git, write, cli } = fixture();
+  write("REVIEW.md", "HEAD_ONLY");
+  git("add", ".");
+  git("commit", "-qm", "head");
+  const result = cli("rules", "file.txt");
+  expect(result.status).toBe(1);
+  expect(result.stderr).toContain("No origin default branch");
+  expect(result.stderr).toContain("Fetch origin");
+  expect(result.stdout).not.toContain("HEAD_ONLY");
+});

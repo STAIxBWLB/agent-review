@@ -2,41 +2,36 @@ import { parseArgs } from "node:util";
 import { PacketUsageError } from "./packet-cli.ts";
 import { frame } from "./frame.ts";
 import { assertSafeExchange } from "./import.ts";
-import { readLedger, type LedgerEvent, type RecordFinding, type ReviewRecordV1 } from "./ledger.ts";
+import { readLedger, type LedgerEvent, type ReviewRecordV1 } from "./ledger.ts";
 import { PR_NUMBER, ledgerEventsView, type ReviewView, type ThreadSelector } from "./record.ts";
 import { commitOid } from "./review-git.ts";
 
 type RecordEvent = Extract<LedgerEvent, { type: "record" }>;
 type EffectiveFinding = ReviewView["findings"][number];
 
-function hubFinding(finding: RecordFinding, effective?: EffectiveFinding) {
-  const { id, term, severity, path, anchor, rationale, disposition, origin } = finding;
-  return {
-    id, pass: term, severity: severity === "blocking" ? "important" : "nit",
-    disposition: effective?.disposition ?? disposition,
-    ...(path === undefined ? {} : { path }),
-    ...(anchor === undefined ? {} : { anchor }),
-    ...((effective?.rationale ?? rationale) === undefined ? {} : { rationale: effective?.rationale ?? rationale }),
-    ...(severity === "blocking" && term === "security" && origin !== "indeterminate" ? { origin } : {}),
-  };
+function hubFinding(finding: EffectiveFinding) {
+  const { text: _text, evidence: _evidence, ...args } = finding;
+  return args;
 }
 
 function exportHub(event: RecordEvent, view: ReviewView): unknown {
   const { record, source } = event;
   const original = source?.format === "hub" ? source.report.hub_review : undefined;
-  const effective = new Map(view.findings.map(finding => [finding.id, finding]));
   if (original && typeof original === "object" && !Array.isArray(original)) {
     const args = original as Record<string, unknown>;
-    if (!Array.isArray(args.findings)) return original;
+    if (!Array.isArray(args.findings) && view.findings.length === 0) return original;
+    const originalFindings = new Map((Array.isArray(args.findings) ? args.findings : []).map(item => [item?.id, item]));
     const baseline = new Map(record.findings.map(finding => [finding.id, finding]));
-    return { ...args, findings: args.findings.map(item => {
-      const previous = baseline.get(item?.id);
-      const current = effective.get(item?.id);
-      if (!previous || !current ||
-          (previous.disposition === current.disposition && previous.rationale === current.rationale)) return item;
+    return { ...args, findings: view.findings.map(current => {
+      const item = originalFindings.get(current.id);
+      const previous = baseline.get(current.id);
+      if (!item || !previous) return hubFinding(current);
       return {
-        ...item, disposition: current.disposition,
-        ...(current.rationale === undefined ? {} : { rationale: current.rationale }),
+        ...item,
+        ...(previous.term === current.pass ? {} : { pass: current.pass }),
+        ...((previous.severity === "blocking" ? "important" : "nit") === current.severity ? {} : { severity: current.severity }),
+        ...(previous.disposition === current.disposition ? {} : { disposition: current.disposition }),
+        ...(previous.rationale === current.rationale ? {} : { rationale: current.rationale }),
       };
     }) };
   }
@@ -44,10 +39,9 @@ function exportHub(event: RecordEvent, view: ReviewView): unknown {
   const sourceNote = source?.report.note;
   const note = [
     ...(typeof sourceNote === "string" ? [sourceNote] : []),
-    ...record.findings.map(finding => `${finding.id}: ${finding.text}`),
+    ...view.findings.flatMap(finding => finding.text === undefined ? [] : [`${finding.id}: ${finding.text}`]),
   ].join("\n") || `Review recorded for ${record.packet.subject.head}.`;
-  const findings = record.findings.map(finding => hubFinding(finding, effective.get(finding.id)));
-  return { verdict: record.verdict, note, coverage: record.coverage, findings };
+  return { verdict: record.verdict, note, coverage: record.coverage, findings: view.findings.map(hubFinding) };
 }
 
 function renderFinding(finding: EffectiveFinding): string {

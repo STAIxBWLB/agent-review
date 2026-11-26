@@ -91,3 +91,39 @@ test("export selects numbered and no-PR records independently at a shared head",
     expect(JSON.parse(result.stdout)).toEqual(expected);
   }
 });
+
+test("hub export carries an earlier blocking finding into a later review with an empty finding list", () => {
+  const { dir, home, cli, ingest, load, git, write, base, head } = exchangeFixture();
+  const savePacket = (head: string) => {
+    const { packet } = isolatedPacket(dir, { kind: "range", base, head, pr: 7 });
+    appendEvent(dir, { v: 1, type: "packet", at: "2026-11-26T00:00:00Z", packet }, { home });
+    return packet.id;
+  };
+  const report = load("hub");
+  const hub = report.hub_review as Record<string, unknown>;
+  const carried = { id: "bugs:carried", pass: "bugs", severity: "important", disposition: "open",
+    path: "src/rules.ts", rationale: "Missing rule validation." };
+  expect(ingest("hub", { ...report, packet_id: savePacket(head),
+    hub_review: { ...hub, verdict: "changes_requested", findings: [carried] } }).status).toBe(0);
+
+  write("src/rules.ts", "later rule text\n");
+  git("commit", "-qam", "later head");
+  const later = git("rev-parse", "HEAD").trim();
+  const packetId = savePacket(later);
+  const laterArgs = { ...hub, note: "Later review", findings: [] };
+  expect(ingest("hub", { ...report, head: later, packet_id: packetId, hub_review: laterArgs }).status).toBe(0);
+  const shown = cli("show", "--head", later, "--pr", "7", "--json");
+  expect(JSON.parse(shown.stdout).openBlocking).toEqual(["bugs:carried"]);
+  const output = cli("export", "--to", "hub", "--head", later, "--pr", "7");
+  expect(output.status).toBe(0);
+  expect(JSON.parse(output.stdout)).toEqual({ ...laterArgs, findings: [carried] });
+
+  const plainReport = { v: 1, packet: { id: packetId, subject: { head: later } },
+    reviewer: { id: "fixture-reviewer", modelFamily: "fixture-family", started: "manual", sameFamilyFallback: false },
+    coverage: hub.coverage, findings: [], verdict: "approved", call: { ok: true } };
+  write("native-report.json", JSON.stringify(plainReport));
+  expect(cli("record", "native-report.json").status).toBe(0);
+  const native = cli("export", "--to", "hub", "--head", later, "--pr", "7");
+  expect(native.status).toBe(0);
+  expect(JSON.parse(native.stdout).findings).toEqual([carried]);
+});

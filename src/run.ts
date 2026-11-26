@@ -1,12 +1,12 @@
 import { spawn } from "node:child_process";
-import { closeSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeSync } from "node:fs";
+import { closeSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { EXIT } from "@staix/cli-output";
 import { chooseHost, hostExecutable, HOST_ORDER, modelOf } from "./host.ts";
 import { importReviewFile } from "./import.ts";
-import { Refusal, shown } from "./ledger.ts";
+import { Refusal, secretShaped, shown, stringsIn } from "./ledger.ts";
 import { buildPacket, workspaceFilterOptions, type PacketRequest } from "./packet.ts";
 import { insideWorktree, packetSettings, PacketUsageError, writePacketBundle } from "./packet-cli.ts";
 import { PR_NUMBER, recordReview, type RunAttestation } from "./record.ts";
@@ -130,6 +130,55 @@ function runReviewer(
   });
 }
 
+const OUTPUT_MARKER = "[redacted reviewer output]";
+const REVIEWER_FILES = [STDOUT_FILE, STDERR_FILE, RESPONSE_FILE] as const;
+
+function hasSecret(line: string): boolean {
+  if (secretShaped(line)) return true;
+  const first = line.trimStart()[0];
+  if (first !== "{" && first !== "[" && first !== '"') return false;
+  try { return [...stringsIn(JSON.parse(line))].some(secretShaped); }
+  catch { return false; }
+}
+
+/** Process complete lines after the pipes close so a split chunk cannot split a secret. */
+function screenReviewerFiles(out: string): string[] {
+  const redactions: string[] = [];
+  for (const name of REVIEWER_FILES) {
+    const path = join(out, name);
+    try {
+      const stat = lstatSync(path);
+      if (!stat.isFile()) throw new Error("not a regular output file");
+      if (stat.size > MAX_OUTPUT) {
+        writeFileSync(path, `${OUTPUT_MARKER}\n`);
+        redactions.push(`${name}: oversized output withheld`);
+        continue;
+      }
+      let count = 0;
+      const source = readFileSync(path, "utf8");
+      const screened = source.replace(/[^\r\n\p{Zl}\p{Zp}]+/gu, line => {
+        if (!hasSecret(line)) return line;
+        count++;
+        return OUTPUT_MARKER;
+      });
+      if (count > 0) {
+        writeFileSync(path, screened);
+        redactions.push(`${name}: ${count} redacted line(s)`);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      // Do not preserve unchecked output if the artifact cannot be opened or overwritten.
+      try {
+        unlinkSync(path);
+        redactions.push(`${name}: removed after screening failed`);
+      } catch {
+        redactions.push(`${name}: could not be screened or removed`);
+      }
+    }
+  }
+  return redactions;
+}
+
 function cleanCheckout(checkout: string, head: string, gitFile: string, filters: string[]): boolean {
   try {
     if (readFileSync(join(checkout, ".git"), "utf8") !== gitFile) return false;
@@ -207,8 +256,9 @@ export async function runCommand(cwd: string, args: readonly string[]): Promise<
     throw new Refusal("Cannot create the detached reviewer worktree", "check Git worktree permissions and retry");
   }
 
+  let redactions: string[] = [];
   const retained = () => new Refusal(
-    `Reviewer worktree ${shown(checkout)} changed or could not be verified, so this review is void`,
+    `Reviewer worktree ${shown(checkout)} changed or could not be verified, so this review is void${redactions.length ? `. ${redactions.join(", ")}` : ""}`,
     "inspect the retained checkout and save any changes before removing it");
   let gitFile: string;
   try { gitFile = readFileSync(join(checkout, ".git"), "utf8"); }
@@ -218,10 +268,18 @@ export async function runCommand(cwd: string, args: readonly string[]): Promise<
   try {
     outcome = await runReviewer(executable, host, hostArgs(host, model, checkout, out, prompt), checkout, out, prompt, options.timeout, pathEnv);
   } finally {
-    if (!cleanCheckout(checkout, head, gitFile, filters)) throw retained();
-    const removed = reviewGit(root, ["worktree", "remove", checkout]);
-    if (removed.status !== 0) throw new Refusal("Cannot remove the clean reviewer worktree", `inspect ${shown(checkout)} and run git worktree remove for it`);
-    rmSync(temp, { recursive: true, force: true });
+    try { redactions = screenReviewerFiles(out); }
+    finally {
+      if (!cleanCheckout(checkout, head, gitFile, filters)) throw retained();
+      const removed = reviewGit(root, ["worktree", "remove", checkout]);
+      if (removed.status !== 0) throw new Refusal("Cannot remove the clean reviewer worktree", `inspect ${shown(checkout)} and run git worktree remove for it`);
+      rmSync(temp, { recursive: true, force: true });
+    }
+  }
+
+  if (redactions.length) {
+    throw new Refusal(`Reviewer output was withheld (${redactions.join(", ")})`,
+      "inspect the redacted output and rerun with a reviewer that does not print sensitive values");
   }
 
   const stdout = join(out, STDOUT_FILE);

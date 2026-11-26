@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { readLedger } from "../src/ledger.ts";
@@ -11,7 +11,7 @@ afterEach(() => {
   for (const path of scratch.splice(0)) rmSync(path, { recursive: true, force: true });
 });
 
-function reviewer(mode: "json" | "dirty" | "timeout" | "brief" | "invalid", review = "# Review\n") {
+function reviewer(mode: "json" | "dirty" | "timeout" | "brief" | "invalid" | "secret", review = "# Review\n") {
   const sandbox = mkdtempSync(join(tmpdir(), "arev-run-test-"));
   scratch.push(sandbox);
   const bin = join(sandbox, "bin"), userHome = join(sandbox, "home"), out = join(sandbox, "out");
@@ -45,6 +45,14 @@ printf '%s\\n' '{"baseRefOid":"${base}","headRefOid":"${head}","title":"Review f
     if (!process.argv.includes("read-only") || process.env.OPENAI_API_KEY) process.exit(9);
     if (mode === "timeout") { await Bun.sleep(60_000); process.exit(1); }
     if (mode === "dirty") writeFileSync("changed-by-reviewer.txt", "fixture edit");
+    if (mode === "secret") {
+      const canary = "ghp_" + "a".repeat(36);
+      process.stdout.write(canary.slice(0, 10));
+      process.stdout.write(canary.slice(10) + "\\n");
+      console.error(canary);
+      writeFileSync(out + "/reviewer-response.md", "response: " + canary + "\\n");
+      process.exit(0);
+    }
     if (mode === "invalid") { console.log("unparseable fixture"); process.exit(0); }
     const reviewer = { id: "untrusted-name", modelFamily: "untrusted-family", started: "self", sameFamilyFallback: false };
     const coverage = { reviewed: packet.units.map(unit => unit.path), skipped: [] };
@@ -141,4 +149,20 @@ test("run does not select a reviewer executable from the source worktree", () =>
   expect(result.status).toBe(1);
   expect(result.stderr).toContain("No selected reviewer executable is available");
   expect(readLedger(dir, { home })).toEqual([]);
+});
+
+test("reviewer secrets are removed from stdout, stderr and the response artifact before recording", () => {
+  const { cli, dir, home, out } = reviewer("secret");
+  const canary = "ghp_" + "a".repeat(36);
+  const result = cli("run", "--host", "codex", "--implementer", "qwen", "--out", out);
+  expect(result.status).toBe(1);
+  for (const name of ["reviewer.stdout", "reviewer.stderr", "reviewer-response.md"]) {
+    expect(result.stderr).toContain(`${name}: 1 redacted line(s)`);
+    expect(readFileSync(join(out, name), "utf8")).toContain("[redacted reviewer output]");
+  }
+  for (const name of readdirSync(out)) {
+    expect(readFileSync(join(out, name), "utf8")).not.toContain(canary);
+  }
+  expect(result.stdout + result.stderr).not.toContain(canary);
+  expect(readLedger(dir, { home }).some(event => event.type === "record")).toBe(false);
 });

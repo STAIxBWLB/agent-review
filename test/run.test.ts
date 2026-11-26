@@ -11,7 +11,7 @@ afterEach(() => {
   for (const path of scratch.splice(0)) rmSync(path, { recursive: true, force: true });
 });
 
-function reviewer(mode: "json" | "dirty" | "timeout" | "brief" | "invalid" | "secret", review = "# Review\n") {
+function reviewer(mode: "json" | "dirty" | "timeout" | "brief" | "invalid" | "secret" | "escaped-secret", review = "# Review\n") {
   const sandbox = mkdtempSync(join(tmpdir(), "arev-run-test-"));
   scratch.push(sandbox);
   const bin = join(sandbox, "bin"), userHome = join(sandbox, "home"), out = join(sandbox, "out");
@@ -58,6 +58,19 @@ printf '%s\\n' '{"baseRefOid":"${base}","headRefOid":"${head}","title":"Review f
     const coverage = { reviewed: packet.units.map(unit => unit.path), skipped: [] };
     const call = { ok: true };
     const fence = String.fromCharCode(96).repeat(3);
+    if (mode === "escaped-secret") {
+      const canary = "ghp_" + "b".repeat(36);
+      const findings = [{ id: "bugs:fixture", term: "bugs", severity: "blocking",
+        disposition: "open", origin: "introduced", text: canary }];
+      const report = JSON.stringify({ v: 1, packet, reviewer, coverage, call,
+        verdict: "changes_requested", findings }, null, 2);
+      const escaped = report.replace(canary, () => String.fromCharCode(92) + "u0067" + canary.slice(1));
+      const fenced = fence + "json\\n" + escaped + "\\n" + fence;
+      console.log(fenced);
+      writeFileSync(out + "/reviewer-response.md", fenced);
+      process.exit(0);
+    }
+
     if (mode === "brief") {
       console.log(fence + "json\\n" + JSON.stringify({ head: packet.subject.head, base: packet.subject.base,
         packet_id: packet.id, reviewer, coverage, call }) + "\\n" + fence + "\\n## Findings\\nP0: None.\\nP1: None.\\nP2: None.\\nP3: None.");
@@ -164,5 +177,25 @@ test("reviewer secrets are removed from stdout, stderr and the response artifact
     expect(readFileSync(join(out, name), "utf8")).not.toContain(canary);
   }
   expect(result.stdout + result.stderr).not.toContain(canary);
+  expect(readLedger(dir, { home }).some(event => event.type === "record")).toBe(false);
+});
+
+test("escaped secrets in pretty-printed reviewer reports are removed before recording", () => {
+  const { cli, dir, home, out } = reviewer("escaped-secret");
+  const canary = "ghp_" + "b".repeat(36);
+  const escaped = String.fromCharCode(92) + "u0067" + canary.slice(1);
+  const result = cli("run", "--host", "codex", "--implementer", "qwen", "--out", out);
+  expect(result.status).toBe(1);
+  for (const name of ["reviewer.stdout", "reviewer-response.md"]) {
+    expect(result.stderr).toContain(name + ": 1 redacted line(s)");
+    expect(readFileSync(join(out, name), "utf8")).toContain("[redacted reviewer output]");
+  }
+  for (const name of readdirSync(out)) {
+    const content = readFileSync(join(out, name), "utf8");
+    expect(content).not.toContain(canary);
+    expect(content).not.toContain(escaped);
+  }
+  expect(result.stdout + result.stderr).not.toContain(canary);
+  expect(result.stdout + result.stderr).not.toContain(escaped);
   expect(readLedger(dir, { home }).some(event => event.type === "record")).toBe(false);
 });

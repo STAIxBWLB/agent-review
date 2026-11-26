@@ -136,9 +136,17 @@ const REVIEWER_FILES = [STDOUT_FILE, STDERR_FILE, RESPONSE_FILE] as const;
 function hasSecret(line: string): boolean {
   if (secretShaped(line)) return true;
   const first = line.trimStart()[0];
-  if (first !== "{" && first !== "[" && first !== '"') return false;
-  try { return [...stringsIn(JSON.parse(line))].some(secretShaped); }
-  catch { return false; }
+  if (first === "{" || first === "[" || first === '"') {
+    try {
+      if ([...stringsIn(JSON.parse(line))].some(secretShaped)) return true;
+    } catch { /* A pretty-printed JSON property is not a complete document. */ }
+  }
+  for (const [literal] of line.matchAll(/"(?:[^"\\\n]|\\.)*"/g)) {
+    try {
+      if (secretShaped(JSON.parse(literal))) return true;
+    } catch { /* Leave invalid string escapes to the report parser. */ }
+  }
+  return false;
 }
 
 /** Process complete lines after the pipes close so a split chunk cannot split a secret. */

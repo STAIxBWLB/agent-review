@@ -183,6 +183,17 @@ test("arev host without --implementer or --pr is refused, and an unknown host id
     const control = run({ PATH: bin }, "host", "--pr", "448", "--implementer", "claude", "--unavailable", "gpt\u001b[31m");
     expect(control.stderr).toContain("arev does not know the host <withheld>");
     expect(control.stderr).not.toContain("\u001b");
+    // `--unavailable kimi claude` is not a list: the second id is a positional, so the usage it prints says how to spell
+    // the repeat instead of leaving the reader to guess.
+    const bare = run({ PATH: bin }, "host", "--pr", "448", "--implementer", "claude", "--unavailable", "kimi", "claude");
+    expect(bare.code).toBe(2);
+    expect(bare.stderr).toContain("[--unavailable ID]...");
+    expect(bare.stderr).toContain("Repeat --unavailable once per host, or comma-separate its ids");
+    expect(bare.stderr).toContain("→ arev host --help");
+    // The table row is what `arev host --help` prints, so the help text spells the repeatable flag the same way.
+    const help = run({ PATH: bin }, "host", "--help");
+    expect(help.code).toBe(0);
+    expect(help.stdout).toBe("Usage: arev host --pr N --implementer ID [--hosts LIST] [--unavailable ID]... [--json]\n");
   } finally {
     rmSync(bin, { recursive: true, force: true });
   }
@@ -219,6 +230,23 @@ test("arev host reports no host and the next step when none can run", () => {
     expect(result.stdout).toContain(`reason: ${BLOCKED}`);
     expect(result.stdout).toContain("next: put one of claude, codex, kimi on PATH");
     expect(result.stdout).not.toContain("model:");
+    // Issue #32: the JSON answer carries that same instruction as `next`, so an agent reading it does not have to parse
+    // the lines. One string serves both surfaces, which is what comparing the two here pins.
+    const json = run({ HOME: home, PATH: bin }, "host", "--pr", "448", "--implementer", "codex", "--json");
+    expect(json.code).toBe(1);
+    const answer = JSON.parse(json.stdout);
+    expect(answer.next).toBe("put one of claude, codex, kimi on PATH and drop it from --unavailable, then run arev host again");
+    expect(result.stdout).toContain(`next: ${answer.next}`);
+    // And a run that does find a host has no next step to name.
+    const found = temp("arev-host-none-found-");
+    try {
+      writeFileSync(join(found, "codex"), "#!/bin/sh\n", { mode: 0o755 });
+      const ok = run({ HOME: home, PATH: found }, "host", "--pr", "448", "--implementer", "claude", "--json");
+      expect(ok.code).toBe(0);
+      expect(JSON.parse(ok.stdout)).toEqual({ host: "codex", reason: "rotation", considered: [], model: "unknown" });
+    } finally {
+      rmSync(found, { recursive: true, force: true });
+    }
   } finally {
     rmSync(home, { recursive: true, force: true });
     rmSync(bin, { recursive: true, force: true });

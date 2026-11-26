@@ -811,7 +811,7 @@ test("a gh read that runs out of time is refused on its bound, with the retry, a
 test("a status write that runs out of time is refused on the same bound, after a read that succeeded", () => {
   const { repo, base, head, home } = fixture();
   const subject: Subject = { kind: "range", base, head, mergeBase: base, pr: 7 };
-  seed({ repo, home, subject, record: recordFor(subject) });
+  const id = seed({ repo, home, subject, record: recordFor(subject) });
   const args = join(home, "gh-args.txt");
   const write = run(repo,
     { PATH: `${fakeGh(args)}:${process.env.PATH ?? ""}`, AGENTHUB_HOME: home, FAKE_GH_HANG_WRITE: "1",
@@ -819,10 +819,12 @@ test("a status write that runs out of time is refused on the same bound, after a
     "gate", "--post");
   expect(write.code).toBe(1);
   expect(write.stderr).toContain(`cannot post the arev/gate status on ${head}: gh did not answer within 15 s`);
-  // A write that ran out of time may already have landed, so the next step looks for the status before writing it again,
-  // and the retry it ends with names the head alone: `--pr` is added when the run was given it, never invented.
-  expect(write.stderr).toContain(`check for an existing arev/gate status on ${head} (gh api --hostname github.com repos/owner/repo/commits/${head}/statuses`);
+  // A write that ran out of time may already have landed, so the next step looks for the status before writing it again.
+  // The lookup names this write's record, because an older status on the same head carries the same context for another
+  // review - and the retry it ends with names the head alone: `--pr` is added when the run was given it, never invented.
+  expect(write.stderr).toContain(`check for an existing arev/gate status on ${head} whose description names record ${id} (gh api --hostname github.com repos/owner/repo/commits/${head}/statuses`);
   expect(write.stderr).toContain("may already have landed");
+  expect(write.stderr).toContain("another record's status carries the same context");
   expect(write.stderr).toContain(`so retry arev gate --post --head ${head} once github.com is reachable from this machine`);
   expect(gating(repo, home).map(event => event.type)).toEqual(["gate"]);
   // The write's stub traps the signal and never exits either, so the bound is asserted here the same way: this case's
@@ -933,8 +935,11 @@ test("a diagnostic carrying URL userinfo is withheld, and the pattern does not s
   expect(secretShaped("https://:ghs-Sup3rS3cretValue@github.com/owner/repo")).toBe(true);
   expect(secretShaped("https://example.org:443?to=a@b")).toBe(false);
   expect(secretShaped("https://example.org/x?to=a@b")).toBe(false);
-  // Two neighbouring JSON fields are not one credential: a compact line puts a finding's text and its rationale side by
-  // side, and a class that allows quotes, commas or angle brackets reads `...:443","rationale":"a@b` as userinfo.
-  expect(secretShaped(`{"text":"https://example.org:443","rationale":"a@b.example"}`)).toBe(false);
+  // Userinfo may carry every sub-delim RFC 3986 allows, so a password with a `,` or a `'` in it is still a credential:
+  // a class that excluded those characters let both through, and this is the shape a remote or a diagnostic carries.
+  expect(secretShaped("https://u:pa,ss@host")).toBe(true);
+  expect(secretShaped("https://u:it's@host")).toBe(true);
+  // Markup between two values is not userinfo: the characters a URL cannot carry unencoded end both classes, so a host:
+  // port and someone's address around an angle bracket are two values, not one credential.
   expect(secretShaped(`<https://example.org:443>,a@b.example`)).toBe(false);
 });

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { expect, test } from "bun:test";
-import { copyFileSync, readFileSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, readFileSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { coverageGap, repositoryPath, type ReviewPacket } from "../src/packet.ts";
@@ -584,4 +584,101 @@ test("a staged deletion with an untracked copy gives an index repair hint", () =
   git("rm", "--cached", "a.txt");
   git("add", "--", "a.txt");
   expect(isolatedPacket(dir, { kind: "workspace" }).packet.units.map(({ path }) => path)).toEqual(["b.txt"]);
+});
+
+test("local attribute files and diff driver settings do not control exclusions or packet identity", () => {
+  const { dir, git, write } = fixture();
+  write(".gitattributes", "*.txt diff=custom\nbase-generated.js linguist-generated\n");
+  write("source.txt", "original text\n");
+  write("base-generated.js", "original generated text\n");
+  write("binary.txt", Buffer.from([0, 1, 2]));
+  git("add", ".");
+  git("commit", "-qm", "base");
+  const base = git("rev-parse", "HEAD").trim();
+  write("source.txt", "replacement text\n");
+  write("base-generated.js", "replacement generated text\n");
+  write("binary.txt", Buffer.from([0, 3, 4]));
+  git("commit", "-qam", "head");
+  const head = git("rev-parse", "HEAD").trim();
+  const request = { kind: "range", base, head } as const;
+  const clean = isolatedPacket(dir, request);
+  expect(clean.packet.units.map(unit => unit.path)).toEqual(["source.txt"]);
+  expect(clean.packet.excluded).toEqual([
+    { path: "base-generated.js", reason: "generated" }, { path: "binary.txt", reason: "binary" },
+  ]);
+
+  const localAttributes = join(dir, ".git", "local-attributes");
+  writeFileSync(localAttributes, "source.txt linguist-generated\n");
+  git("config", "core.attributesFile", localAttributes);
+  expect(isolatedPacket(dir, request)).toEqual(clean);
+
+  git("config", "--unset", "core.attributesFile");
+  for (const [key, value] of [
+    ["binary", "true"], ["binary", "false"], ["algorithm", "histogram"],
+    ["textconv", "/missing-fixture-textconv"], ["command", "/missing-fixture-diff"], ["wordRegex", "."],
+  ] as const) {
+    git("config", `diff.custom.${key}`, value);
+    expect(isolatedPacket(dir, request)).toEqual(clean);
+    git("config", "--unset", `diff.custom.${key}`);
+  }
+
+  for (const key of ["diff.custom.funcname", "diff.custom.xfuncname"]) {
+    git("config", key, "^replacement");
+    expect(() => isolatedPacket(dir, request)).toThrow(
+      `Local Git setting "${key}" changes patch hunk labels. Unset that key`,
+    );
+    git("config", "--unset", key);
+  }
+  expect(isolatedPacket(dir, request)).toEqual(clean);
+});
+
+test("workspace packets keep CRLF edits and mode-only changes under either checkout setting", () => {
+  const { dir, git, write } = fixture();
+  write("text.txt", "original\n");
+  write("script.sh", "echo fixture\n");
+  git("add", ".");
+  git("commit", "-qm", "base");
+  write("text.txt", "replacement\r\n");
+  chmodSync(join(dir, "script.sh"), 0o755);
+  const request = { kind: "workspace" } as const;
+  const clean = isolatedPacket(dir, request);
+  expect(clean.packet.units).toContainEqual({ path: "script.sh", status: "M", insertions: 0, deletions: 0 });
+  expect(clean.diff).toContain("new mode 100755");
+  expect(clean.diff).toContain("+replacement\r\n");
+
+  for (const setting of ["true", "false"]) {
+    git("config", "core.autocrlf", setting);
+    git("config", "core.fileMode", setting);
+    expect(isolatedPacket(dir, request)).toEqual(clean);
+  }
+});
+
+test("a local info/attributes override cannot supply an exclusion", () => {
+  const { dir, git, write } = fixture();
+  write("fixture.txt", "original\n");
+  git("add", ".");
+  git("commit", "-qm", "base");
+  write("fixture.txt", "replacement\n");
+  const request = { kind: "workspace" } as const;
+  const clean = isolatedPacket(dir, request);
+  write(".git/info/attributes", "fixture.txt linguist-generated\n");
+  expect(() => isolatedPacket(dir, request)).toThrow("Local Git info/attributes can override merge-base attributes");
+  rmSync(join(dir, ".git", "info", "attributes"));
+  expect(isolatedPacket(dir, request)).toEqual(clean);
+});
+
+test("an empty Git diff driver name cannot change the packet", () => {
+  const { dir, git, write } = fixture();
+  write(".gitattributes", "*.txt diff=\n");
+  write("file.txt", "original text\n");
+  git("add", ".");
+  git("commit", "-qm", "base");
+  write("file.txt", "updated text\n");
+  git("commit", "-qam", "head");
+  const request = { kind: "commit", commit: "HEAD" } as const;
+  const clean = isolatedPacket(dir, request);
+  expect(clean.packet.units.map(unit => unit.path)).toEqual(["file.txt"]);
+  expect(clean.diff).toContain("+updated text");
+  git("config", "diff..binary", "true");
+  expect(isolatedPacket(dir, request)).toEqual(clean);
 });

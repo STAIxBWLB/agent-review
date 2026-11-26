@@ -1,12 +1,13 @@
 import { memoryGitEnv, memoryGitSync } from "@staix/agent-mem/platform";
 
 const gitArgs = (cwd: string, args: string[], literalPathspecs = true) =>
-  ["-C", cwd, "-c", "protocol.allow=never", ...(literalPathspecs ? ["--literal-pathspecs"] : []), ...args];
+  ["-C", cwd, "-c", "protocol.allow=never", "-c", "core.attributesFile=/dev/null", ...(literalPathspecs ? ["--literal-pathspecs"] : []), ...args];
 
 const gitOptions = () => ({
   env: {
     ...memoryGitEnv(process.env, { repositoryIsolation: true, readOnlyDiagnostic: true }),
     LC_ALL: "C",
+    GIT_ATTR_NOSYSTEM: "1",
   },
   maxBuffer: 16 * 1024 * 1024,
   timeout: 15_000,

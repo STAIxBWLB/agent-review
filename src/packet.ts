@@ -165,6 +165,36 @@ function workspaceFilterOptions(cwd: string): string[] {
   return names(configured.stdout).flatMap(key => ["-c", `${key}=${key.endsWith(".required") ? "false" : ""}`]);
 }
 
+/** Keep driver output deterministic. Git flags already disable external commands, textconv and word diff. */
+function diffDriverOverrides(cwd: string): string[] {
+  const configured = reviewGit(cwd, ["config", "--null", "--name-only", "--get-regexp", "^diff\\..*\\.(binary|algorithm|funcname|xfuncname)$"]);
+  if (configured.status !== 0 && configured.status !== 1) {
+    throw new Error("Cannot inspect local Git diff drivers. Check the repository Git configuration and retry.");
+  }
+  const keys = names(configured.stdout);
+  const hunkLabel = keys.find(key => /\.(?:x?funcname)$/.test(key));
+  if (hunkLabel) {
+    // There is no Git option that disables only this driver's hunk labels and restores the default.
+    throw new Error(`Local Git setting ${JSON.stringify(hunkLabel)} changes patch hunk labels. Unset that key or use a checkout without the override.`);
+  }
+  return keys.flatMap(key => ["-c", `${key}=${key.endsWith(".binary") ? "auto" : "myers"}`]);
+}
+
+/** Git gives info/attributes precedence even over --attr-source. Refuse any active local override. */
+function ensureBaseAttributes(cwd: string): void {
+  const path = checkedOutput(reviewGit(cwd, ["rev-parse", "--git-path", "info/attributes"]), "the Git attributes path");
+  let size: number;
+  try {
+    size = lstatSync(resolve(cwd, path.replace(/\r?\n$/, ""))).size;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw new Error("Cannot check Git info/attributes. Make the file readable or move it aside before building the packet.");
+  }
+  if (size !== 0) {
+    throw new Error("Local Git info/attributes can override merge-base attributes. Move it aside before building the packet.");
+  }
+}
+
 function checkedOutput(result: ReturnType<typeof reviewGit>, label: string): string {
   if (/only found copies from modified paths|rename detection was skipped|diff\.renameLimit/i.test(result.stderr ?? "")) {
     throw new Error("Git could not complete rename and copy detection. Review a smaller subject.");
@@ -206,11 +236,15 @@ function canonicalJson(value: unknown): string {
 export function buildPacket(cwd: string, request: PacketRequest): PacketBundle {
   const root = repositoryRoot(cwd);
   const subject = resolveSubject(root, request);
+  ensureBaseAttributes(root);
+  const driverOptions = diffDriverOverrides(root);
   const workspace = request.kind === "workspace" || request.kind === "files";
   const scopes = request.kind === "files" ? request.paths.map(path => repositoryPath(cwd, root, path, true)) : [];
   if (request.kind === "files" && scopes.length === 0) throw new Error("No file scope given. Pass paths after --files.");
-  if (!workspace) return buildPacketFromIndex(root, subject, scopes, []);
-  const gitOptions = [...workspaceFilterOptions(root), ...globalIgnoreOptions(root),
+  if (!workspace) return buildPacketFromIndex(root, subject, scopes, driverOptions);
+  // Compare actual worktree line endings and mode bits regardless of checkout preferences.
+  const gitOptions = [...driverOptions, ...workspaceFilterOptions(root), ...globalIgnoreOptions(root),
+    "-c", "core.autocrlf=false", "-c", "core.fileMode=true",
     "-c", "core.splitIndex=false", "-c", "add.ignoreErrors=false"];
   const untracked = names(checkedOutput(
     reviewGit(root, [...gitOptions, "ls-files", "-z", "--others", "--exclude-standard"]),

@@ -1,8 +1,8 @@
 import { afterEach, expect, test } from "bun:test";
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
-import { canonicalJson, ledgerPath, readLedger, recordId, Refusal, reviewProjectId, secretShaped, appendEvent, type LedgerEvent, type PacketBlock, type ReviewRecordV1 } from "../src/ledger.ts";
+import { canonicalJson, comparablePath, ledgerPath, readLedger, RECORD_EVENT_BOUND, recordId, Refusal, reviewProjectId, secretShaped, appendEvent, type LedgerEvent, type PacketBlock, type ReviewRecordV1 } from "../src/ledger.ts";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -121,24 +121,109 @@ test("a packet event at the 500-file ceiling fits its own bound, and so does a r
   }
 });
 
+test("a record of the largest packet and the largest report fits the record bound, which the packet bound would refuse", () => {
+  const { repo, home } = fixture();
+  // The issue's shape: the 500-unit ceiling with 400-byte paths, two rules covering all of them, and a report that
+  // covers every unit while skipping half of them with a 600-byte reason. The embedded packet alone is under the packet
+  // bound, and the record is the sum of that packet and the report - over the 1 MiB a record used to be held to.
+  const unitPath = (index: number) => `src/${String(index).padStart(3, "0")}/${"d".repeat(391)}.ts`;
+  const units = Array.from({ length: 500 }, (_, index) => ({ path: unitPath(index), status: "M", insertions: 1, deletions: 1 }));
+  const rules = ["REVIEW.md", "docs/review.md"].map(name => ({ name, sha256: "e".repeat(64), appliesTo: units.map(unit => unit.path) }));
+  const packet: PacketBlock = { id: "d".repeat(64), subject: { kind: "range", base: HEAD, head: "b".repeat(40), mergeBase: HEAD }, units, rules };
+  appendEvent(repo, {
+    v: 1, type: "record", at: "2026-11-26T00:00:01.000Z", id: "f".repeat(64),
+    record: {
+      v: 1, packet,
+      reviewer: { id: "claude", modelFamily: "anthropic", started: "self", sameFamilyFallback: false },
+      coverage: {
+        reviewed: units.map(unit => unit.path),
+        skipped: units.slice(0, 250).map(unit => ({ path: unit.path, reason: "s".repeat(600) })),
+      },
+      findings: [], verdict: "approved", call: { ok: true },
+    },
+  }, { home });
+  const line = readFileSync(ledgerPath(repo, { home }), "utf8").trim();
+  // Measured on the written line: over the packet event's 1 MiB (the bound a record was held to before this change) and
+  // under the record's own packet + report bound.
+  expect(Buffer.byteLength(line)).toBeGreaterThan(1024 * 1024);
+  expect(Buffer.byteLength(line)).toBeLessThan(2 * 1024 * 1024);
+});
+
 test("an event over its own bound is refused, and the refusal names the event type", () => {
   const { repo, home } = fixture();
   expect(() => appendEvent(repo, resolveEvent("x".repeat(300 * 1024)), { home })).toThrow("the resolve event exceeds 262144 bytes");
-  // The larger bound belongs to the events that embed a packet, and each names itself.
+  // Each of the two larger bounds belongs to its own event, and each refusal names itself.
   expect(() => appendEvent(repo, {
     v: 1, type: "packet", at: "2026-11-26T00:00:00.000Z",
     packet: { id: "d".repeat(64), subject: { kind: "range", base: HEAD, head: HEAD, mergeBase: HEAD }, units: [{ path: "x".repeat(1024 * 1024) }] },
   }, { home })).toThrow("the packet event exceeds 1048576 bytes");
+  // A record is bounded by its packet plus the report it carries, so only a payload over both is refused.
   expect(() => appendEvent(repo, {
     v: 1, type: "record", at: "2026-11-26T00:00:00.000Z", id: "f".repeat(64),
     record: {
       v: 1,
       packet: { id: "d".repeat(64), subject: { kind: "range", base: HEAD, head: HEAD, mergeBase: HEAD }, units: [{ path: "x".repeat(1024 * 1024) }] },
       reviewer: { id: "claude", modelFamily: "anthropic", started: "self", sameFamilyFallback: false },
-      coverage: { reviewed: [], skipped: [] }, findings: [], verdict: "approved", call: { ok: true },
+      coverage: { reviewed: [], skipped: [{ path: "src/a.ts", reason: "x".repeat(2 * 1024 * 1024) }] },
+      findings: [], verdict: "approved", call: { ok: true },
     },
-  }, { home })).toThrow("the record event exceeds 1048576 bytes");
+  }, { home })).toThrow(`the record event exceeds ${RECORD_EVENT_BOUND} bytes`);
   expect(existsSync(ledgerPath(repo, { home }))).toBe(false);
+});
+
+test("a checkout whose worktree root cannot be read refuses the ledger rather than skipping the containment check", () => {
+  const root = mkdtempSync(join(tmpdir(), "arev-ledger-broken-"));
+  roots.push(root);
+  // A `.git` entry git itself cannot read: `rev-parse --show-toplevel` fails, and the containment check would be skipped.
+  // The marker is what separates that from the supported case of a plain directory outside any repository, which the
+  // next assertion keeps readable - `arev show` exits 0 there with its no-ledger line.
+  const broken = join(root, "broken");
+  mkdirSync(broken);
+  writeFileSync(join(broken, ".git"), "gitdir: /nonexistent/gitdir\n");
+  expect(() => ledgerPath(broken, { home: join(root, "agenthub") }))
+    .toThrow("so where the ledger lives cannot be checked");
+  // A marker that exists but cannot be followed is the same checkout: a `.git` symlink whose target is gone reads as
+  // absent to a stat that follows links, and skipping the check there is the fail-open this signal exists to close.
+  const unlinked = join(root, "unlinked");
+  mkdirSync(unlinked);
+  symlinkSync(join(root, "gone"), join(unlinked, ".git"));
+  expect(() => ledgerPath(unlinked, { home: join(root, "agenthub") }))
+    .toThrow("so where the ledger lives cannot be checked");
+  // The search runs to the filesystem root, so distance does not turn the same checkout into "no marker": a fixed
+  // ancestor count would stop short of the marker here and skip the check, one level further away from the same hole.
+  const deep = join(unlinked, ...Array.from({ length: 70 }, (_, index) => `d${index}`));
+  mkdirSync(deep, { recursive: true });
+  expect(() => ledgerPath(deep, { home: join(root, "agenthub") }))
+    .toThrow("so where the ledger lives cannot be checked");
+  // The refusal names that directory only when it may be shown: a secret-shaped segment makes it `<withheld>`, the same
+  // screen every other refusal value goes through.
+  const secret = join(root, "sk-abcdefghijklmnopqrstuvwx");
+  mkdirSync(secret);
+  writeFileSync(join(secret, ".git"), "gitdir: /nonexistent/gitdir\n");
+  let refusal = "";
+  try {
+    ledgerPath(secret, { home: join(root, "agenthub") });
+  } catch (error) {
+    refusal = (error as Refusal).message;
+  }
+  expect(refusal).toContain("arev cannot read the worktree root of <withheld>");
+  expect(refusal).not.toContain("abcdefghijklmnopqrstuvwx");
+  const outside = join(root, "plain");
+  mkdirSync(outside);
+  expect(ledgerPath(outside, { home: join(root, "agenthub") })).toContain(join("review"));
+});
+
+test("a missing path below a symlinked ancestor is resolved however deep it is", () => {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), "arev-ledger-deep-")));
+  roots.push(base);
+  const real = join(base, "real"), alias = join(base, "alias");
+  mkdirSync(real);
+  symlinkSync(real, alias);
+  // Nothing below the alias exists yet - a ledger file's own path is the usual case - so the walk has to reach the alias
+  // itself. A fixed step count stops short and answers with the unresolved spelling, which is the mismatch between a
+  // path spelled through a link and the worktree root this resolution exists to prevent.
+  const below = Array.from({ length: 70 }, (_, index) => `d${index}`);
+  expect(comparablePath(join(alias, ...below))).toBe(join(real, ...below));
 });
 
 test("a repository without an origin keeps one ledger across its linked worktrees", () => {

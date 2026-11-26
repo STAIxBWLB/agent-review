@@ -11,9 +11,9 @@
  * - `--implementer` is any identity, not only a review host: an implementer can be a peer that is never a host (`qwen`),
  *   and the script's `choices=ORDER` would have refused to name it.
  */
-import { accessSync, constants, readFileSync, statSync } from "node:fs";
+import { accessSync, constants, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { delimiter, join } from "node:path";
+import { delimiter, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { EXIT } from "@staix/cli-output";
 import { secretShaped } from "./ledger.ts";
@@ -66,8 +66,8 @@ export function chooseHost(pr: number, implementer: string, available: ReadonlyS
   return available.has(implementer) ? { host: implementer, reason: "same-family fallback", considered } : { reason: BLOCKED, considered };
 }
 
-/** Whether `cli` is an executable file in one of the PATH directories, as a shell would run it. */
-export function onPath(cli: string, pathEnv: string): boolean {
+/** Find the executable once so a later cwd change cannot select a different program. */
+export function hostExecutable(cli: string, pathEnv: string, allowed = (_path: string) => true): string | undefined {
   for (const directory of pathEnv.split(delimiter)) {
     // An empty component means the current directory to a shell and to `which`, and this process runs inside the
     // reviewed checkout: a `codex` planted there would be resolved and started. So an empty component is skipped,
@@ -77,12 +77,17 @@ export function onPath(cli: string, pathEnv: string): boolean {
     try {
       if (!statSync(candidate).isFile()) continue;
       accessSync(candidate, constants.X_OK);
-      return true;
+      const path = realpathSync(candidate);
+      if (allowed(path)) return resolve(candidate);
     } catch {
       continue;
     }
   }
-  return false;
+  return undefined;
+}
+
+export function onPath(cli: string, pathEnv: string): boolean {
+  return hostExecutable(cli, pathEnv) !== undefined;
 }
 
 /** The hosts of `order` whose CLI is on PATH and that `--unavailable` does not name. */

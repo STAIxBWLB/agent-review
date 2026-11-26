@@ -139,7 +139,17 @@ function optionalText(row: Record<string, unknown>, key: string, max: number, fi
   return row[key] === undefined ? undefined : text(row[key], max, field, kind);
 }
 
+export interface RunAttestation {
+  packetId: string;
+  host: string;
+  model: string;
+  implementer: string;
+  sameFamilyFallback: boolean;
+}
+
 export interface RecordOptions {
+  /** A trusted attestation supplied only by the run command. */
+  run?: RunAttestation;
   /** Override the command named in report-validation repair guidance. */
   retryCommand?: string;
   /** The packet arev built for this head, as the ledger holds it. */
@@ -190,21 +200,30 @@ function validateReviewRecord(raw: unknown, options: RecordOptions): ReviewRecor
 
   const reviewerRow = closed(row.reviewer, ["id", "modelFamily", "model", "started", "implementer", "sameFamilyFallback"], "reviewer");
   if (!reviewerRow) refuse("reviewer must be a plain object with id, modelFamily, started and sameFamilyFallback", "add the reviewer block to the report");
-  const declaredImplementer = optionalText(reviewerRow, "implementer", MAX_NAME, "reviewer.implementer");
-  const flaggedImplementer = options.implementer === undefined ? undefined : cliText(options.implementer, MAX_NAME, "--implementer");
-  if (declaredImplementer !== undefined && flaggedImplementer !== undefined && declaredImplementer !== flaggedImplementer) {
-    refuse(`--implementer ${shown(flaggedImplementer)} disagrees with the report's reviewer.implementer ${echoName(declaredImplementer)}`,
-      "drop one of them; --implementer overrides only when the report states none");
+  let reviewer: ReviewRecordV1["reviewer"];
+  if (options.run) {
+    const { host, model, implementer, sameFamilyFallback } = options.run;
+    if (options.run.packetId !== options.packet.id) {
+      refuse("The reviewer reported a different packet from the one given to this run", "use the packet issued for this review");
+    }
+    reviewer = { id: host, modelFamily: host, model, implementer, sameFamilyFallback, started: "run" };
+  } else {
+    const declaredImplementer = optionalText(reviewerRow, "implementer", MAX_NAME, "reviewer.implementer");
+    const flaggedImplementer = options.implementer === undefined ? undefined : cliText(options.implementer, MAX_NAME, "--implementer");
+    if (declaredImplementer !== undefined && flaggedImplementer !== undefined && declaredImplementer !== flaggedImplementer) {
+      refuse(`--implementer ${shown(flaggedImplementer)} disagrees with the report's reviewer.implementer ${echoName(declaredImplementer)}`,
+        "drop one of them; --implementer overrides only when the report states none");
+    }
+    if (typeof reviewerRow.sameFamilyFallback !== "boolean") refuse("reviewer.sameFamilyFallback must be true or false", "set it in the report: true when the reviewer is the implementer's family and the gate may allow it");
+    reviewer = {
+      id: text(reviewerRow.id, MAX_NAME, "reviewer.id"),
+      modelFamily: text(reviewerRow.modelFamily, MAX_FAMILY, "reviewer.modelFamily"),
+      started: oneOf(reviewerRow.started, ["self", "manual"] as const, "reviewer.started"),
+      sameFamilyFallback: reviewerRow.sameFamilyFallback,
+      ...(reviewerRow.model === undefined ? {} : { model: text(reviewerRow.model, MAX_NAME, "reviewer.model") }),
+      ...((declaredImplementer ?? flaggedImplementer) === undefined ? {} : { implementer: declaredImplementer ?? flaggedImplementer }),
+    };
   }
-  if (typeof reviewerRow.sameFamilyFallback !== "boolean") refuse("reviewer.sameFamilyFallback must be true or false", "set it in the report: true when the reviewer is the implementer's family and the gate may allow it");
-  const reviewer: ReviewRecordV1["reviewer"] = {
-    id: text(reviewerRow.id, MAX_NAME, "reviewer.id"),
-    modelFamily: text(reviewerRow.modelFamily, MAX_FAMILY, "reviewer.modelFamily"),
-    started: oneOf(reviewerRow.started, ["self", "manual"] as const, "reviewer.started"),
-    sameFamilyFallback: reviewerRow.sameFamilyFallback,
-    ...(reviewerRow.model === undefined ? {} : { model: text(reviewerRow.model, MAX_NAME, "reviewer.model") }),
-    ...((declaredImplementer ?? flaggedImplementer) === undefined ? {} : { implementer: declaredImplementer ?? flaggedImplementer }),
-  };
 
   const coverageRow = closed(row.coverage, ["reviewed", "skipped"], "coverage");
   if (!coverageRow) refuse("coverage must be a plain object with reviewed and skipped", "add the coverage block to the report");
@@ -633,9 +652,9 @@ function parseArgs(args: readonly string[], spec: { value: readonly string[]; bo
 
 /** Validate and append one report for callers that already have its decoded value. */
 export function recordReview(
-  cwd: string, raw: unknown, options: { label: string; implementer?: string; light?: boolean },
+  cwd: string, raw: unknown, options: { label: string; implementer?: string; light?: boolean; run?: RunAttestation },
 ) {
-  const { implementer, light } = options;
+  const { implementer, light, run } = options;
   const label = shown(options.label);
   // The raw screen cannot see a JSON escape, which the parse has now decoded: `\u0041` spells `A`, so a report can carry
   // a secret-shaped value past it. Every string the parsed report holds is screened the same way, still naming no value.
@@ -663,7 +682,7 @@ export function recordReview(
   }
   const packetEvent = requireCurrentPacket(cwd, head, packetId, events);
   const cap = packetEvent.review?.advisory_cap ?? DEFAULT_ADVISORY_CAP;
-  const record = parseReviewRecord(raw, { packet: packetEvent.packet, maxAdvisories: cap,
+  const record = parseReviewRecord(raw, { packet: packetEvent.packet, maxAdvisories: cap, run,
     ...(implementer === undefined ? {} : { implementer }), ...(light ? { light: true } : {}) });
   const id = recordId(record);
   appendEvent(cwd, { v: 1, type: "record", at: new Date().toISOString(), id, record });

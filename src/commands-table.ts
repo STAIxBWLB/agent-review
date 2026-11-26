@@ -9,6 +9,8 @@ export const commands = [
     syntax: "import --from ocr|brief <file>" },
   { name: "export", aliases: [], description: "Export a recorded review",
     syntax: "export --to hub|markdown [--head SHA] [--pr N|none]" },
+  { name: "run", aliases: [], description: "Run a read-only reviewer and record its report",
+    syntax: "run [--pr N] [--host ID] --implementer ID [--timeout MIN] [--out DIR]" },
   { name: "status", aliases: [], description: "Show implementation status" },
   { name: "record", aliases: [], description: "Validate a review report against the packet for its head and append it to the ledger",
     syntax: "record <report.json> [--implementer NAME] [--light] [--json]" },

@@ -234,8 +234,8 @@ function names(stdout: string): string[] {
 }
 
 // Workspace comparisons may run checkout filters. Disable the configured commands before asking Git to diff.
-function workspaceFilterOptions(cwd: string): string[] {
-  const configured = reviewGit(cwd, ["config", "--null", "--name-only", "--get-regexp", "^filter\\..*\\.(clean|process|required)$"]);
+export function workspaceFilterOptions(cwd: string): string[] {
+  const configured = reviewGit(cwd, ["config", "--null", "--name-only", "--get-regexp", "^filter\\..*\\.(clean|smudge|process|required)$"]);
   if (configured.status !== 0 && configured.status !== 1) {
     throw new Error("Cannot inspect workspace Git filters. Check the repository Git configuration.");
   }

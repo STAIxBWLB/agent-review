@@ -4,6 +4,7 @@ import { commandUsage, commands, usage } from "./commands-table.ts";
 import { setupCommand } from "./setup.ts";
 import { mcpCommand } from "./mcp.ts";
 import { gateCommand } from "./gate.ts";
+import { runCommand } from "./run.ts";
 import { hostCommand } from "./host.ts";
 import { Refusal } from "./ledger.ts";
 import { PacketUsageError, runPacket, runRules } from "./packet-cli.ts";
@@ -11,9 +12,10 @@ import { recordCommand, resolveCommand, showCommand } from "./record.ts";
 import { importCommand } from "./import.ts";
 import { exportCommand } from "./export.ts";
 
-type Runner = (cwd: string, args: readonly string[]) => number | void;
+type Runner = (cwd: string, args: readonly string[]) => number | void | Promise<number>;
 const RUN = {
   host: hostCommand,
+  run: runCommand,
   packet: runPacket,
   rules: runRules,
   import: importCommand,
@@ -27,7 +29,7 @@ const RUN = {
 } as const satisfies Record<string, Runner>;
 const dispatchable = (name: string): name is keyof typeof RUN => Object.hasOwn(RUN, name);
 
-export function main(args: readonly string[]): number {
+export async function main(args: readonly string[]): Promise<number> {
   const [first = "--help", ...extra] = args;
   const command = commands.find(({ name, aliases }) =>
     name === first || aliases.some(alias => alias === first));
@@ -38,7 +40,7 @@ export function main(args: readonly string[]): number {
       return EXIT.ok;
     }
     try {
-      const code = RUN[command.name](process.cwd(), extra);
+      const code = await RUN[command.name](process.cwd(), extra);
       return typeof code === "number" ? code : EXIT.ok;
     } catch (error) {
       for (const line of errorLine("arev", error instanceof Error ? error.message : "Command failed.", "", {

@@ -71,7 +71,7 @@ export interface RecordFinding {
 export interface ReviewRecordV1 {
   v: 1;
   packet: PacketBlock;
-  reviewer: { id: string; modelFamily: string; model?: string; started: "self" | "manual"; implementer?: string; sameFamilyFallback: boolean };
+  reviewer: { id: string; modelFamily: string; model?: string; started: "self" | "manual" | "run"; implementer?: string; sameFamilyFallback: boolean };
   coverage: { reviewed: string[]; skipped: { path: string; reason: string }[] };
   findings: RecordFinding[];
   verdict: "approved" | "changes_requested";

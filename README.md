@@ -11,6 +11,7 @@
 - `arev rules`: Read the rules that apply to paths
 - `arev import`: Import a legacy review report
 - `arev export`: Export a recorded review
+- `arev run`: Run a read-only reviewer and record its report
 - `arev status`: Show implementation status
 - `arev record`: Validate a review report against the packet for its head and append it to the ledger
 - `arev resolve`: Settle a recorded finding as fixed, false_positive or accepted
@@ -114,6 +115,19 @@ head and base.
 to the host configuration path. Run `arev setup <host> --undo` in the same
 configuration to revert what setup installed.
 
+## Running a review
+
+Run `arev run --pr N --implementer ID` to select a reviewer, export the packet
+and contract, and run the reviewer in a detached worktree. Without `--pr`,
+the run reviews HEAD against the origin default branch and starts the
+automatic host rotation at the first host. Pass `--host ID` to select an
+installed reviewer explicitly.
+
+The default timeout is 30 minutes. Use `--out DIR` outside the source
+worktree to choose where packet files and reviewer output are saved. A dirty
+reviewer checkout is retained for inspection and its review is void.
+Use `arev gate` to check the recorded result.
+
 ## Development
 
 With Bun 1.4.4 or later, run:
@@ -130,3 +144,6 @@ Regenerate the command list with `bun scripts/gen-readme.ts` after editing
 
 - On 2026-11-26, aligned the dependency rule with AC10's declared range for
   `@staix/agent-mem` and exact pins for the other two runtime packages.
+
+- On 2026-11-26, documented the V2 decision to launch an installed reviewer
+  CLI for read-only review without passing provider credentials.

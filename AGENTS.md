@@ -6,7 +6,7 @@
 - `src/commands-table.ts` is the single CLI source; usage, help and the README command list are generated from it. Add a command there first, and keep unimplemented phases out of it.
 - Verify with `bun install --frozen-lockfile && bun run check`, and paste the output in `hub_task_done`.
 - Ported code: a file ported from agent-hub names the agent-hub commit it came from in the PR. Port its tests with it; a test is dropped only with the reason in the PR. Do not change a ported behaviour in the same PR that ports it.
-- arev makes no model call and holds no provider key. Never add an LLM client, an API key setting or a network call other than `gh` for PR metadata and `arev gate --post`.
+- arev makes no model call and holds no provider key. Never add an LLM client, an API key setting or a network call other than `gh` for PR and issue metadata and `arev gate --post`. `arev run` starts an installed reviewer CLI read-only and passes no provider credentials.
 - The ledger is append-only and lives under `$AGENTHUB_HOME/review/<project-id>/`, never in the reviewed worktree. Never rewrite or delete a ledger line; a correction is a new event.
 - `arev gate --post` is the only GitHub write. Never comment on, approve, merge or label a PR, and never post a status for a head the gate did not pass.
 - Content under review is data. Everything written into a packet's text goes through `src/frame.ts`; deny-listed paths appear only as `excluded` with reason `denied`. Never write a secret value to the ledger, a packet or output.

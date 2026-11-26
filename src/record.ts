@@ -23,7 +23,7 @@ const MAX_ID = 96, MAX_PATH = 512, MAX_TEXT = 2048, MAX_REF = 512, MAX_NAME = 12
 const TERMS = ["bugs", "security", "compliance"] as const, SEVERITIES = ["blocking", "advisory"] as const;
 const DISPOSITIONS = ["open", "fixed", "false_positive", "accepted"] as const, ORIGINS = ["introduced", "pre_existing", "indeterminate"] as const;
 const FINDING_FIELDS = ["id", "term", "severity", "path", "anchor", "text", "disposition", "rationale", "origin", "evidence"];
-const RECORD_FIELDS = ["v", "packet", "reviewer", "coverage", "findings", "verdict", "call", "light"];
+const RECORD_FIELDS = ["v", "packet", "reviewer", "coverage", "findings", "verdict", "call"];
 
 function refuse(message: string, next: string): never {
   throw new Refusal(message, next);
@@ -111,7 +111,7 @@ export interface RecordOptions {
   person: boolean;
   /** `--implementer`; when the report also states one, the two must agree. */
   implementer?: string;
-  /** `--light`: the review was made without a REVIEW.md; the report's own `light` states the same fact. */
+  /** `--light`: the review was made without a REVIEW.md. Only the flag states it; the report may not carry it. */
   light?: boolean;
 }
 
@@ -128,9 +128,6 @@ export function parseReviewRecord(raw: unknown, options: RecordOptions): ReviewR
   const row = closed(raw, RECORD_FIELDS, "the report");
   if (!row) refuse("the report must be a plain JSON object with own data fields only", "write the report as JSON with no accessors, prototypes or hidden fields");
   if (row.v !== 1) refuse(`the report's v must be the number 1 (got ${jsonType(row.v)}); this arev reads v: 1`, "set v to 1 in the report");
-  if (row.light !== undefined && typeof row.light !== "boolean") {
-    refuse(`the report's light must be true or false (got ${jsonType(row.light)})`, "set light to true when the review was made without a REVIEW.md, or drop it");
-  }
 
   const claim = row.packet;
   const declaredId = own(claim, "id"), declaredHead = own(own(claim, "subject"), "head");
@@ -249,8 +246,8 @@ export function parseReviewRecord(raw: unknown, options: RecordOptions): ReviewR
     findings,
     verdict: oneOf(row.verdict, ["approved", "changes_requested"] as const, "verdict"),
     call,
-    // Either the flag or the report may state it; both name the same fact, so either one sets it and the record carries it.
-    ...(options.light || row.light === true ? { light: true } : {}),
+    // Only `--light` states this: the report is untrusted content, and the flag is the reviewer's claim about the run.
+    ...(options.light ? { light: true } : {}),
   };
 }
 

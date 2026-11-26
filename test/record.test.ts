@@ -254,12 +254,12 @@ test("arev record without a packet for the head names the packet command", () =>
   expect(result.stderr).toContain("arev packet");
 });
 
-test("light is a record field, set by the flag or stated in the report", () => {
+test("light comes only from the --light flag, and a report that carries it is refused as an unknown field", () => {
   expect(parseReviewRecord(reportFor(HEAD), options).light).toBeUndefined();
   expect(parseReviewRecord(reportFor(HEAD), { ...options, light: true }).light).toBe(true);
-  expect(parseReviewRecord(reportFor(HEAD, { light: true }), options).light).toBe(true);
-  // It is a declared field, so a wrong type is refused by name rather than ignored.
-  expect(() => parseReviewRecord(reportFor(HEAD, { light: SECRET }), options)).toThrow("the report's light must be true or false (got string)");
+  // The flag is the reviewer's claim about the run, not review content, so the report may not state it.
+  expect(() => parseReviewRecord(reportFor(HEAD, { light: true }), options)).toThrow("the report has an unknown field (light)");
+  expect(() => parseReviewRecord(reportFor(HEAD, { light: false }), options)).toThrow("the report has an unknown field (light)");
 });
 
 test("arev record --light keeps the flag on the record it appends, and show --json echoes it", () => {
@@ -297,6 +297,21 @@ test("arev record --light keeps the flag on the record it appends, and show --js
   expect(records).toHaveLength(2);
   expect(records[0].record.light).toBe(true);
   expect(records[1].record.light).toBeUndefined();
+
+  // A report cannot assert its own lightness: only `arev record --light` may, and the refusal says so by naming the field.
+  const stated = join(root, "report-light.json");
+  writeFileSync(stated, JSON.stringify(reportFor(head, {
+    light: true,
+    packet: { id: packet.id, subject: packet.subject },
+    coverage: { reviewed: packet.units.map((unit: { path: string }) => unit.path), skipped: [] },
+  })));
+  const refused = run(repo, home, "record", stated);
+  expect(refused.code).toBe(1);
+  expect(refused.stderr).toContain("the report has an unknown field (light)");
+  // The refused run wrote nothing: the view still shows the last accepted record, and the ledger has two.
+  expect(JSON.parse(run(repo, home, "show", "--json").stdout).record).toBe(plain.record);
+  expect(readFileSync(join(home, "review", "github.com/owner/repo", "ledger.jsonl"), "utf8")
+    .split("\n").filter(Boolean).map(line => JSON.parse(line)).filter(event => event.type === "record")).toHaveLength(2);
 });
 
 const SECRET = `ghp_${"a".repeat(36)}`;

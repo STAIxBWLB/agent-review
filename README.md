@@ -135,9 +135,16 @@ installed reviewer explicitly.
 
 Supported reviewers submit one validated report over the scoped MCP stdio
 channel. The runner records the staged report after it verifies the checkout.
-Codex waits for the run-scoped server to initialize before its first turn. A
-server startup failure stops the Codex run. If a reviewer finishes without
-staging a report, the runner can still read a JSON report from its output.
+Codex waits for the run-scoped server and pre-approves only its four review
+tools. Its global approval policy and read-only sandbox still apply. A
+server startup failure stops the Codex run.
+
+Claude starts in plan mode with user plugins and hooks disabled and the
+scoped MCP config supplied explicitly. A Kimi CLI without an MCP config flag
+reads the bundle files directly. If a reviewer finishes without staging a
+report, the prompt gives an exact JSON example with string paths in
+`coverage.reviewed`. The runner also accepts the opening-fence bullet that
+Kimi's text renderer may add.
 
 To verify the MCP channel with an installed and authenticated Codex CLI, run
 `arev run --host codex --implementer <id> --out <fresh-dir>` on a reviewable

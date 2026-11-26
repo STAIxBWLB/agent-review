@@ -64,9 +64,10 @@ last one left, as `same-family fallback`, so a review never runs on the AI that
 wrote the change unless nothing else can run.
 
 The model is the `model` key of `~/.codex/config.toml`, the `default_model` key
-of `~/.kimi-code/config.toml`, and `unknown` for every other host. Only that key
-is read. A value that is not a plain name reads as `unknown` as well, and the
-command reads no repository and writes no ledger.
+of `~/.kimi-code/config.toml`, and `unknown` for every other host. Only that
+key's value reaches the answer. A value that is not a plain name reads as
+`unknown` as well, and so does a config TOML itself does not accept; the command
+reads no repository and writes no ledger.
 
 `--json` prints `host`, `model`, `reason` and `considered`. When no host can run,
 it exits nonzero and names the next step.

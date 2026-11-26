@@ -87,63 +87,17 @@ export function availableHosts(unavailable: ReadonlySet<string>, pathEnv: string
   return new Set(order.filter(host => !unavailable.has(host) && onPath(host, pathEnv)));
 }
 
-/** The escapes a TOML basic string defines, other than the two numeric forms. */
-const TOML_ESCAPES: Record<string, string> = { b: "\b", t: "\t", n: "\n", f: "\f", r: "\r", '"': '"', "\\": "\\" };
-/** The four and eight digit escapes, as `\uXXXX` and `\UXXXXXXXX`. */
-const TOML_LONG: Record<string, number> = { u: 4, U: 8 };
-
-/** A TOML basic string's body decoded, or `undefined` when it carries an escape TOML does not define. */
-function basicString(body: string): string | undefined {
-  let out = "";
-  for (let index = 0; index < body.length; index++) {
-    const char = body[index]!;
-    if (char !== "\\") {
-      out += char;
-      continue;
-    }
-    const escape = body[++index];
-    if (escape === undefined) return undefined;
-    const short = TOML_ESCAPES[escape];
-    if (short !== undefined) {
-      out += short;
-      continue;
-    }
-    const width = TOML_LONG[escape];
-    const hex = width === undefined ? "" : body.slice(index + 1, index + 1 + width);
-    if (width === undefined || hex.length !== width || !/^[0-9a-fA-F]+$/.test(hex)) return undefined;
-    const codePoint = Number.parseInt(hex, 16);
-    // A surrogate half and anything past the last code point are not characters a string can hold.
-    if (codePoint > 0x10ffff || (codePoint >= 0xd800 && codePoint <= 0xdfff)) return undefined;
-    out += String.fromCodePoint(codePoint);
-    index += width;
-  }
-  return out;
-}
-
 /**
- * The value of one top-level string key of a TOML document, or `undefined`. Only the top level is read: a `model` inside
- * a profile table is not the model the host runs. A key may be bare, basic-quoted or literal-quoted, and a value is a
- * single-line basic or literal string, decoded by TOML's own escapes so a model written with one attests as itself.
- */
-function tomlString(text: string, key: string): string | undefined {
-  for (const line of text.split(/\r?\n/)) {
-    const entry = line.trim();
-    if (entry.startsWith("[")) return undefined;
-    const match = /^(?:"([^"]*)"|'([^']*)'|([A-Za-z0-9_-]+))\s*=\s*(.+)$/.exec(entry);
-    if (!match || (match[1] ?? match[2] ?? match[3]) !== key) continue;
-    const value = match[4]!.trim();
-    const basic = /^"((?:[^"\\]|\\.)*)"\s*(?:#.*)?$/.exec(value);
-    if (basic) return basicString(basic[1]!);
-    const literal = /^'([^']*)'\s*(?:#.*)?$/.exec(value);
-    return literal ? literal[1]! : undefined;
-  }
-  return undefined;
-}
-
-/**
- * The model the host's own config names, or `unknown` (spec #24 AC2). Only that one key's value leaves this function: a
- * value that is empty, over 128 bytes, carries control characters or is secret-shaped is not a model name, so it reads as
- * `unknown` rather than reaching output or, through `arev run`, the ledger.
+ * The model the host's own config names, or `unknown` (spec #24 AC2).
+ *
+ * The document is read by TOML's own parser, not line by line. A line reader cannot tell a key from the body of a
+ * multiline string or a comment, and this config class is exactly where multiline text lives: a description holding a
+ * line that looks like `model = "..."` was returned instead of the key that follows it. Parsing also settles quoted
+ * keys, escapes and `#` comments without a rule of my own for each.
+ *
+ * Only that one top-level key's value leaves this function: a `model` inside a table is not the model the host runs, and
+ * a value that is not a string, is empty, over 128 bytes, carries control characters or is secret-shaped is not a model
+ * name, so it reads as `unknown` rather than reaching output or, through `arev run`, the ledger.
  */
 export function modelOf(host: string, home: string): string {
   const config = ({ codex: { file: ".codex/config.toml", key: "model" },
@@ -156,8 +110,16 @@ export function modelOf(host: string, home: string): string {
     return "unknown";
   }
   if (Buffer.byteLength(text) > MAX_CONFIG_BYTES) return "unknown";
-  const value = tomlString(text, config.key);
-  if (value === undefined || value.length === 0 || Buffer.byteLength(value) > MAX_MODEL_BYTES
+  let document: Record<string, unknown>;
+  try {
+    // A TOML document is a table, so the parse result is a plain object of its top-level keys.
+    document = Bun.TOML.parse(text) as Record<string, unknown>;
+  } catch {
+    // Not TOML the parser accepts: an undefined escape, a broken table, a duplicate key. No model name to attest.
+    return "unknown";
+  }
+  const value = Object.hasOwn(document, config.key) ? document[config.key] : undefined;
+  if (typeof value !== "string" || value.length === 0 || Buffer.byteLength(value) > MAX_MODEL_BYTES
     || /[\p{Cc}\p{Cf}]/u.test(value) || secretShaped(value)) return "unknown";
   return value;
 }

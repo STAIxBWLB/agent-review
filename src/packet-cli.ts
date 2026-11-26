@@ -3,7 +3,7 @@ import { dirname, resolve, sep } from "node:path";
 import { parseArgs } from "node:util";
 import { EXIT, errorLine } from "@staix/cli-output";
 import { Refusal, appendEvent, comparablePath } from "./ledger.ts";
-import { buildPacket, repositoryPath, type PacketBundle, type PacketRequest } from "./packet.ts";
+import { buildPacket, packetBrief, packetResult, repositoryPath, type PacketBundle, type PacketRequest } from "./packet.ts";
 import { parseReviewMd, type ReviewMdSettings } from "./review-md.ts";
 import { commitOid, mergeBaseOid, repositoryRoot, reviewGit } from "./review-git.ts";
 import { readRules, renderRules } from "./rules.ts";
@@ -130,7 +130,7 @@ export function runPacket(cwd: string, args: readonly string[]): number | void {
         "packet.json": `${json}\n`,
         "diff.patch": bundle.diff,
         "rules.md": `${bundle.rules}\n`,
-        "brief.md": `${bundle.brief}\n`,
+        "brief.md": `${packetBrief(bundle, "file")}\n`,
         ...(bundle.contractText === undefined ? {} : { "contract.md": bundle.contractText }),
       })) {
         const path = resolve(destination, name);
@@ -158,7 +158,12 @@ export function runPacket(cwd: string, args: readonly string[]): number | void {
   if (values.json && bundle.rulesMissing.some(rule => rule.source === "REVIEW.md")) {
     console.error("arev: REVIEW.md is unavailable at the merge base. Rerun without --json or use --out DIR for the brief.");
   }
-  console.log(values.json ? json : bundle.brief);
+  if (values.json) {
+    console.log(bundle.contractText === undefined ? json : JSON.stringify(packetResult(bundle), null, 2));
+  } else {
+    console.log(packetBrief(bundle, "inline"));
+    if (bundle.contractText !== undefined) process.stdout.write(`\n${bundle.contractText}`);
+  }
 }
 
 export function runRules(cwd: string, args: readonly string[]): void {

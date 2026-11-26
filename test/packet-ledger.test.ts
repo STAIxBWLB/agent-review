@@ -147,7 +147,7 @@ test("arev packet --pr N names the PR in the packet's subject, and the report wr
     `printf '{"baseRefOid":"${base}","headRefOid":"${head}"}'\n`, { mode: 0o755 });
   const built = cli("packet", "--pr", "7", "--json");
   expect(built.status).toBe(0);
-  const packet = JSON.parse(built.stdout) as BuiltPacket & { subject: { pr?: number } };
+  const packet = JSON.parse(built.stdout).packet as BuiltPacket & { subject: { pr?: number } };
   expect(packet.subject).toMatchObject({ kind: "range", base, head, pr: 7 });
 
   // The repository is origin's, never the one gh resolves for itself: a fork's PR 7 is not the PR this packet reviews.
@@ -192,10 +192,10 @@ test("a resolve names its own PR, so a head with a packet but no record settles 
 
   // PR 7 reports it at its first head, PR 8 reports it at its own head.
   gh(head);
-  const firstPacket = JSON.parse(cli("packet", "--pr", "7", "--json").stdout) as BuiltPacket;
+  const firstPacket = JSON.parse(cli("packet", "--pr", "7", "--json").stdout).packet as BuiltPacket;
   expect(cli("record", report(reportFor(firstPacket, { findings: [blocking], verdict: "changes_requested" }))).status).toBe(0);
   gh(second);
-  const otherPacket = JSON.parse(cli("packet", "--pr", "8", "--json").stdout) as BuiltPacket;
+  const otherPacket = JSON.parse(cli("packet", "--pr", "8", "--json").stdout).packet as BuiltPacket;
   // A second id only this PR reports, so the resolve below can be refused for the thread alone rather than for existence.
   const otherOnly = { ...blocking, id: "bugs:other-only", text: "only the other PR reports this" };
   expect(cli("record", report(reportFor(otherPacket, { findings: [blocking, otherOnly], verdict: "changes_requested" }))).status).toBe(0);
@@ -236,8 +236,8 @@ test("two PRs share one head, so each report records against its own packet and 
   const gh = (ref: string) => writeFileSync(join(bin, "gh"),
     `#!/bin/sh\nprintf '{"baseRefOid":"${base}","headRefOid":"${ref}"}'\n`, { mode: 0o755 });
   gh(head);
-  const seven = JSON.parse(cli("packet", "--pr", "7", "--json").stdout) as BuiltPacket;
-  const eight = JSON.parse(cli("packet", "--pr", "8", "--json").stdout) as BuiltPacket;
+  const seven = JSON.parse(cli("packet", "--pr", "7", "--json").stdout).packet as BuiltPacket;
+  const eight = JSON.parse(cli("packet", "--pr", "8", "--json").stdout).packet as BuiltPacket;
   expect(seven.subject).toMatchObject({ pr: 7 });
   expect(eight.subject).toMatchObject({ pr: 8 });
   expect(seven.id).not.toBe(eight.id);
@@ -290,11 +290,11 @@ test("two PRs share one head, so each report records against its own packet and 
   };
   const sevenNext = commit("export const a = 5;\n", "PR 7 second head");
   gh(sevenNext);
-  const sevenSecond = JSON.parse(cli("packet", "--pr", "7", "--json").stdout) as BuiltPacket;
+  const sevenSecond = JSON.parse(cli("packet", "--pr", "7", "--json").stdout).packet as BuiltPacket;
   expect(cli("record", report(reportFor(sevenSecond, { findings: [sevenOnly], verdict: "changes_requested" }))).status).toBe(0);
   const eightNext = commit("export const a = 6;\n", "PR 8 second head");
   gh(eightNext);
-  const eightSecond = JSON.parse(cli("packet", "--pr", "8", "--json").stdout) as BuiltPacket;
+  const eightSecond = JSON.parse(cli("packet", "--pr", "8", "--json").stdout).packet as BuiltPacket;
   expect(cli("record", report(reportFor(eightSecond, { findings: [eightOnly], verdict: "changes_requested" }))).status).toBe(0);
   const backToSeven = cli("resolve", "bugs:seven-only", "--pr", "7", "--as", "fixed");
   expect(backToSeven.stdout).toContain(`at ${sevenNext}`);
@@ -457,7 +457,17 @@ esac
   writeFileSync(join(bin, "issue-22.json"), JSON.stringify({ body: "Amended issue requirement." }));
   const amended = cli("packet", "--pr", "7", "--json");
   expect(amended.status, amended.stderr).toBe(0);
-  expect(JSON.parse(amended.stdout).id).not.toBe(original.id);
+  const json = JSON.parse(amended.stdout);
+  expect(json.packet.id).not.toBe(original.id);
+  expect(json.contract).toContain("> Amended issue requirement.");
+  expect(json.packet.contract.sha256).toBe(createHash("sha256").update(json.contract).digest("hex"));
+  expect(json.brief).toContain("the contract field of this result");
+  expect(json.brief).not.toContain("contract.md");
+  const plain = cli("packet", "--pr", "7");
+  expect(plain.status).toBe(0);
+  expect(plain.stdout).toContain("the framed contract below");
+  expect(plain.stdout).toContain(json.contract);
+  expect(plain.stdout).not.toContain("contract.md");
 
   writeFileSync(gh, "#!/bin/sh\nexit 42\n");
   const recorded = cli("record", report(reportFor(original)));
@@ -501,8 +511,10 @@ test("a local --contract file is framed and is part of the packet identity", () 
   writeFileSync(file, "## Amended local fixture heading\n");
   const changed = cli("packet", "--from", base, "--to", head, "--contract", file, "--json");
   expect(changed.status, changed.stderr).toBe(0);
-  expect(JSON.parse(changed.stdout).contract.sha256).not.toBe(before.contract.sha256);
-  expect(JSON.parse(changed.stdout).id).not.toBe(before.id);
+  const amended = JSON.parse(changed.stdout);
+  expect(amended.packet.contract.sha256).not.toBe(before.contract.sha256);
+  expect(amended.packet.id).not.toBe(before.id);
+  expect(amended.contract).toContain("> ## Amended local fixture heading");
   writeFileSync(file, "token: fixture-secret-value");
   const refused = cli("packet", "--commit", head, "--contract", file, "--out", join(dir, "secret-out"));
   expect(refused.status).toBe(1);

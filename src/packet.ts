@@ -322,6 +322,21 @@ export function bindPacketContract(packet: ReviewPacket, contract: PacketBlock["
   return { id: createHash("sha256").update(canonicalJson(updated)).digest("hex"), ...updated };
 }
 
+/** Point to the contract only where this output mode actually delivers it. */
+export function packetBrief(bundle: PacketBundle, mode: "file" | "result" | "inline"): string {
+  if (bundle.contractText === undefined) return bundle.brief;
+  const where = { file: "contract.md beside this brief", result: "the contract field of this result",
+    inline: "the framed contract below" }[mode];
+  return `${bundle.brief}\n\nContract: Read ${where}. No GitHub access is needed.`;
+}
+
+export function packetResult(bundle: PacketBundle) {
+  return {
+    packet: bundle.packet, brief: packetBrief(bundle, "result"), rulesMissing: bundle.rulesMissing,
+    ...(bundle.contractText === undefined ? {} : { contract: bundle.contractText }),
+  };
+}
+
 export function buildPacket(cwd: string, request: PacketRequest, options: PacketBuildOptions = {}): PacketBundle {
   const root = repositoryRoot(cwd);
   let contract: ContractArtifact | undefined;
@@ -337,7 +352,6 @@ export function buildPacket(cwd: string, request: PacketRequest, options: Packet
   }
   const attachContract = (bundle: PacketBundle): PacketBundle => contract === undefined ? bundle : {
     ...bundle, packet: bindPacketContract(bundle.packet, contract.metadata), contractText: contract.text,
-    brief: `${bundle.brief}\n\nContract: Read the framed contract.md beside this brief in the exported bundle. No GitHub access is needed.`,
   };
   ensureBaseAttributes(root);
   const driverOptions = diffDriverOverrides(root);

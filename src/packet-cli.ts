@@ -27,7 +27,7 @@ function refuse(error: Refusal): number {
 }
 
 /** Whether a destination is the worktree or inside it, comparing resolved paths so a symlinked root still matches. */
-function insideWorktree(root: string, destination: string): boolean {
+export function insideWorktree(root: string, destination: string): boolean {
   const base = comparablePath(root), candidate = comparablePath(destination);
   return candidate === base || candidate.startsWith(base + sep);
 }
@@ -107,42 +107,59 @@ export function runPacket(cwd: string, args: readonly string[]): number | void {
     return refuse(error);
   }
   const json = JSON.stringify(bundle.packet, null, 2);
-  // Removes exactly what this call created, so a bundle is never left behind without the event that describes it.
-  let discard = (): void => {};
   if (values.out !== undefined) {
-    const destination = resolve(cwd, values.out);
-    const created: string[] = [];
-    let createdRoot: string | undefined;
-    discard = () => {
-      for (const path of created.splice(0)) {
-        try { unlinkSync(path); } catch { /* Preserve the original failure. */ }
-      }
-      if (createdRoot === undefined) return;
-      for (let dir = destination; ; dir = dirname(dir)) {
-        try { rmdirSync(dir); } catch { break; }
-        if (dir === createdRoot) break;
-      }
-      createdRoot = undefined;
-    };
-    try {
-      createdRoot = mkdirSync(destination, { recursive: true });
-      for (const [name, text] of Object.entries({
-        "packet.json": `${json}\n`,
-        "diff.patch": bundle.diff,
-        "rules.md": `${bundle.rules}\n`,
-        "brief.md": `${packetBrief(bundle, "file")}\n`,
-        ...(bundle.contractText === undefined ? {} : { "contract.md": bundle.contractText }),
-      })) {
-        const path = resolve(destination, name);
-        const file = openSync(path, "wx", 0o600);
-        created.push(path);
-        try { writeFileSync(file, text); }
-        finally { closeSync(file); }
-      }
-    } catch {
-      discard();
-      throw new Error("Cannot write packet files. Choose a writable output directory without existing packet files.");
+    writePacketBundle(cwd, bundle, settings, resolve(cwd, values.out));
+    return;
+  }
+  appendPacketEvent(cwd, bundle, settings);
+  if (values.json && bundle.rulesMissing.some(rule => rule.source === "REVIEW.md")) {
+    console.error("arev: REVIEW.md is unavailable at the merge base. Rerun without --json or use --out DIR for the brief.");
+  }
+  if (values.json) {
+    console.log(bundle.contractText === undefined ? json : JSON.stringify(packetResult(bundle), null, 2));
+  } else {
+    console.log(packetBrief(bundle, "inline"));
+    if (bundle.contractText !== undefined) process.stdout.write(`\n${bundle.contractText}`);
+  }
+}
+
+/** Deliver the packet artifacts and its ledger event together. */
+export function writePacketBundle(
+  cwd: string, bundle: PacketBundle, settings: ReviewMdSettings, destination: string,
+): void {
+  const json = JSON.stringify(bundle.packet, null, 2);
+  // Removes exactly what this call created, so a bundle is never left behind without the event that describes it.
+  const created: string[] = [];
+  let createdRoot: string | undefined;
+  function discard(): void {
+    for (const path of created.splice(0)) {
+      try { unlinkSync(path); } catch { /* Preserve the original failure. */ }
     }
+    if (createdRoot === undefined) return;
+    for (let dir = destination; ; dir = dirname(dir)) {
+      try { rmdirSync(dir); } catch { break; }
+      if (dir === createdRoot) break;
+    }
+    createdRoot = undefined;
+  }
+  try {
+    createdRoot = mkdirSync(destination, { recursive: true });
+    for (const [name, text] of Object.entries({
+      "packet.json": `${json}\n`,
+      "diff.patch": bundle.diff,
+      "rules.md": `${bundle.rules}\n`,
+      "brief.md": `${packetBrief(bundle, "file")}\n`,
+      ...(bundle.contractText === undefined ? {} : { "contract.md": bundle.contractText }),
+    })) {
+      const path = resolve(destination, name);
+      const file = openSync(path, "wx", 0o600);
+      created.push(path);
+      try { writeFileSync(file, text); }
+      finally { closeSync(file); }
+    }
+  } catch {
+    discard();
+    throw new Error("Cannot write packet files. Choose a writable output directory without existing packet files.");
   }
   // The event is written once the packet is delivered, and before this command returns: a failed `--out` export leaves
   // no event behind, so it cannot make the report for the packet the reviewer actually holds look stale. The reverse
@@ -153,16 +170,6 @@ export function runPacket(cwd: string, args: readonly string[]): number | void {
   } catch (error) {
     discard();
     throw error;
-  }
-  if (values.out !== undefined) return;
-  if (values.json && bundle.rulesMissing.some(rule => rule.source === "REVIEW.md")) {
-    console.error("arev: REVIEW.md is unavailable at the merge base. Rerun without --json or use --out DIR for the brief.");
-  }
-  if (values.json) {
-    console.log(bundle.contractText === undefined ? json : JSON.stringify(packetResult(bundle), null, 2));
-  } else {
-    console.log(packetBrief(bundle, "inline"));
-    if (bundle.contractText !== undefined) process.stdout.write(`\n${bundle.contractText}`);
   }
 }
 

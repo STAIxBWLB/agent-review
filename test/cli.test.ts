@@ -27,10 +27,10 @@ test("bootstraps outside the checkout and renders the command table", () => {
 });
 
 test("rejects unavailable commands and extra arguments", () => {
-  for (const args of [["run"], ["status", "--post"]]) {
+  for (const args of [["fixture-unknown-command"], ["status", "--post"]]) {
     const result = run(...args);
     expect(result.code).toBe(2);
-    expect(result.stderr).toContain(args[0] === "run" ? "unknown command" : "status takes no arguments");
+    expect(result.stderr).toContain(args[0] === "fixture-unknown-command" ? "unknown command" : "status takes no arguments");
     expect(result.stderr).toContain("arev --help");
   }
 });

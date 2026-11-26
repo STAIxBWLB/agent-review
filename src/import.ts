@@ -5,7 +5,7 @@ import { parseArgs } from "node:util";
 import { deniedReportPath, foldPathSegment } from "./deny.ts";
 import { appendEvent, readLedger, recordId, Refusal, secretShaped, shown, type LedgerEvent, type ReviewSource } from "./ledger.ts";
 import { PacketUsageError } from "./packet-cli.ts";
-import { parseReviewRecord, requireCurrentPacket } from "./record.ts";
+import { parseReviewRecord, requireCurrentPacket, type RunAttestation } from "./record.ts";
 
 type Row = Record<string, unknown>;
 const SHA = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
@@ -188,10 +188,15 @@ export function importCommand(cwd: string, args: readonly string[]): void {
     throw new PacketUsageError(usage);
   }
   const file = positionals[0]!;
-  const report = readReport(resolve(cwd, file), values.from);
-  const hub = values.from === "brief" && report.hub_review !== undefined
+  const { id, head } = importReviewFile(cwd, file, values.from);
+  console.log(`Imported review ${id} for head ${head}.`);
+}
+
+export function importReviewFile(cwd: string, file: string, from: "ocr" | "brief", run?: RunAttestation): { id: string; head: string } {
+  const report = readReport(resolve(cwd, file), from);
+  const hub = from === "brief" && report.hub_review !== undefined
     ? requireRow(report.hub_review, "hub_review") : undefined;
-  const format = hub ? "hub" : values.from;
+  const format = hub ? "hub" : from;
   const head = report.head ?? report.head_commit, base = report.base ?? report.base_commit;
   if (hub && hub.verdict === undefined) invalid("hub_review needs its original verdict");
   if ((report.head !== undefined && report.head_commit !== undefined && report.head !== report.head_commit) ||
@@ -237,11 +242,11 @@ export function importCommand(cwd: string, args: readonly string[]): void {
       ...reviewer,
     },
   }, {
-    packet: event.packet, maxAdvisories: event.review?.advisory_cap,
-    retryCommand: `arev import --from ${values.from} '${shown(file).replaceAll("'", "'\\''")}'`,
+    packet: event.packet, maxAdvisories: event.review?.advisory_cap, run,
+    retryCommand: `arev import --from ${from} '${shown(file).replaceAll("'", "'\\''")}'`,
   });
   const id = recordId(record);
   appendEvent(cwd, { v: 1, type: "record", at: new Date().toISOString(), id, record,
     source: { format, report } });
-  console.log(`Imported review ${id} for head ${head}.`);
+  return { id, head };
 }

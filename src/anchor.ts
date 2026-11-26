@@ -1,5 +1,6 @@
 import { types } from "node:util";
 import type { ReviewAnchor, ReviewSelector } from "@staix/agent-console/contract";
+import { isDenied } from "@staix/agent-mem/platform";
 import { sanitize } from "./frame.ts";
 export type { ReviewAnchor, ReviewSelector, ReviewThread } from "@staix/agent-console/contract";
 
@@ -18,13 +19,15 @@ const foldSegment = (segment: string): string => segment.normalize("NFKC").repla
 
 /**
  * The part of agent-hub's `projectionPath` that keeps an anchored path inside the repository it names: relative, no
- * empty, `.` or `..` segment, and no `.git` or `.agenthub` segment in any spelling. Projected-diff selectors and the
- * deny list are deferred; the packet keeps deny-listed paths out of its text.
+ * empty, `.` or `..` segment, no `.git` or `.agenthub` segment in any spelling, and neither the path nor its folded
+ * spelling deny-listed. Projected-diff selectors stay deferred. Upstream calls this with no extra deny list, so the
+ * `@staix/agent-mem/platform` list is the whole rule.
  */
 function insideRepo(path: string): boolean {
-  const parts = path.split("/");
+  const parts = path.split("/"), folded = parts.map(foldSegment).join("/");
   return !!path && !path.startsWith("/")
-    && parts.every(part => !!part && part !== "." && part !== ".." && ![".git", ".agenthub"].includes(foldSegment(part)));
+    && parts.every(part => !!part && part !== "." && part !== ".." && ![".git", ".agenthub"].includes(foldSegment(part)))
+    && !isDenied(path) && !isDenied(folded);
 }
 
 /** Conformance bounds belong to the published acon contract; hub write byte bounds are a separate layer below. */

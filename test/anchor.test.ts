@@ -55,6 +55,7 @@ test("hub byte caps remain stricter than shared shape conformance and round-trip
   }
   expect(() => parseReviewAnchor(anchor([{ kind: "lineRange", startLine: Number.MAX_SAFE_INTEGER + 1, endLine: Number.MAX_SAFE_INTEGER + 1 }]))).toThrow();
   for (const path of ["../report.md", "/report.md", "docs/../report.md", ".GIT/config", ".ＧＩＴ/config", ".agenthub/state/hub.db", "C:/report.md", "docs\\report.md"]) expect(() => parseReviewAnchor({ ...anchor(), path })).toThrow();
+  for (const path of ["docs/.env", "certs/server.pem", "id_rsa", ".maru/secrets/plan.md", ".ＥＮＶ"]) expect(() => parseReviewAnchor({ ...anchor(), path }), path).toThrow("review anchor path");
 });
 
 test("anchor refusals name the field and UTF-8 cap without reflecting input values", () => {

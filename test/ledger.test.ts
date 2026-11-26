@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
-import { canonicalJson, ledgerPath, readLedger, recordId, Refusal, reviewProjectId, secretShaped, appendEvent, type LedgerEvent, type ReviewRecordV1 } from "../src/ledger.ts";
+import { canonicalJson, ledgerPath, readLedger, recordId, Refusal, reviewProjectId, secretShaped, appendEvent, type LedgerEvent, type PacketBlock, type ReviewRecordV1 } from "../src/ledger.ts";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -93,31 +93,51 @@ test("the project key and the worktree check follow the reviewed checkout, not a
   }
 });
 
-test("a packet event at the 500-file ceiling fits its own bound, which the record-sized one would refuse", () => {
+test("a packet event at the 500-file ceiling fits its own bound, and so does a record of the same packet", () => {
   const { repo, home } = fixture();
   // The largest packet a supported subject builds: 500 units with 160-byte paths, and three rules that each applied to
   // all of them (REVIEW.md plus two rule files under it), which is what `MAX_FILES` in src/packet.ts allows.
   const unitPath = (index: number) => `src/${String(index).padStart(3, "0")}/${"d".repeat(151)}.ts`;
   const units = Array.from({ length: 500 }, (_, index) => ({ path: unitPath(index), status: "M", insertions: 12, deletions: 3 }));
   const rules = ["REVIEW.md", "docs/review.md", ".github/review.md"].map(name => ({ name, sha256: "e".repeat(64), appliesTo: units.map(unit => unit.path) }));
+  const packet: PacketBlock = { id: "d".repeat(64), subject: { kind: "range", base: HEAD, head: "b".repeat(40), mergeBase: HEAD }, units, rules };
+  appendEvent(repo, { v: 1, type: "packet", at: "2026-11-26T00:00:00.000Z", review: { advisory_cap: 5 }, packet }, { home });
+  // A record embeds the packet it was validated against beside a coverage list of the same paths, so it is the second
+  // event that reaches this size. Full coverage, as a recorded review of that packet necessarily has.
   appendEvent(repo, {
-    v: 1, type: "packet", at: "2026-11-26T00:00:00.000Z", review: { advisory_cap: 5 },
-    packet: { id: "d".repeat(64), subject: { kind: "range", base: HEAD, head: "b".repeat(40), mergeBase: HEAD }, units, rules },
+    v: 1, type: "record", at: "2026-11-26T00:00:01.000Z", id: "f".repeat(64),
+    record: {
+      v: 1, packet,
+      reviewer: { id: "claude", modelFamily: "anthropic", started: "self", sameFamilyFallback: false },
+      coverage: { reviewed: units.map(unit => unit.path), skipped: [] },
+      findings: [], verdict: "approved", call: { ok: true },
+    },
   }, { home });
-  const line = readFileSync(ledgerPath(repo, { home }), "utf8").trim();
-  // Over the bound every other event keeps and under the packet one: this is the size a supported subject reaches.
-  expect(Buffer.byteLength(line)).toBeGreaterThan(256 * 1024);
-  expect(Buffer.byteLength(line)).toBeLessThan(1024 * 1024);
+  const [packetLine, recordLine] = readFileSync(ledgerPath(repo, { home }), "utf8").trim().split("\n");
+  // Over the bound every other event keeps and under the one these two carry: this is the size a supported subject reaches.
+  for (const [name, line] of [["packet", packetLine], ["record", recordLine]] as const) {
+    expect(Buffer.byteLength(line!), name).toBeGreaterThan(256 * 1024);
+    expect(Buffer.byteLength(line!), name).toBeLessThan(1024 * 1024);
+  }
 });
 
 test("an event over its own bound is refused, and the refusal names the event type", () => {
   const { repo, home } = fixture();
   expect(() => appendEvent(repo, resolveEvent("x".repeat(300 * 1024)), { home })).toThrow("the resolve event exceeds 262144 bytes");
-  // The larger bound is the packet event's alone.
+  // The larger bound belongs to the events that embed a packet, and each names itself.
   expect(() => appendEvent(repo, {
     v: 1, type: "packet", at: "2026-11-26T00:00:00.000Z",
     packet: { id: "d".repeat(64), subject: { kind: "range", base: HEAD, head: HEAD, mergeBase: HEAD }, units: [{ path: "x".repeat(1024 * 1024) }] },
   }, { home })).toThrow("the packet event exceeds 1048576 bytes");
+  expect(() => appendEvent(repo, {
+    v: 1, type: "record", at: "2026-11-26T00:00:00.000Z", id: "f".repeat(64),
+    record: {
+      v: 1,
+      packet: { id: "d".repeat(64), subject: { kind: "range", base: HEAD, head: HEAD, mergeBase: HEAD }, units: [{ path: "x".repeat(1024 * 1024) }] },
+      reviewer: { id: "claude", modelFamily: "anthropic", started: "self", sameFamilyFallback: false },
+      coverage: { reviewed: [], skipped: [] }, findings: [], verdict: "approved", call: { ok: true },
+    },
+  }, { home })).toThrow("the record event exceeds 1048576 bytes");
   expect(existsSync(ledgerPath(repo, { home }))).toBe(false);
 });
 

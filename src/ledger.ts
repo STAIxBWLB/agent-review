@@ -87,10 +87,12 @@ const MAX_EVENT_BYTES = 256 * 1024;
 /**
  * A packet event is larger than any other by construction: one unit per changed file plus, per rule, the paths that
  * rule applied to. The 500-file ceiling (`MAX_FILES` in `src/packet.ts`) with 160-byte paths and three rules covering
- * them measures about 360 KB, so the packet event has the bound that ceiling needs and the others keep the smaller one.
+ * them measures about 360 KB, and a record event embeds that same packet beside a coverage list of the same paths, which
+ * measures about 440 KB. Both carry the bound that ceiling needs; the other events keep the smaller one.
  */
 const MAX_PACKET_EVENT_BYTES = 1024 * 1024;
-const eventCap = (type: LedgerEvent["type"]): number => type === "packet" ? MAX_PACKET_EVENT_BYTES : MAX_EVENT_BYTES;
+const eventCap = (type: LedgerEvent["type"]): number =>
+  type === "packet" || type === "record" ? MAX_PACKET_EVENT_BYTES : MAX_EVENT_BYTES;
 /**
  * Ledger reads go through `reviewGit`, so they describe the same checkout the packet does: an inherited `GIT_DIR` or
  * `GIT_WORK_TREE` would key the ledger to one repository while `arev packet` built a packet for another.

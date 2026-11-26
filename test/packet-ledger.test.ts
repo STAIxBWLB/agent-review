@@ -26,6 +26,9 @@ function report(body: unknown): string {
 function reviewedFlow(review = "# Review\nEvery change gets a packet and a record.\n", env: NodeJS.ProcessEnv = {}) {
   const repo = fixture(env);
   const { git, write } = repo;
+  // `arev packet --pr` reads its PR from the GitHub repository origin names, so a fixture that builds PR packets has one.
+  // The ledger key comes from the same origin, and every case resolves it through `reviewProjectId`.
+  git("remote", "add", "origin", "https://github.com/owner/repo.git");
   write("REVIEW.md", review);
   write("src/a.ts", "export const a = 1;\n");
   git("add", ".");
@@ -135,13 +138,20 @@ test("arev packet --pr N names the PR in the packet's subject, and the report wr
   const bin = mkdtempSync(join(tmpdir(), "arev-gh-"));
   scratch.push(bin);
   // A fake `gh` keeps this offline: `--pr` reads the base and head from it, and the values are the fixture's own commits,
-  // which the command validates as full OIDs before using them.
-  const { base, head, cli } = reviewedFlow("# Review\n", { PATH: `${bin}:${process.env.PATH ?? ""}` });
-  writeFileSync(join(bin, "gh"), `#!/bin/sh\nprintf '{"baseRefOid":"${base}","headRefOid":"${head}"}'\n`, { mode: 0o755 });
+  // which the command validates as full OIDs before using them. It records its argv, because which repository it is asked
+  // for is the point: `GH_REPO` names a fork here, and the read still has to name origin's repository.
+  const { git, base, head, cli } = reviewedFlow("# Review\n", { PATH: `${bin}:${process.env.PATH ?? ""}`, GH_REPO: "someone/fork" });
+  writeFileSync(join(bin, "gh"),
+    `#!/bin/sh\nfor arg in "$@"; do printf '%s\\n' "$arg" >> ${JSON.stringify(join(bin, "gh-args.txt"))}; done\n` +
+    `printf '{"baseRefOid":"${base}","headRefOid":"${head}"}'\n`, { mode: 0o755 });
   const built = cli("packet", "--pr", "7", "--json");
   expect(built.status).toBe(0);
   const packet = JSON.parse(built.stdout) as BuiltPacket & { subject: { pr?: number } };
   expect(packet.subject).toMatchObject({ kind: "range", base, head, pr: 7 });
+
+  // The repository is origin's, never the one gh resolves for itself: a fork's PR 7 is not the PR this packet reviews.
+  const argv = readFileSync(join(bin, "gh-args.txt"), "utf8").trim().split("\n");
+  expect(argv).toEqual(["pr", "view", "7", "--repo", "github.com/owner/repo", "--json", "baseRefOid,headRefOid"]);
 
   // The packet event carries the thread, and `record`'s rebuild has to reproduce it: a rebuild that dropped `pr` would
   // build a different id and refuse this report.
@@ -151,6 +161,14 @@ test("arev packet --pr N names the PR in the packet's subject, and the report wr
   const shown = JSON.parse(cli("show", "--json").stdout);
   expect(shown.packet).toBe(packet.id);
   expect(shown.head).toBe(head);
+
+  // An origin that names no GitHub repository refuses before gh is asked, the way the status write does: the packet
+  // would otherwise name a pull request of a repository it cannot spell.
+  git("remote", "set-url", "origin", "https://gitlab.com/owner/repo.git");
+  const foreign = cli("packet", "--pr", "8", "--json");
+  expect(foreign.status).toBe(1);
+  expect(foreign.stderr).toContain("A PR packet names the GitHub repository origin gives, and this repository's origin does not name one");
+  expect(readFileSync(join(bin, "gh-args.txt"), "utf8").trim().split("\n")).toEqual(argv);
 });
 
 test("a resolve names its own PR, so a head with a packet but no record settles only that PR", () => {
@@ -306,7 +324,7 @@ test("a refusal that reaches the command's catch prints its own next step, not t
   const { base, head, git, cli } = reviewedFlow();
   // The ledger path is refused while the packet event is written, after the packet itself was built, so this refusal
   // leaves the packet command through `src/cli.ts`: `arev packet --help` would answer nothing here.
-  git("remote", "add", "origin", "https://github.com/../evil.git");
+  git("remote", "set-url", "origin", "https://github.com/../evil.git");
   const refused = cli("packet", "--from", base, "--to", head, "--json");
   expect(refused.status).toBe(1);
   expect(refused.stderr).toContain("the origin remote does not name a plain repository path");

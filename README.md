@@ -12,6 +12,7 @@
 - `arev record`: Validate a review report against the packet for its head and append it to the ledger
 - `arev resolve`: Settle a recorded finding as fixed, false_positive or accepted
 - `arev show`: Show the recorded review for a head
+- `arev gate`: Answer whether this exact head is reviewed, and post the status with --post
 - `arev --help`: Show usage
 - `arev --version`: Show version
 

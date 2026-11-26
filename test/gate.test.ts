@@ -144,6 +144,13 @@ const events = (repo: string, home: string): LedgerEvent[] => {
   return readFileSync(path, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line) as LedgerEvent);
 };
 
+/**
+ * The gate and post events, in file order. An evaluation the post preflight refuses is still an answer the ledger holds,
+ * so it leaves one `gate` event and no `post` event; only a refusal by the decision itself leaves neither.
+ */
+const gating = (repo: string, home: string): LedgerEvent[] =>
+  events(repo, home).filter(event => event.type === "gate" || event.type === "post");
+
 test("the gate passes a head whose review is complete", () => {
   const { repo, base, head, home } = fixture();
   const subject: Subject = { kind: "range", base, head, mergeBase: base };
@@ -295,7 +302,7 @@ test("a head two PRs share refuses without --pr, and each PR gates on its own re
     head, ok: false, record: eightId, verdict: "changes_requested", open: ["blocking findings are open: bugs:eight-only"],
   });
 
-  // Fail closed through the command too: no gate event, and never a status for a head the gate did not judge.
+  // Fail closed through the command too: never a status for a head the gate did not judge.
   const refusedArgs = join(home, "gh-args.txt");
   const refused = run(repo, { PATH: `${fakeGh(refusedArgs)}:${process.env.PATH ?? ""}`, AGENTHUB_HOME: home }, "gate", "--head", head, "--post");
   expect(refused.code).toBe(1);
@@ -306,7 +313,8 @@ test("a head two PRs share refuses without --pr, and each PR gates on its own re
   // guard stops refusing.
   expect(existsSync(refusedArgs)).toBe(false);
   expect(existsSync(`${refusedArgs}.read`)).toBe(false);
-  expect(events(repo, home).filter(event => event.type === "gate" || event.type === "post")).toEqual([]);
+  // This refusal is the decision's own, before any evaluation exists to record, so there is no gate event either.
+  expect(gating(repo, home)).toEqual([]);
 
   // The flag reaches the decision through the command, and names the record it settled on.
   const threadedRun = run(repo, { AGENTHUB_HOME: home }, "gate", "--head", head, "--pr", "7");
@@ -371,9 +379,12 @@ test("--post refuses a head more than one thread reviewed, because a commit stat
   expect(refused.code).toBe(1);
   expect(refused.stderr).toContain(`head ${head} has packets or records in more than one thread (PR 7, PR 8), and a commit status is per commit, so a status posted for one PR shows on the others`);
   expect(refused.stderr).toContain("→ push a distinct commit for each PR and post the gate from that PR's own head");
-  // `gh` is never spawned, and neither a post nor a gate event is written for the refused invocation.
+  // `gh` is never spawned. The evaluation is recorded before the preflight that refused the write, and the write it
+  // refused is not.
   expect(existsSync(args)).toBe(false);
-  expect(events(repo, home).filter(event => event.type === "gate" || event.type === "post")).toEqual([]);
+  const recorded = gating(repo, home);
+  expect(recorded.map(event => event.type)).toEqual(["gate"]);
+  expect(recorded[0]).toMatchObject({ head, ok: true, record: sevenId });
 
   // The question without --post is unchanged: the named thread gates on its own record and says which one.
   const answered = run(repo, { AGENTHUB_HOME: home }, "gate", "--pr", "7");
@@ -396,7 +407,10 @@ test("--post refuses a shared head even when the other thread has only built its
   expect(refused.code).toBe(1);
   expect(refused.stderr).toContain(`head ${head} has packets or records in more than one thread (PR 7, PR 8)`);
   expect(existsSync(args)).toBe(false);
-  expect(events(repo, home).filter(event => event.type === "gate" || event.type === "post")).toEqual([]);
+  // The packet-only thread refused the write after the evaluation, so the gate event stands and no post follows it.
+  const recorded = gating(repo, home);
+  expect(recorded.map(event => event.type)).toEqual(["gate"]);
+  expect(recorded[0]).toMatchObject({ head, ok: true });
 });
 
 test("--post refuses a head an open PR heads where the ledger knows only one thread", () => {
@@ -417,10 +431,12 @@ test("--post refuses a head an open PR heads where the ledger knows only one thr
   expect(refused.code).toBe(1);
   expect(refused.stderr).toContain(`head ${head} heads open PR 8 besides PR 7, and a commit status is per commit: a success posted here would satisfy their checks, though the gate did not pass for that PR`);
   expect(refused.stderr).toContain("→ push a distinct commit for each PR and post the gate from that PR's own head");
-  // The metadata read happened; the status write never did, and no gate or post event was written.
+  // The metadata read happened; the status write never did. The evaluation is in the ledger, the post it refused is not.
   expect(readFileSync(`${args}.read`, "utf8")).toContain(`repos/owner/repo/commits/${head}/pulls`);
   expect(existsSync(args)).toBe(false);
-  expect(events(repo, home).filter(event => event.type === "gate" || event.type === "post")).toEqual([]);
+  const recorded = gating(repo, home);
+  expect(recorded.map(event => event.type)).toEqual(["gate"]);
+  expect(recorded[0]).toMatchObject({ head, ok: true });
 
   // The same head with only its own PR open posts, so the guard is the other PR and not the read itself.
   const only = run(repo, { PATH: `${fakeGh(args)}:${process.env.PATH ?? ""}`, AGENTHUB_HOME: home, FAKE_GH_PULLS: JSON.stringify([{ number: 7, state: "open", head: { sha: head }, base: { sha: base } }]) }, "gate", "--pr", "7", "--post");
@@ -454,6 +470,8 @@ test("a status goes to the repository origin names, and a non-GitHub origin refu
   // Even with gh able to resolve a repository for itself, neither call is made.
   expect(existsSync(args)).toBe(false);
   expect(existsSync(`${args}.read`)).toBe(false);
+  // The evaluation happened; only the write it was refused after is missing.
+  expect(gating(repo, home).map(event => event.type)).toEqual(["gate"]);
 });
 
 test("both gh calls name github.com, so GH_HOST cannot redirect the read or the status", () => {
@@ -492,9 +510,9 @@ test("--post reads every page of the pulls reply, so an open PR on page 2 still 
     { PATH: `${fakeGh(args)}:${process.env.PATH ?? ""}`, AGENTHUB_HOME: home, FAKE_GH_PULLS: pages }, "gate", "--pr", "7", "--post");
   expect(refused.code).toBe(1);
   expect(refused.stderr).toContain(`head ${head} heads open PR 8 besides PR 7, and a commit status is per commit`);
-  // The status write never happened, and no gate or post event was written for the refused invocation.
+  // The status write never happened; the evaluation that preceded it is in the ledger, the post is not.
   expect(existsSync(args)).toBe(false);
-  expect(events(repo, home).filter(event => event.type === "gate" || event.type === "post")).toEqual([]);
+  expect(gating(repo, home).map(event => event.type)).toEqual(["gate"]);
 });
 
 test("--post re-checks the review's merge base against the PR's own base, so a retargeted PR is never posted", () => {

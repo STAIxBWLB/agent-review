@@ -3,8 +3,9 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { readLedger } from "../src/ledger.ts";
-import { MCP_TOOLS, mcpHandlers } from "../src/mcp.ts";
+import { argumentError } from "@staix/mcp-stdio";
+import { Refusal, readLedger } from "../src/ledger.ts";
+import { MCP_TOOLS, mcpFailureText, mcpHandlers } from "../src/mcp.ts";
 
 const cleanup: string[] = [];
 const savedHome = process.env.AGENTHUB_HOME;
@@ -47,16 +48,66 @@ function repo(): { dir: string; base: string } {
   return { dir, base };
 }
 
-type Schema = { properties?: Record<string, { enum?: string[] }> };
+type Schema = {
+  properties?: Record<string, { enum?: string[] }>;
+  required?: string[];
+  additionalProperties?: unknown;
+};
+const tools = MCP_TOOLS as unknown as { name: string; inputSchema: Schema }[];
+const schemaOf = (name: string): Schema => tools.find(tool => tool.name === name)!.inputSchema;
+
+/** A packet and the report written from it, so the schema cases run on the arguments the flow really passes. */
+function flow(dir: string, base: string): { request: Record<string, unknown>; report: Record<string, unknown> } {
+  const built = mcpHandlers(dir).arev_packet({ subject: "range", base, head: "HEAD" }) as
+    { packet: { id: string; subject: unknown; units: { path: string }[] } };
+  const request = { subject: "range", base, head: "HEAD" };
+  const report = {
+    v: 1,
+    packet: { id: built.packet.id, subject: built.packet.subject },
+    reviewer: { id: "codex", modelFamily: "codex", started: "self", implementer: "qwen", sameFamilyFallback: false },
+    coverage: { reviewed: built.packet.units.map(unit => unit.path), skipped: [] },
+    findings: [],
+    verdict: "approved",
+    call: { ok: true },
+  };
+  return { request, report };
+}
 
 test("the tool table is AC9's six tools: no accepted, no post", () => {
   expect(MCP_TOOLS.map(tool => tool.name))
     .toEqual(["arev_packet", "arev_rules", "arev_record", "arev_resolve", "arev_show", "arev_gate"]);
-  const tools = MCP_TOOLS as unknown as { name: string; inputSchema: Schema }[];
-  const resolve = tools.find(tool => tool.name === "arev_resolve")!;
-  expect(resolve.inputSchema.properties?.as?.enum).toEqual(["fixed", "false_positive"]);
+  expect(schemaOf("arev_resolve").properties?.as?.enum).toEqual(["fixed", "false_positive"]);
   // The one GitHub write stays CLI-only, whatever a description says: no tool takes a post flag.
   expect(tools.some(tool => Object.hasOwn(tool.inputSchema.properties ?? {}, "post"))).toBe(false);
+});
+
+test("every tool's schema accepts the arguments the flow passes, under the protocol's own validator", () => {
+  const { dir, base } = repo();
+  const { request, report } = flow(dir, base);
+  const cases: [string, Record<string, unknown>][] = [
+    ["arev_packet", request],
+    ["arev_rules", { paths: ["src/a.ts"] }],
+    ["arev_record", { report }],
+    ["arev_resolve", { finding: "bugs:x", as: "fixed", evidence: ["src/a.ts:1"] }],
+    ["arev_show", {}],
+    ["arev_gate", {}],
+  ];
+  for (const [name, args] of cases) expect([name, argumentError(args, schemaOf(name))]).toEqual([name, undefined]);
+  // The report's own fields are the handler's to read, but the envelope stays closed: a stray argument is refused
+  // before a handler sees it.
+  expect(argumentError({ report, post: true }, schemaOf("arev_record"))).toBe("unknown argument: post");
+});
+
+test("arev_rules takes no base argument, so the trusted merge base is the only one read", () => {
+  expect(argumentError({ paths: ["src/a.ts"], base: "HEAD" }, schemaOf("arev_rules"))).toBe("unknown argument: base");
+  const { dir, base } = repo();
+  const result = mcpHandlers(dir).arev_rules({ paths: ["src/a.ts"] }) as { base: string; rules: string };
+  expect(result.base).toBe(base);
+});
+
+test("arev_record takes no light argument, so lightness stays a statement a person makes at a terminal", () => {
+  expect(Object.hasOwn(schemaOf("arev_record").properties ?? {}, "light")).toBe(false);
+  expect(argumentError({ report: {}, light: true }, schemaOf("arev_record"))).toBe("unknown argument: light");
 });
 
 test("arev_packet writes the packet event and prints nothing", () => {
@@ -87,6 +138,36 @@ test("arev_resolve refuses accepted, naming the terminal", () => {
     .toThrow(/person's decision/);
 });
 
+test("arev_resolve refuses arguments it will not echo: the id and the head", () => {
+  const { dir } = repo();
+  const handlers = mcpHandlers(dir);
+  const complaint = (args: Record<string, unknown>): string => {
+    try {
+      handlers.arev_resolve(args);
+    } catch (error) {
+      return error instanceof Error ? error.message : "no error";
+    }
+    return "no error";
+  };
+  // An id is a shape before it is a lookup: a value outside the finding-id charset is named by its argument only.
+  const idMessage = complaint({ finding: "review text with spaces and sk-live-abc123", as: "fixed" });
+  expect(idMessage).toContain("arev_resolve needs finding");
+  expect(idMessage).not.toContain("sk-live-abc123");
+  expect(idMessage).not.toContain("review text");
+  // A head keys the resolve event, so it is a full SHA or refused, and the value is not repeated.
+  const headMessage = complaint({ finding: "bugs:x", as: "fixed", head: "HEAD-of-someone" });
+  expect(headMessage).toContain("arev_resolve needs head: a full commit SHA");
+  expect(headMessage).not.toContain("HEAD-of-someone");
+});
+
+test("a failed tool call carries a cause and a next step, and never an internal message", () => {
+  expect(mcpFailureText(new Refusal("no origin default branch is available", "fetch origin and retry")))
+    .toBe("no origin default branch is available Next: fetch origin and retry");
+  const internal = mcpFailureText(new Error("EACCES: open /tmp/secret-report.json"));
+  expect(internal).not.toContain("secret-report");
+  expect(internal).toContain("arev <command> --help");
+});
+
 test("arev_gate answers through the same decision the CLI prints, and posts nothing", () => {
   const { dir } = repo();
   const printed = spyOn(process.stdout, "write");
@@ -99,20 +180,12 @@ test("arev_gate answers through the same decision the CLI prints, and posts noth
   expect(result.head).toMatch(/^[a-f0-9]{40}$/);
 });
 
-test("the AC9 flow runs over the tools: packet, record, then a gate that passes", () => {
+test("the AC9 flow runs over the tools, validated as the protocol validates it", () => {
   const { dir, base } = repo();
+  const { report } = flow(dir, base);
+  // The report the flow writes is what the protocol has to accept before any handler runs.
+  expect(argumentError({ report }, schemaOf("arev_record"))).toBeUndefined();
   const handlers = mcpHandlers(dir);
-  const built = handlers.arev_packet({ subject: "range", base, head: "HEAD" }) as
-    { packet: { id: string; subject: unknown; units: { path: string }[] } };
-  const report = {
-    v: 1,
-    packet: { id: built.packet.id, subject: built.packet.subject },
-    reviewer: { id: "codex", modelFamily: "codex", started: "self", implementer: "qwen", sameFamilyFallback: false },
-    coverage: { reviewed: built.packet.units.map(unit => unit.path), skipped: [] },
-    findings: [],
-    verdict: "approved",
-    call: { ok: true },
-  };
   const recorded = handlers.arev_record({ report }) as { id: string; head: string; blockingOpen: number };
   expect(recorded.blockingOpen).toBe(0);
   const shown = handlers.arev_show({}) as { view: { record?: string; counts: { important: number } } };

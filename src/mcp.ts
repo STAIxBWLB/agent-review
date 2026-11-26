@@ -31,6 +31,10 @@ function pathsArgument(value: unknown): string[] | undefined {
   return value as string[];
 }
 
+/** A recorded finding id's charset (the report's own bound), so an argument the ledger names is checked first. */
+const FINDING_ID = /^[A-Za-z0-9._:-]{1,96}$/;
+const FULL_OID = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
+
 /**
  * The merge base `arev rules` reads: the origin default branch against the repository's HEAD. `arev rules` and
  * `arev gate` each carry this lookup with their own refusal, so this copy leaves both of them alone.
@@ -92,7 +96,9 @@ export function mcpHandlers(cwd: string): Record<McpToolName, Handler> {
     arev_rules: args => {
       const paths = pathsArgument(args.paths);
       if (paths === undefined) return fail("arev_rules needs paths: one or more repository-relative paths", "pass paths: the files whose rules you need");
-      const base = text(args.base) ?? defaultBase(cwd);
+      // The merge base is always the computed one: a caller-supplied base could name HEAD, and rules read from the head
+      // are the rules the change itself rewrote, which is what AC2 exists to prevent.
+      const base = defaultBase(cwd);
       const rules = readRules(cwd, base, paths.map(path => ({ path, sides: [path] })));
       return { base, ...rules };
     },
@@ -102,12 +108,16 @@ export function mcpHandlers(cwd: string): Record<McpToolName, Handler> {
         return fail("arev_record needs report: the report body as an object", "pass report: the JSON you wrote for this packet");
       }
       const implementer = text(args.implementer);
+      // No `light` here: a report's lightness is the reviewer's claim about how the review was made and it relaxes the
+      // gate, so only `arev record --light` at a terminal states it (AC2). A server is never a person.
       return recordReview(cwd, report, { label: "argument", person: false,
-        ...(implementer === undefined ? {} : { implementer }), ...(args.light === true ? { light: true } : {}) });
+        ...(implementer === undefined ? {} : { implementer }) });
     },
     arev_resolve: args => {
       const finding = text(args.finding);
-      if (finding === undefined) return fail("arev_resolve needs finding: the recorded finding id", "pass finding: an id from arev_show");
+      if (finding === undefined || !FINDING_ID.test(finding)) {
+        return fail("arev_resolve needs finding: a recorded finding id", "pass finding: an id from arev_show");
+      }
       const as = args.as;
       // `accepted` is the person's decision, and a server has no terminal: the CLI refuses it there too.
       if (as === "accepted") {
@@ -117,8 +127,12 @@ export function mcpHandlers(cwd: string): Record<McpToolName, Handler> {
       if (as !== "fixed" && as !== "false_positive") {
         return fail("arev_resolve settles a finding as fixed or false_positive", "pass as: fixed or false_positive");
       }
-      const evidence = pathsArgument(args.evidence) ?? [];
+      const evidence = args.evidence === undefined ? [] : pathsArgument(args.evidence);
+      if (evidence === undefined) return fail("arev_resolve evidence must be one or more strings", "pass evidence: a path:line or a command's output that settles the finding");
       const rationale = text(args.rationale), head = text(args.head);
+      // A head is the ledger key the resolve is written at, so it is a full SHA or nothing: a caller-supplied value is
+      // never echoed, and one that is not an OID would key a resolve to a head no review has.
+      if (head !== undefined && !FULL_OID.test(head)) return fail("arev_resolve needs head: a full commit SHA", "pass head: the full 40-character SHA arev_show names");
       return resolveFinding(cwd, finding, { as, person: false, evidence,
         ...(rationale === undefined ? {} : { rationale }), ...(head === undefined ? {} : { head }) });
     },
@@ -136,7 +150,11 @@ export function mcpHandlers(cwd: string): Record<McpToolName, Handler> {
 
 const REPORT_SCHEMA = {
   type: "object",
-  description: "The report body you wrote for this packet, as JSON.",
+  description: "The report body you wrote for this packet, as JSON. arev checks it field by field against the packet.",
+  // The protocol validates the envelope only: the report is read field by field by `parseReviewRecord`, the one reader of
+  // ReviewRecordV1. A schema that closes the object refuses every real report before its handler runs - the protocol
+  // reports `report: unknown argument: v` - and an empty schema is its spelling of "any JSON-safe value".
+  additionalProperties: {},
 } as const;
 
 export const MCP_TOOLS: readonly (Tool & { name: McpToolName })[] = [
@@ -159,12 +177,11 @@ export const MCP_TOOLS: readonly (Tool & { name: McpToolName })[] = [
   },
   {
     name: "arev_rules",
-    description: "Read the rule files that apply to paths, at the merge base of the origin default branch against HEAD, so a change cannot rewrite the rules it is reviewed under.",
+    description: "Read the rule files that apply to paths, at the merge base of the origin default branch against HEAD, so a change cannot rewrite the rules it is reviewed under. The merge base is always computed here; there is no way to ask for another base.",
     inputSchema: {
       type: "object",
       properties: {
         paths: { type: "array", items: { type: "string" }, maxItems: 500, description: "Repository-relative paths." },
-        base: { type: "string", description: "Full merge base SHA to read instead of the computed one." },
       },
       required: ["paths"],
       additionalProperties: false,
@@ -172,13 +189,12 @@ export const MCP_TOOLS: readonly (Tool & { name: McpToolName })[] = [
   },
   {
     name: "arev_record",
-    description: "Validate a report against the packet in the ledger for its head and append it: the record id, verdict and finding tally come back. A refused report returns the reason and the next step.",
+    description: "Validate a report against the packet in the ledger for its head and append it: the record id, verdict and finding tally come back. A refused report returns the reason and the next step. A review made without REVIEW.md is recorded with arev record --light in the CLI: lightness relaxes the gate, so only a person at a terminal states it.",
     inputSchema: {
       type: "object",
       properties: {
         report: REPORT_SCHEMA,
         implementer: { type: "string", description: "Who wrote the reviewed change, when the report does not say." },
-        light: { type: "boolean", description: "State that no REVIEW.md was available for this review." },
       },
       required: ["report"],
       additionalProperties: false,
@@ -224,7 +240,17 @@ export const MCP_TOOLS: readonly (Tool & { name: McpToolName })[] = [
   },
 ];
 
-const INSTRUCTIONS = "arev is deterministic review tooling. Build a packet, read its brief, record the report you wrote, settle findings, then gate the head. accepted findings and arev gate --post are CLI-only.";
+const INSTRUCTIONS = "arev is deterministic review tooling. Build a packet, read its brief, record the report you wrote, settle findings, then gate the head. accepted findings, arev record --light and arev gate --post are CLI-only.";
+
+/**
+ * What a failed tool call answers with. A refusal already carries its cause and the next step. Anything else is an
+ * internal failure whose own message can hold reviewed content or a path, so the caller gets a fixed, bounded line that
+ * names the CLI as the way to see the cause; an unrun check is never reported as a pass.
+ */
+export function mcpFailureText(error: unknown): string {
+  if (error instanceof Refusal) return `${error.message} Next: ${error.next}`;
+  return "the tool failed before it answered. Run the same step with the CLI (arev <command> --help) to see the cause.";
+}
 
 /** `arev mcp`: serve until stdin closes. `bin/arev.js` sets an exit code and leaves the loop alive on stdin. */
 export function mcpCommand(cwd: string, args: readonly string[]): number {
@@ -233,7 +259,7 @@ export function mcpCommand(cwd: string, args: readonly string[]): number {
     return EXIT.usage;
   }
   void serve({ name: "arev", version, tools: MCP_TOOLS, handlers: mcpHandlers(cwd), instructions: INSTRUCTIONS,
-    failureText: error => error instanceof Refusal ? `${error.message} Next: ${error.next}` : undefined })
+    failureText: mcpFailureText })
     .catch(error => {
       console.error(`arev mcp: ${error instanceof Error ? error.message : "the server stopped"}`);
       process.exitCode = EXIT.fail;

@@ -392,6 +392,9 @@ test("local diff ordering cannot change packet identity", () => {
   const initial = isolatedPacket(dir, request);
   write("diff-order", "z.txt\na.txt\n");
   git("config", "diff.orderFile", join(dir, "diff-order"));
+  git("config", "diff.context", "0");
+  git("config", "diff.interHunkContext", "12");
+  git("config", "diff.algorithm", "histogram");
   expect(isolatedPacket(dir, request)).toEqual(initial);
 });
 
@@ -409,4 +412,26 @@ test("an exact patch retains both sides of a rename into the old pathname", () =
   expect(bundle.packet.units).toEqual([{ path: "[old]/child?.txt", status: "R", insertions: 0, deletions: 0 }]);
   expect(bundle.diff).toContain("rename from [old]");
   expect(bundle.diff).toContain("rename to [old]/child?.txt");
+});
+
+test("a local rename limit cannot hide the denied source of a near-copy", () => {
+  const { dir, git, write } = fixture();
+  const privateFixture = "DENIED_NEAR_COPY_FIXTURE\n".repeat(10);
+  write(".env", privateFixture);
+  write("first.txt", "an unrelated source\n".repeat(10));
+  write("second.txt", "another unrelated source\n".repeat(10));
+  git("add", ".");
+  git("commit", "-qm", "base");
+  git("config", "diff.renameLimit", "1");
+  write("copied.txt", privateFixture + "an extra line\n");
+  write("new.txt", "a separate addition\n");
+  const expectDenial = (bundle: ReturnType<typeof isolatedPacket>) => {
+    expect(bundle.packet.excluded).toContainEqual({ path: "copied.txt", reason: "denied" });
+    expect(bundle.diff).not.toContain("DENIED_NEAR_COPY_FIXTURE");
+    expect(bundle.brief).not.toContain("DENIED_NEAR_COPY_FIXTURE");
+  };
+  expectDenial(isolatedPacket(dir, { kind: "workspace" }));
+  git("add", ".");
+  git("commit", "-qm", "head");
+  expectDenial(isolatedPacket(dir, { kind: "commit", commit: "HEAD" }));
 });

@@ -45,8 +45,9 @@ const MAX_PATCH_BYTES = 256 * 1024;
 const MAX_PACKET_BYTES = 8 * 1024 * 1024;
 const LOCKFILES = new Set(["bun.lock", "bun.lockb", "package-lock.json", "yarn.lock",
   "pnpm-lock.yaml", "Cargo.lock", "poetry.lock", "uv.lock", "go.sum", "composer.lock", "Gemfile.lock"]);
-const RENAME_OPTIONS = ["-M", "-C", "--find-copies-harder"];
-const DIFF_OPTIONS = ["--no-ext-diff", "--no-textconv", "--no-color", "--ignore-submodules=dirty", "-O/dev/null"];
+const RENAME_OPTIONS = ["-l0", "-M", "-C", "--find-copies-harder"];
+const DIFF_OPTIONS = ["--no-ext-diff", "--no-textconv", "--no-color", "--ignore-submodules=dirty",
+  "-O/dev/null", "-U3", "--inter-hunk-context=0", "--diff-algorithm=myers"];
 const FULL_OID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 interface Group { status: string; paths: string[]; opaque?: true }
 
@@ -56,6 +57,9 @@ function prRefs(cwd: string, number: string): { base: string; head: string } {
     cwd, encoding: "utf8", timeout: 15_000, maxBuffer: 32_000,
     env: { ...process.env, GH_PROMPT_DISABLED: "1" },
   });
+  if ((result.error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") {
+    throw new Error("GitHub CLI gh is unavailable. Install gh or specify the range with --from and --to.");
+  }
   if (result.status !== 0) throw new Error("Cannot read PR metadata. Check gh authentication and the PR number.");
   let data: unknown;
   try { data = JSON.parse(result.stdout); }
@@ -139,6 +143,9 @@ function workspaceFilterOptions(cwd: string): string[] {
 }
 
 function checkedOutput(result: ReturnType<typeof reviewGit>, label: string): string {
+  if (/only found copies from modified paths|rename detection was skipped|diff\.renameLimit/i.test(result.stderr ?? "")) {
+    throw new Error("Git could not complete rename and copy detection. Review a smaller subject.");
+  }
   if (result.status === 129 && result.stderr.includes("attr-source")) {
     throw new Error("This Git does not support --attr-source. Upgrade Git before building a packet.");
   }

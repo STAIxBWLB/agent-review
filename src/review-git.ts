@@ -4,7 +4,10 @@ const gitArgs = (cwd: string, args: string[], literalPathspecs = true) =>
   ["-C", cwd, "-c", "protocol.allow=never", ...(literalPathspecs ? ["--literal-pathspecs"] : []), ...args];
 
 const gitOptions = () => ({
-  env: memoryGitEnv(process.env, { repositoryIsolation: true, readOnlyDiagnostic: true }),
+  env: {
+    ...memoryGitEnv(process.env, { repositoryIsolation: true, readOnlyDiagnostic: true }),
+    LC_ALL: "C",
+  },
   maxBuffer: 16 * 1024 * 1024,
   timeout: 15_000,
 });

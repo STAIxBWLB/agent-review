@@ -9,6 +9,9 @@
 - `arev packet`: Build a review packet
 - `arev rules`: Read the rules that apply to paths
 - `arev status`: Show implementation status
+- `arev record`: Validate a review report against the packet for its head and append it to the ledger
+- `arev resolve`: Settle a recorded finding as fixed, false_positive or accepted
+- `arev show`: Show the recorded review for a head
 - `arev --help`: Show usage
 - `arev --version`: Show version
 

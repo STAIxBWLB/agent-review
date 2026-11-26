@@ -9,7 +9,9 @@ import { commitOid, globalIgnoreOptions, mergeBaseOid, repositoryRoot, reviewGit
 import { readAttributes, readRules, renderRules, type RuleMissing, type RuleText } from "./rules.ts";
 
 export type PacketRequest =
-  | { kind: "range"; base: string; head: string }
+  // `pr` rides on the range request so a packet built with `--pr` can be rebuilt by `arev record` without asking `gh`
+  // again: the subject the rebuild must reproduce is the one the packet event stored.
+  | { kind: "range"; base: string; head: string; pr?: number }
   | { kind: "commit"; commit: string }
   | { kind: "workspace" }
   | { kind: "files"; paths: readonly string[] }
@@ -20,6 +22,8 @@ export interface PacketSubject {
   base: string;
   head: string;
   mergeBase: string;
+  /** The PR this packet was built for (`--pr`), which is the review thread a finding's lifecycle is scoped to. */
+  pr?: number;
 }
 export interface PacketUnit { path: string; status: string; insertions: number; deletions: number }
 export interface PacketExcluded { path: string; reason: "generated" | "binary" | "denied" | "too large" }
@@ -81,8 +85,9 @@ function prRefs(cwd: string, number: string): { base: string; head: string } {
 function resolveSubject(cwd: string, request: PacketRequest): PacketSubject {
   if (request.kind === "range" || request.kind === "pr") {
     const refs = request.kind === "pr" ? prRefs(cwd, request.number) : request;
+    const pr = request.kind === "pr" ? Number(request.number) : request.pr;
     const base = commitOid(cwd, refs.base), head = commitOid(cwd, refs.head);
-    return { kind: "range", base, head, mergeBase: mergeBaseOid(cwd, base, head) };
+    return { kind: "range", base, head, mergeBase: mergeBaseOid(cwd, base, head), ...(pr === undefined ? {} : { pr }) };
   }
   if (request.kind === "commit") {
     const head = commitOid(cwd, request.commit);

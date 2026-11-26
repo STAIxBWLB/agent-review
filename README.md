@@ -1,17 +1,21 @@
 # agent-review
 
-`arev` is a Bun CLI for deterministic review tooling. The current scaffold
-provides the command entry point and development checks.
+`arev` is a Bun CLI for deterministic review tooling. Build packets from Git changes and inspect the rules that apply to each path.
 
 ## Commands
 
 <!-- arev commands:start -->
 
+- `arev packet`: Build a review packet
+- `arev rules`: Read the rules that apply to paths
 - `arev status`: Show implementation status
 - `arev --help`: Show usage
 - `arev --version`: Show version
 
 <!-- arev commands:end -->
+
+Run `arev packet --help` for subject and output options. Packet and rule
+commands require Git with support for `--attr-source` and `check-attr --source`.
 
 ## Development
 

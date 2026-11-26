@@ -29,8 +29,10 @@ commands require Git with support for `--attr-source` and `check-attr --source`.
 on `github.com`, never from the repository `gh` resolves for itself (`GH_REPO`,
 the working directory), and refuses an origin that names no GitHub repository.
 The standalone `arev rules` command compares against the default branch on `origin`.
-A path the deny list withholds from review contributes no rule, and the output
-counts it as `withheld as denied` instead of echoing the spelling supplied.
+A path the deny list withholds from review contributes no rule: the supplied
+spelling is matched the way the packet matches it, so a folded or backslashed
+spelling counts too, and the output counts it as `withheld as denied` instead of
+echoing it.
 
 `arev packet --pr N --out DIR` includes a framed `contract.md` with the PR title,
 body, and referenced issue bodies. A reviewer can read this file without

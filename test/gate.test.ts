@@ -303,6 +303,33 @@ test("a head two PRs share refuses without --pr, and each PR gates on its own re
   expect(badPr.stderr).toContain("Invalid PR number. Pass a positive integer to --pr.");
 });
 
+test("--post refuses a head more than one thread reviewed, because a commit status is per commit", () => {
+  const { repo, base, head, home } = fixture();
+  const seven: Subject = { kind: "range", base, head, mergeBase: base, pr: 7 };
+  const eight: Subject = { kind: "range", base, head, mergeBase: base, pr: 8 };
+  const sevenId = seed({ repo, home, subject: seven, record: recordFor(seven) });
+  seed({ repo, home, subject: eight, record: recordFor(eight, {
+    findings: [blocking({ id: "bugs:eight-only" })], verdict: "changes_requested",
+  }) });
+
+  // PR 7's gate passes, and that is the trap: a status lives on the commit, so posting PR 7's success would satisfy a
+  // required check on PR 8, whose own review at this head was changes_requested. The post refuses before any GitHub call.
+  const args = join(home, "gh-args.txt");
+  const refused = run(repo, { PATH: `${fakeGh(args)}:${process.env.PATH ?? ""}`, AGENTHUB_HOME: home }, "gate", "--pr", "7", "--post");
+  expect(refused.code).toBe(1);
+  expect(refused.stderr).toContain(`head ${head} has packets or records in more than one thread (PR 7, PR 8), and a commit status is per commit, so a status posted for one PR shows on the others`);
+  expect(refused.stderr).toContain("→ push a distinct commit for each PR and post the gate from that PR's own head");
+  // `gh` is never spawned, and neither a post nor a gate event is written for the refused invocation.
+  expect(existsSync(args)).toBe(false);
+  expect(events(repo, home).filter(event => event.type === "gate" || event.type === "post")).toEqual([]);
+
+  // The question without --post is unchanged: the named thread gates on its own record and says which one.
+  const answered = run(repo, { AGENTHUB_HOME: home }, "gate", "--pr", "7");
+  expect(answered.code).toBe(0);
+  expect(answered.stdout).toContain(`record ${sevenId}`);
+  expect(answered.stdout).toContain("gate: passes");
+});
+
 test("REVIEW.md must be at the merge base unless the record says --light", () => {
   const { repo, base, head } = fixture(null);
   const subject: Subject = { kind: "range", base, head, mergeBase: base };

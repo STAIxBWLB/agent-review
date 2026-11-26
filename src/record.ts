@@ -345,8 +345,11 @@ const threadOf = (subject: PacketBlock["subject"] | undefined): number | undefin
 const subjectOf = (event: LedgerEvent): PacketBlock["subject"] | undefined =>
   event.type === "record" ? event.record.packet.subject : event.type === "packet" ? event.packet.subject : undefined;
 
-/** Every review thread that has a record or a packet at one head, in the order the ledger wrote them. */
-function threadsAtHead(events: readonly LedgerEvent[], head: string): (number | undefined)[] {
+/**
+ * Every review thread that has a record or a packet at one head, in the order the ledger wrote them. Exported for
+ * `arev gate`: a commit status belongs to the commit, so `--post` has to see a head more than one thread claims.
+ */
+export function threadsAtHead(events: readonly LedgerEvent[], head: string): (number | undefined)[] {
   const threads: (number | undefined)[] = [];
   for (const event of events) {
     const subject = subjectOf(event);

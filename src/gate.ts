@@ -7,7 +7,7 @@
 import { spawnSync } from "node:child_process";
 import { EXIT, errorLine } from "@staix/cli-output";
 import { Refusal, appendEvent, readLedger, type LedgerEvent, type ReviewRecordV1 } from "./ledger.ts";
-import { PR_NUMBER, ledgerEventsView } from "./record.ts";
+import { PR_NUMBER, ledgerEventsView, threadsAtHead } from "./record.ts";
 import { parseReviewMd } from "./review-md.ts";
 import { commitOid, mergeBaseOid, reviewGit } from "./review-git.ts";
 import { readRules } from "./rules.ts";
@@ -183,6 +183,16 @@ export function gateCommand(cwd: string, args: readonly string[]): number {
       ...(parsed.flags["--head"]?.at(-1) === undefined ? {} : { head: parsed.flags["--head"]!.at(-1)! }),
       ...(prFlag === undefined ? {} : { pr: Number(prFlag) }),
     });
+    // A commit status belongs to the commit, not to the PR: on a head more than one thread reviewed, a success posted
+    // from one PR's pass shows on every other PR's checks, which is a status the gate did not pass there. The plain gate
+    // still answers for the thread it was asked about; only the post refuses, and it refuses before any GitHub call.
+    if (parsed.flags["--post"] !== undefined) {
+      const threads = threadsAtHead(readLedger(cwd), result.head);
+      if (threads.length > 1) {
+        throw new Refusal(`head ${result.head} has packets or records in more than one thread (${threads.map(thread => thread === undefined ? "no PR" : `PR ${thread}`).join(", ")}), and a commit status is per commit, so a status posted for one PR shows on the others`,
+          "push a distinct commit for each PR and post the gate from that PR's own head");
+      }
+    }
     // The spec's ledger has a `gate` event, so each evaluation is recorded: it is written here, never inside the pure
     // decision, and it sits before the `post` event because a pass posts after this line. The decision reads only
     // record, resolve and packet events, so writing it changes no later answer.

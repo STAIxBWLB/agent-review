@@ -155,7 +155,7 @@ test("compound credential keys in hub arguments are refused before they enter th
   const before = readFileSync(ledger);
   const report = load("hub");
   const hub = report.hub_review as Record<string, unknown>;
-  for (const key of ["client_secret", "clientSecret", "private_key"]) {
+  for (const key of ["client_secret", "clientSecret", "private_key", "api key"]) {
     const rejected = ingest("hub", { ...report, hub_review: { ...hub, [key]: "dummy-canary-value" } });
     expect(rejected.status).toBe(1);
     expect(rejected.stderr).toContain("credential field");

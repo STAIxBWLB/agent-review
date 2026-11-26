@@ -11,7 +11,7 @@ type Row = Record<string, unknown>;
 const SHA = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const MAX_SOURCE_BYTES = 128 * 1024;
 const SENSITIVE_KEY = /secret|password|passwd|token|apikey|privatekey|credential|authorization|oauth|^auth$/;
-const credentialKey = (key: string) => SENSITIVE_KEY.test(foldPathSegment(key).replace(/[_-]/g, ""));
+const credentialKey = (key: string) => SENSITIVE_KEY.test(foldPathSegment(key).replace(/[^a-z0-9]/g, ""));
 
 function invalid(message: string): never {
   throw new Refusal(shown(message), "correct the input report and run arev import again");

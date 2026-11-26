@@ -63,6 +63,10 @@ for (const [initial, disposition] of [["open", "fixed"], ["fixed", "false_positi
     const exported = cli("export", "--to", "hub", "--head", head);
     expect(exported.status).toBe(0);
     expect(JSON.parse(exported.stdout).findings[0].disposition).toBe(disposition);
+    const markdown = cli("export", "--to", "markdown", "--head", head, "--pr", "7");
+    expect(markdown.status).toBe(0);
+    expect(markdown.stdout).toContain(`(compliance, blocking, ${disposition})`);
+    expect(markdown.stdout).toContain(String(original.findings[0]?.id));
     if (initial === "fixed") expect(JSON.parse(shown.stdout).findings[0].disposition).toBe(disposition);
   });
 }

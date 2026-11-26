@@ -112,7 +112,7 @@ export function exportCommand(cwd: string, args: readonly string[]): void {
   const thread: ThreadSelector | undefined = pr === undefined || pr === "none" ? pr : Number(pr);
   const events = readLedger(cwd);
   const head = values.head === undefined ? undefined : commitOid(cwd, values.head);
-  const view = ledgerEventsView(events, head, thread, { includeSettled: values.to === "hub" });
+  const view = ledgerEventsView(events, head, thread, { includeSettled: true });
   const event = events.findLast((item): item is RecordEvent =>
     item.type === "record" && item.id === view.record && item.record.packet.subject.head === view.head);
   if (!event) throw new Error("No review record matches the head. Import or record a review first.");

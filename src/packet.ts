@@ -158,13 +158,19 @@ function workspaceFilterOptions(cwd: string): string[] {
   return names(configured.stdout).flatMap(key => ["-c", `${key}=${key.endsWith(".required") ? "false" : ""}`]);
 }
 
-/** Local diff drivers may not change what is considered binary or alter the selected diff algorithm. */
+/** Keep driver output deterministic. Git flags already disable external commands, textconv and word diff. */
 function diffDriverOverrides(cwd: string): string[] {
-  const configured = reviewGit(cwd, ["config", "--null", "--name-only", "--get-regexp", "^diff\\..+\\.(binary|algorithm)$"]);
+  const configured = reviewGit(cwd, ["config", "--null", "--name-only", "--get-regexp", "^diff\\..+\\.(binary|algorithm|funcname|xfuncname)$"]);
   if (configured.status !== 0 && configured.status !== 1) {
     throw new Error("Cannot inspect local Git diff drivers. Check the repository Git configuration and retry.");
   }
-  return names(configured.stdout).flatMap(key => ["-c", `${key}=${key.endsWith(".binary") ? "auto" : "myers"}`]);
+  const keys = names(configured.stdout);
+  const hunkLabel = keys.find(key => /\.(?:x?funcname)$/.test(key));
+  if (hunkLabel) {
+    // There is no Git option that disables only this driver's hunk labels and restores the default.
+    throw new Error(`Local Git setting ${JSON.stringify(hunkLabel)} changes patch hunk labels. Unset that key or use a checkout without the override.`);
+  }
+  return keys.flatMap(key => ["-c", `${key}=${key.endsWith(".binary") ? "auto" : "myers"}`]);
 }
 
 /** Git gives info/attributes precedence even over --attr-source. Refuse any active local override. */

@@ -613,9 +613,22 @@ test("local attribute files and diff driver settings do not control exclusions o
   expect(isolatedPacket(dir, request)).toEqual(clean);
 
   git("config", "--unset", "core.attributesFile");
-  git("config", "diff.custom.binary", "true");
-  expect(isolatedPacket(dir, request)).toEqual(clean);
-  git("config", "diff.custom.binary", "false");
+  for (const [key, value] of [
+    ["binary", "true"], ["binary", "false"], ["algorithm", "histogram"],
+    ["textconv", "/missing-fixture-textconv"], ["command", "/missing-fixture-diff"], ["wordRegex", "."],
+  ] as const) {
+    git("config", `diff.custom.${key}`, value);
+    expect(isolatedPacket(dir, request)).toEqual(clean);
+    git("config", "--unset", `diff.custom.${key}`);
+  }
+
+  for (const key of ["diff.custom.funcname", "diff.custom.xfuncname"]) {
+    git("config", key, "^replacement");
+    expect(() => isolatedPacket(dir, request)).toThrow(
+      `Local Git setting "${key}" changes patch hunk labels. Unset that key`,
+    );
+    git("config", "--unset", key);
+  }
   expect(isolatedPacket(dir, request)).toEqual(clean);
 });
 

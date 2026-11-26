@@ -197,7 +197,7 @@ export function ledgerPath(cwd: string, options: { home?: string } = {}): string
  */
 function gitMarkerAtOrAbove(cwd: string): boolean {
   let current = resolve(cwd);
-  for (let step = 0; step < 64; step++) {
+  for (;;) {
     // A `.git` directory, and the `.git` file a linked worktree or a submodule carries, both count.
     try {
       lstatSync(join(current, ".git"));
@@ -208,10 +208,11 @@ function gitMarkerAtOrAbove(cwd: string): boolean {
       if (code !== "ENOENT" && code !== "ENOTDIR") return true;
     }
     const parent = dirname(current);
+    // The filesystem root ends the search, and only the root does: a fixed ancestor count would report "no marker" for
+    // a checkout deeper than the count, which is the fail-open this probe exists to close.
     if (parent === current) return false;
     current = parent;
   }
-  return false;
 }
 
 /** Every string an event carries, keys included, as it was written: `JSON.stringify` escapes whitespace first. */

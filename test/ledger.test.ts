@@ -189,6 +189,12 @@ test("a checkout whose worktree root cannot be read refuses the ledger rather th
   symlinkSync(join(root, "gone"), join(unlinked, ".git"));
   expect(() => ledgerPath(unlinked, { home: join(root, "agenthub") }))
     .toThrow("so where the ledger lives cannot be checked");
+  // The search runs to the filesystem root, so distance does not turn the same checkout into "no marker": a fixed
+  // ancestor count would stop short of the marker here and skip the check, one level further away from the same hole.
+  const deep = join(unlinked, ...Array.from({ length: 70 }, (_, index) => `d${index}`));
+  mkdirSync(deep, { recursive: true });
+  expect(() => ledgerPath(deep, { home: join(root, "agenthub") }))
+    .toThrow("so where the ledger lives cannot be checked");
   const outside = join(root, "plain");
   mkdirSync(outside);
   expect(ledgerPath(outside, { home: join(root, "agenthub") })).toContain(join("review"));

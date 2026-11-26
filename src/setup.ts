@@ -253,7 +253,13 @@ export function setupCommand(cwd: string, args: readonly string[]): number {
         else attempt(() => writeFileSync(saved.config.path, saved.config.before ?? ""), saved.config.path, "restore");
       }
       for (const file of saved.skill.files) {
-        try { unlinkSync(join(saved.skill.dir, file.name)); } catch { /* Already gone: undo still completes. */ }
+        const path = join(saved.skill.dir, file.name);
+        attempt(() => {
+          try { unlinkSync(path); }
+          catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          }
+        }, path, "remove the installed skill file");
       }
       for (const dir of [...saved.created].reverse()) {
         try { rmdirSync(dir); } catch { /* A directory that gained other files is left alone. */ }
@@ -330,7 +336,7 @@ export function setupCommand(cwd: string, args: readonly string[]): number {
         writeFileSync(receipt, `${JSON.stringify(saved, null, 2)}\n`, { mode: 0o600 });
       }, receipt, "write the arev setup receipt to");
     } catch (error) {
-      const left = rollback(target, before, installed, [...created, skillTarget]);
+      const left = rollback(target, before, installed, created);
       if (left.length > 0) {
         throw new Refusal(`arev setup did not finish, and could not take back ${left.join(", ")}`,
           `remove those paths by hand, then run arev setup ${name} --apply again`);

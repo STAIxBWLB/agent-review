@@ -202,3 +202,46 @@ test("a filesystem failure names the path, the errno code and the next step", ()
   expect(lines.some(line => line.startsWith("next:") && line.includes("permissions"))).toBe(true);
   expect(receipts()).toEqual([]);
 });
+
+test("a failed receipt write preserves a pre-existing empty skill directory", () => {
+  const skillDirectory = join(home, ".kimi-code", "skills", "arev-review");
+  const receiptDirectory = join(state, "setup");
+  mkdirSync(skillDirectory, { recursive: true });
+  mkdirSync(receiptDirectory, { recursive: true });
+  chmodSync(receiptDirectory, 0o500);
+  try {
+    expect(setupCommand(home, ["kimi", "--apply"])).toBe(1);
+    expect(existsSync(skillDirectory)).toBe(true);
+    expect(readdirSync(skillDirectory)).toEqual([]);
+    expect(existsSync(join(home, ".kimi-code", "mcp.json"))).toBe(false);
+    expect(receipts()).toEqual([]);
+  } finally {
+    chmodSync(receiptDirectory, 0o700);
+  }
+});
+
+test("undo retains its receipt when a skill file cannot be removed, then succeeds on retry", () => {
+  const skillDirectory = join(home, ".kimi-code", "skills", "arev-review");
+  const skill = join(skillDirectory, "SKILL.md");
+  const config = join(home, ".kimi-code", "mcp.json");
+  expect(setupCommand(home, ["kimi", "--apply"])).toBe(0);
+  const originalReceipts = receipts();
+  expect(originalReceipts).toHaveLength(1);
+  chmodSync(skillDirectory, 0o500);
+  const lines: string[] = [];
+  const stderr = spyOn(console, "error").mockImplementation((line: unknown) => { lines.push(String(line)); });
+  try {
+    expect(setupCommand(home, ["kimi", "--undo"])).toBe(1);
+    expect(existsSync(skill)).toBe(true);
+    expect(receipts()).toEqual(originalReceipts);
+    expect(lines.some(line => line.includes("cannot remove the installed skill file"))).toBe(true);
+    expect(lines.some(line => line.startsWith("next:") && line.includes("permissions"))).toBe(true);
+  } finally {
+    stderr.mockRestore();
+    chmodSync(skillDirectory, 0o700);
+  }
+  expect(setupCommand(home, ["kimi", "--undo"])).toBe(0);
+  expect(existsSync(skill)).toBe(false);
+  expect(existsSync(config)).toBe(false);
+  expect(receipts()).toEqual([]);
+});

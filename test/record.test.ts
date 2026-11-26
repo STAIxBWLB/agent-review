@@ -227,18 +227,20 @@ test("a finding's lifecycle is scoped to its PR: one PR's resolve leaves another
     { v: 1, type: "packet", at: "t0", packet: packetFor(HEAD) },
     { v: 1, type: "record", at: "t1", id: "record-1", record: recordAt(HEAD, [finding()]) },
     { v: 1, type: "packet", at: "t2", packet: other },
-    { v: 1, type: "record", at: "t3", id: "record-2", record: recordAt(NEXT, [finding({ text: "the other PR's frame is missing" })], "changes_requested", { ok: true }, 8) },
+    // The other PR reports the same id as an advisory, and it is the later record: a resolve expands its finding from the
+    // latest report of the id, so this severity is what a replay that did not skip the other PR's record would show.
+    { v: 1, type: "record", at: "t3", id: "record-2", record: recordAt(NEXT, [finding({ text: "the other PR's frame is missing", severity: "advisory" })], "changes_requested", { ok: true }, 8) },
     { v: 1, type: "resolve", at: "t4", head: HEAD, finding: "bugs:missing-frame", as: "fixed", evidence: ["src/a.ts:40"] },
   ];
-  // PR 7's own head is settled, and PR 8's finding is not in PR 7's view at all.
+  // PR 7's own head is settled, and it settles the blocking finding this PR reported, not the advisory one PR 8 did.
   const mine = ledgerEventsView(events, HEAD);
   expect(mine.openBlocking).toEqual([]);
-  expect(mine.counts).toMatchObject({ fixed: 1, openImportant: 0 });
+  expect(mine.counts).toMatchObject({ important: 1, nit: 0, fixed: 1, openImportant: 0 });
   expect(mine.findings.find(entry => entry.id === "bugs:missing-frame")?.text).toBe("raw reviewed content reached the packet");
   // PR 8's view replays only its own report: the resolve at PR 7's head neither settles nor appears there.
   const theirs = ledgerEventsView(events, NEXT);
-  expect(theirs.openBlocking).toEqual(["bugs:missing-frame"]);
-  expect(theirs.counts).toMatchObject({ important: 1, openImportant: 1, fixed: 0 });
+  expect(theirs.openBlocking).toEqual([]);
+  expect(theirs.counts).toMatchObject({ important: 0, nit: 1, openNit: 1, fixed: 0 });
   expect(theirs.findings.find(entry => entry.id === "bugs:missing-frame")?.text).toBe("the other PR's frame is missing");
   expect(theirs.findings.find(entry => entry.id === "bugs:missing-frame")?.disposition).toBe("open");
 });

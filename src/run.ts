@@ -108,7 +108,8 @@ function mcpArgs(host: string, arev: string, out: string, launch: string, kimiFl
   const command = "/bin/sh";
   const args = ["-c", 'CDPATH= cd "$1" && exec "$2" mcp --run "$3"', "sh", launch, arev, out];
   if (host === "codex") {
-    return ["-c", `mcp_servers.arev.command=${JSON.stringify(command)}`,
+    // Wait for this run's cold tool catalog before Codex sends its first turn.
+    return ["-c", "mcp_servers.arev.required=true", "-c", `mcp_servers.arev.command=${JSON.stringify(command)}`,
       "-c", `mcp_servers.arev.args=${JSON.stringify(args)}`];
   }
   const configFlag = host === "kimi" ? kimiFlag : "--mcp-config";

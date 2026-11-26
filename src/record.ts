@@ -357,7 +357,7 @@ function parseArgs(args: readonly string[], spec: { value: readonly string[]; bo
 }
 
 /** `arev record <report.json> [--implementer NAME] [--json]`. */
-export function recordCommand(args: readonly string[]): number {
+export function recordCommand(cwd: string, args: readonly string[]): number {
   const parsed = parseArgs(args, { value: ["--implementer"], boolean: ["--json"] });
   if (!parsed) return usageError("record takes one report file and --implementer <name> | --json");
   if (parsed.positionals.length !== 1) return usageError(`record takes exactly one report file (got ${parsed.positionals.length})`);
@@ -380,7 +380,7 @@ export function recordCommand(args: readonly string[]): number {
     if (typeof head !== "string" || !head) {
       throw new Refusal(`the report ${file} has no packet.subject.head`, "write the report from the packet.json arev wrote: arev packet --pr N --out DIR");
     }
-    const events = readLedger(cwd());
+    const events = readLedger(cwd);
     const packetEvent = [...events].reverse().find(event => event.type === "packet" && event.packet.subject.head === head);
     if (!packetEvent || packetEvent.type !== "packet") {
       throw new Refusal(`no packet for head ${head} is in the ledger`, `run arev packet for that head (arev packet --pr N --out DIR), then write the report from its packet.json`);
@@ -389,7 +389,7 @@ export function recordCommand(args: readonly string[]): number {
     const implementer = parsed.flags["--implementer"]?.at(-1);
     const record = parseReviewRecord(raw, { packet: packetEvent.packet, maxAdvisories: cap, person: interactive(), ...(implementer === undefined ? {} : { implementer }) });
     const id = recordId(record);
-    appendEvent(cwd(), { v: 1, type: "record", at: new Date().toISOString(), id, record });
+    appendEvent(cwd, { v: 1, type: "record", at: new Date().toISOString(), id, record });
     const blockingOpen = record.findings.filter(finding => finding.severity === "blocking" && finding.disposition === "open").length;
     if (parsed.flags["--json"] !== undefined) {
       console.log(JSON.stringify({ id, head: record.packet.subject.head, verdict: record.verdict, call: record.call, findings: record.findings.length, blockingOpen }, null, 2));
@@ -404,7 +404,7 @@ export function recordCommand(args: readonly string[]): number {
 }
 
 /** `arev resolve <finding-id> --as fixed|false_positive|accepted [--evidence REF]... [--rationale TEXT] [--head SHA]`. */
-export function resolveCommand(args: readonly string[]): number {
+export function resolveCommand(cwd: string, args: readonly string[]): number {
   const parsed = parseArgs(args, { value: ["--as", "--evidence", "--rationale", "--head"], boolean: ["--json"] });
   if (!parsed) return usageError("resolve takes one finding id and --as fixed|false_positive|accepted, with --evidence, --rationale or --head");
   if (parsed.positionals.length !== 1) return usageError(`resolve takes exactly one finding id (got ${parsed.positionals.length})`);
@@ -421,7 +421,7 @@ export function resolveCommand(args: readonly string[]): number {
     if (as === "false_positive" && evidence.length === 0) {
       throw new Refusal("--as false_positive needs --evidence", `pass --evidence path:line (or the command output) that settles ${id}`);
     }
-    const events = readLedger(cwd());
+    const events = readLedger(cwd);
     const known = events.some(event => event.type === "record" && event.record.findings.some(finding => finding.id === id));
     if (!known) throw new Refusal(`no recorded finding has the id ${id}`, "run arev show to list the finding ids in the ledger");
     const newestRecord = [...events].reverse().find(event => event.type === "record");
@@ -432,7 +432,7 @@ export function resolveCommand(args: readonly string[]): number {
       ...(evidence.length ? { evidence } : {}),
       ...(rationale === undefined ? {} : { rationale: cliText(rationale, MAX_TEXT, "--rationale") }),
     };
-    appendEvent(cwd(), event);
+    appendEvent(cwd, event);
     if (parsed.flags["--json"] !== undefined) console.log(JSON.stringify({ finding: id, as, head, evidence, ...(rationale === undefined ? {} : { rationale }) }, null, 2));
     else console.log(`resolved ${id} as ${as} at ${head}; next: arev show, then arev gate`);
     return EXIT.ok;
@@ -442,14 +442,14 @@ export function resolveCommand(args: readonly string[]): number {
 }
 
 /** `arev show [--head SHA] [--json]`. */
-export function showCommand(args: readonly string[]): number {
+export function showCommand(cwd: string, args: readonly string[]): number {
   const parsed = parseArgs(args, { value: ["--head"], boolean: ["--json"] });
   if (!parsed) return usageError("show takes --head <sha> and --json");
   if (parsed.positionals.length > 0) return usageError(`show takes no arguments after its flags (got ${parsed.positionals.length})`);
   try {
-    const events = readLedger(cwd());
+    const events = readLedger(cwd);
     if (events.length === 0) {
-      console.log(`no review ledger for ${reviewProjectId(cwd())} yet; next: arev packet --pr N --out DIR`);
+      console.log(`no review ledger for ${reviewProjectId(cwd)} yet; next: arev packet --pr N --out DIR`);
       return EXIT.ok;
     }
     const view = ledgerEventsView(events, parsed.flags["--head"]?.at(-1));
@@ -471,6 +471,3 @@ export function showCommand(args: readonly string[]): number {
     return failure(error);
   }
 }
-
-/** The reviewed checkout: `arev` runs where the person ran it. */
-const cwd = (): string => process.cwd();

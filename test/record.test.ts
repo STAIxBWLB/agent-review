@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { ledgerEventsView, parseReviewRecord } from "../src/record.ts";
-import { appendEvent, type LedgerEvent, type PacketBlock } from "../src/ledger.ts";
+import { type LedgerEvent, type PacketBlock } from "../src/ledger.ts";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -11,8 +11,13 @@ afterEach(() => {
 });
 
 function git(cwd: string, args: string[]): void {
+  gitOut(cwd, args);
+}
+
+function gitOut(cwd: string, args: string[]): string {
   const result = Bun.spawnSync(["git", "-C", cwd, ...args], { env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1" } });
   if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+  return result.stdout.toString().trim();
 }
 
 function fixture(): { root: string; repo: string; home: string } {
@@ -192,18 +197,33 @@ test("the view carries an open blocking finding to a later head and a resolve se
 
 test("arev record, resolve and show read and append the same ledger", () => {
   const { root, repo, home } = fixture();
-  const packet: LedgerEvent = { v: 1, type: "packet", at: "2026-11-26T00:00:00.000Z", packet: packetFor(HEAD) };
-  appendEvent(repo, packet, { home });
+  const commit = (body: string, message: string) => {
+    writeFileSync(join(repo, "a.ts"), body);
+    git(repo, ["add", "a.ts"]);
+    git(repo, ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", message]);
+    return gitOut(repo, ["rev-parse", "HEAD"]);
+  };
+  const base = commit("export const a = 1;\n", "base");
+  const head = commit("export const a = 2;\n", "head");
+
+  // The packet event has to be one arev built for this head: `record` rebuilds it and refuses a packet it cannot match.
+  const built = run(repo, home, "packet", "--from", base, "--to", head, "--json");
+  expect(built.code).toBe(0);
+  const packet = JSON.parse(built.stdout);
   const report = join(root, "report.json");
-  writeFileSync(report, JSON.stringify(reportFor(HEAD, { findings: [finding()] })));
+  writeFileSync(report, JSON.stringify(reportFor(head, {
+    packet: { id: packet.id, subject: packet.subject },
+    coverage: { reviewed: packet.units.map((unit: { path: string }) => unit.path), skipped: [] },
+    findings: [finding()],
+  })));
 
   const recorded = run(repo, home, "record", report);
   expect(recorded.code).toBe(0);
   expect(recorded.stdout).toContain("1 finding(s), 1 blocking open");
 
   const shown = JSON.parse(run(repo, home, "show", "--json").stdout);
-  expect(shown.head).toBe(HEAD);
-  expect(shown.packet).toBe(PACKET);
+  expect(shown.head).toBe(head);
+  expect(shown.packet).toBe(packet.id);
   expect(shown.openBlocking).toEqual(["bugs:missing-frame"]);
   expect(run(repo, home, "show").stdout).toContain("gate: fails while these are open: bugs:missing-frame");
 

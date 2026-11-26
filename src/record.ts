@@ -15,6 +15,7 @@ import { parseReviewAnchor, reviewAnchorErrorMessage, type ReviewAnchor } from "
 import { blocksApproval, findingTally, findingsForHead, positionalFindingId, type ReviewFinding, type ReviewFindingSet, type ReviewFindingTally } from "./findings.ts";
 import { sanitize } from "./frame.ts";
 import { Refusal, appendEvent, readLedger, recordId, reviewProjectId, type LedgerEvent, type PacketBlock, type RecordFinding, type ReviewRecordV1 } from "./ledger.ts";
+import { buildPacket, type PacketRequest } from "./packet.ts";
 
 /** The spec's default advisory cap; a packet event may carry REVIEW.md's value as `review.advisory_cap`. */
 export const DEFAULT_MAX_ADVISORIES = 5;
@@ -261,6 +262,20 @@ const lifecycle = (finding: RecordFinding): ReviewFinding => ({
 });
 
 /**
+ * The request that rebuilds a stored packet from its own subject. A subject that is a fixed base and head rebuilds to
+ * the same packet; a workspace subject does not, because it names HEAD while the tree is what moved.
+ */
+function rebuildRequest(subject: PacketBlock["subject"]): PacketRequest | undefined {
+  if (subject.kind === "range" && subject.base) return { kind: "range", base: subject.base, head: subject.head };
+  if (subject.kind === "commit") return { kind: "commit", commit: subject.head };
+  if (subject.kind === "workspace") return { kind: "workspace" };
+  // ponytail: a `files` packet does not keep the scope paths it was built from, so it cannot be rebuilt and its report
+  // is still checked against the stored event alone. Ceiling: an edit after `arev packet --files P...` leaves a stale
+  // packet accepted for the same head. Lifting it needs the scope paths stored on the packet event.
+  return undefined;
+}
+
+/**
  * Replay the ledger into the review of one head. Records are finding sets keyed by their head; a resolve is an explicit
  * disposition for its id at the head it was recorded at, carrying the severity and term of the latest report of it, so
  * settling a blocking finding once settles it for later heads too. A resolve naming an id no report ever carried has
@@ -384,6 +399,21 @@ export function recordCommand(cwd: string, args: readonly string[]): number {
     const packetEvent = [...events].reverse().find(event => event.type === "packet" && event.packet.subject.head === head);
     if (!packetEvent || packetEvent.type !== "packet") {
       throw new Refusal(`no packet for head ${head} is in the ledger`, `run arev packet for that head (arev packet --pr N --out DIR), then write the report from its packet.json`);
+    }
+    const request = rebuildRequest(packetEvent.packet.subject);
+    if (request) {
+      let rebuilt: string;
+      try {
+        rebuilt = buildPacket(cwd, request).packet.id;
+      } catch (error) {
+        // A packet that cannot be rebuilt cannot be shown to match, and an unrun check is not a pass.
+        throw new Refusal(`arev cannot rebuild the packet for head ${head} to check the report against: ${error instanceof Error ? error.message : "unknown error"}`,
+          `fetch the reviewed commits and retry, or rerun arev packet for ${head} and rewrite the report from its packet.json`);
+      }
+      if (rebuilt !== packetEvent.packet.id) {
+        throw new Refusal(`the packet changed since arev packet (${packetEvent.packet.id} was recorded, ${rebuilt} is what arev builds for head ${head} now)`,
+          "rerun arev packet and rewrite the report from the new packet.json; a workspace subject counts every uncommitted file, the report included, so keep the report outside the worktree");
+      }
     }
     const cap = packetEvent.review?.advisory_cap ?? DEFAULT_MAX_ADVISORIES;
     const implementer = parsed.flags["--implementer"]?.at(-1);

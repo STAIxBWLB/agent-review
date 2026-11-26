@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { copyFileSync, lstatSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { copyFileSync, lstatSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { isDenied } from "@staix/agent-mem/platform";
@@ -235,8 +235,16 @@ export function buildPacket(cwd: string, request: PacketRequest): PacketBundle {
   catch { throw new Error("Cannot create a temporary Git index directory. Check temporary directory permissions and retry."); }
   try {
     const indexFile = join(temp, "index");
-    try { copyFileSync(resolve(root, indexPath.replace(/\r?\n$/, "")), indexFile); }
-    catch (error) {
+    const realIndex = resolve(root, indexPath.replace(/\r?\n$/, ""));
+    try {
+      const { mtimeNs } = statSync(realIndex, { bigint: true });
+      copyFileSync(realIndex, indexFile);
+      // Git uses the index mtime to discover racy-clean entries. A fresh copy would
+      // hide them when add -N rewrites the index. Round down so the cutoff cannot
+      // move forward even on filesystems with different timestamp precision.
+      const cutoff = Number(mtimeNs / 1_000_000_000n);
+      utimesSync(indexFile, cutoff, cutoff);
+    } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
         throw new Error("Cannot copy the repository's Git index. Check index permissions and retry.");
       }

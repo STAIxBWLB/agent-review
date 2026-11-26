@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { copyFileSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { copyFileSync, readFileSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { coverageGap, repositoryPath, type ReviewPacket } from "../src/packet.ts";
@@ -453,4 +453,29 @@ test("workspace accounts for an untracked file recreated at a staged rename sour
   expect(bundle.diff).toContain("new tracked-name reuse");
   const scoped = isolatedPacket(dir, { kind: "files", paths: ["a.txt"] });
   expect(scoped.packet.units.some(unit => unit.path === "a.txt")).toBe(true);
+});
+
+test("a temporary index keeps a same-size edit at the real index timestamp", () => {
+  const { dir, git, write } = fixture();
+  const stamp = 1_700_000_000;
+  const tracked = join(dir, "tracked.txt");
+  const index = join(dir, ".git", "index");
+  git("config", "core.trustctime", "false");
+  write("tracked.txt", "before\n");
+  utimesSync(tracked, stamp, stamp);
+  git("add", ".");
+  git("commit", "-qm", "base");
+  utimesSync(index, stamp, stamp);
+  const before = readFileSync(index);
+
+  // Preserve the index entry's size and mtime so Git has to detect a racy-clean entry.
+  write("tracked.txt", "edited\n");
+  utimesSync(tracked, stamp, stamp);
+  write("untracked.txt", "new fixture content\n");
+  expect(git("diff", "HEAD", "--name-status").trim()).toBe("M\ttracked.txt");
+
+  const bundle = isolatedPacket(dir, { kind: "workspace" });
+  assertParity(bundle.packet, ["tracked.txt", "untracked.txt"]);
+  expect(bundle.diff).toContain("+edited");
+  expect(readFileSync(index)).toEqual(before);
 });

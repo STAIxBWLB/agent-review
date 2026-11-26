@@ -62,6 +62,22 @@ test("permits named node:module helpers and rejects indirect runtime loaders", (
     const alias = require;
   `);
   expect(errors).toHaveLength(5);
-  expect(errors.slice(0, 4).every(error => error.includes("without createRequire"))).toBe(true);
+  expect(errors.slice(0, 4).every(error => error.includes("allowlisted isBuiltin"))).toBe(true);
   expect(errors[4]).toContain("call require directly");
+});
+
+test("rejects unlisted module bindings and indirect loader properties", () => {
+  const errors = fixture(`
+    import { _load } from "node:module";
+    process.getBuiltinModule("node:path");
+    import.meta.require("node:path");
+    process["getBuiltinModule"]("node:path");
+    import.meta["require"]("node:path");
+  `);
+  expect(errors).toHaveLength(5);
+  expect(errors[0]).toContain("allowlisted isBuiltin");
+  expect(errors[1]).toContain("instead of getBuiltinModule");
+  expect(errors[2]).toContain("instead of require");
+  expect(errors[3]).toContain("instead of getBuiltinModule");
+  expect(errors[4]).toContain("instead of require");
 });

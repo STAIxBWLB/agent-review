@@ -9,7 +9,8 @@ const dependencies = {
   "@staix/mcp-stdio": "0.1.0",
 };
 const packages = new Set(["@staix/agent-mem/platform", "@staix/cli-output", "@staix/mcp-stdio"]);
-const moduleLoaders = new Set(["createRequire", "Module", "default"]);
+// ponytail: this AST check catches accidental imports; review covers deliberate evasion via eval, new Function or Bun.plugin.
+const moduleBindings = new Set(["isBuiltin"]);
 const extensions = new Set([".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs"]);
 
 export function checkBoundary(directory: string): string[] {
@@ -43,7 +44,7 @@ export function checkBoundary(directory: string): string[] {
       const name = specifier.text;
       if (typeOnly && name === "@staix/agent-console/contract") return;
       if ((name === "node:module" || name === "module") && !typeOnly && !safeModuleBindings) {
-        failures.push(`${location}: use explicit named imports from node:module without createRequire.`);
+        failures.push(`${location}: use only the allowlisted isBuiltin runtime import from node:module.`);
         return;
       }
       if (isBuiltin(name) || name.startsWith("bun:") || packages.has(name)) return;
@@ -72,13 +73,13 @@ export function checkBoundary(directory: string): string[] {
           bindings.elements.every(element => element.isTypeOnly));
         const safeModuleBindings = clause?.name === undefined && bindings !== undefined &&
           ts.isNamedImports(bindings) && bindings.elements.every(element =>
-            element.isTypeOnly || !moduleLoaders.has((element.propertyName ?? element.name).text));
+            element.isTypeOnly || moduleBindings.has((element.propertyName ?? element.name).text));
         checkImport(node, node.moduleSpecifier, typeOnly, safeModuleBindings);
       } else if (ts.isExportDeclaration(node) && node.moduleSpecifier) {
         const exports = node.exportClause;
         const safeModuleBindings = exports !== undefined && ts.isNamedExports(exports) &&
           exports.elements.every(element =>
-            element.isTypeOnly || !moduleLoaders.has((element.propertyName ?? element.name).text));
+            element.isTypeOnly || moduleBindings.has((element.propertyName ?? element.name).text));
         checkImport(node, node.moduleSpecifier, node.isTypeOnly, safeModuleBindings);
       } else if (ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference)) {
         checkImport(node, node.moduleReference.expression, node.isTypeOnly);
@@ -89,7 +90,16 @@ export function checkBoundary(directory: string): string[] {
            (ts.isIdentifier(node.expression) && node.expression.text === "require"))) {
         checkImport(node, node.arguments[0]);
       }
+      const member = ts.isPropertyAccessExpression(node) ? node.name.text :
+        ts.isElementAccessExpression(node) && ts.isStringLiteralLike(node.argumentExpression)
+          ? node.argumentExpression.text : undefined;
+      if (member === "getBuiltinModule" || (member === "require" && (ts.isPropertyAccessExpression(node) ||
+          ts.isElementAccessExpression(node)) && ts.isMetaProperty(node.expression))) {
+        const line = source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1;
+        failures.push(`${relative(root, path)}:${line}: use a static import instead of ${member}.`);
+      }
       if (ts.isIdentifier(node) && node.text === "require" &&
+          !(ts.isPropertyAccessExpression(node.parent) && node.parent.name === node && ts.isMetaProperty(node.parent.expression)) &&
           !(ts.isCallExpression(node.parent) && node.parent.expression === node)) {
         const line = source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1;
         failures.push(`${relative(root, path)}:${line}: call require directly with a literal or use an import declaration.`);

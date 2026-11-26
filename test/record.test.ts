@@ -1,9 +1,9 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { ledgerEventsView, parseReviewRecord } from "../src/record.ts";
-import { type LedgerEvent, type PacketBlock } from "../src/ledger.ts";
+import { ledgerEventsView, parseReviewRecord, recordCommand } from "../src/record.ts";
+import { Refusal, type LedgerEvent, type PacketBlock } from "../src/ledger.ts";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -58,11 +58,20 @@ const reportFor = (head: string, changes: Record<string, unknown> = {}) => ({
   ...changes,
 });
 
-const options = { packet: packetFor(HEAD), person: false };
+const options = { packet: packetFor(HEAD) };
 const finding = (changes: Record<string, unknown> = {}) =>
   ({ id: "bugs:missing-frame", term: "bugs", severity: "blocking", disposition: "open", origin: "introduced", text: "raw reviewed content reached the packet", ...changes });
+/** The next step the refusal states, or `undefined` when the report was recorded. */
+const nextOf = (report: unknown): string | undefined => {
+  try {
+    parseReviewRecord(report, options);
+    return undefined;
+  } catch (error) {
+    return error instanceof Refusal ? error.next : undefined;
+  }
+};
 const recordAt = (head: string, findings: unknown[], verdict = "changes_requested", call: unknown = { ok: true }) =>
-  parseReviewRecord(reportFor(head, { findings, verdict, call }), { packet: packetFor(head), person: false });
+  parseReviewRecord(reportFor(head, { findings, verdict, call }), { packet: packetFor(head) });
 
 test("a report is recorded against the ledger's packet, not the copy it carries", () => {
   const record = parseReviewRecord(reportFor(HEAD), options);
@@ -77,7 +86,7 @@ test("a coverage path is matched exactly, and framed only in what the record sto
   // coverage check has to compare the path the packet names, not the framed spelling it is displayed with.
   const header = "--- from x";
   const packet: PacketBlock = { ...packetFor(HEAD), units: [{ path: header, status: "M" }] };
-  const record = parseReviewRecord(reportFor(HEAD, { coverage: { reviewed: [header], skipped: [] } }), { packet, person: false });
+  const record = parseReviewRecord(reportFor(HEAD, { coverage: { reviewed: [header], skipped: [] } }), { packet });
   expect(record.coverage.reviewed).toEqual([`> ${header}`]);
 });
 
@@ -109,7 +118,7 @@ test("advisory findings are capped by the packet's REVIEW.md value, default 5", 
   const advisories = (count: number) => Array.from({ length: count }, (_, index) => finding({ id: `bugs:advisory-${index}`, severity: "advisory" }));
   expect(() => parseReviewRecord(reportFor(HEAD, { findings: advisories(6) }), options)).toThrow("6 advisory findings exceed the cap of 5");
   expect(parseReviewRecord(reportFor(HEAD, { findings: advisories(5) }), options).findings).toHaveLength(5);
-  expect(() => parseReviewRecord(reportFor(HEAD, { findings: advisories(3) }), { packet: packetFor(HEAD), person: false, maxAdvisories: 2 }))
+  expect(() => parseReviewRecord(reportFor(HEAD, { findings: advisories(3) }), { packet: packetFor(HEAD), maxAdvisories: 2 }))
     .toThrow("exceed the cap of 2");
 });
 
@@ -134,13 +143,16 @@ test("unknown fields, accessors, proxies and inherited keys are refused without 
   expect(executed).toBe(false);
 });
 
-test("accepted needs a person and a rationale; false_positive needs evidence", () => {
-  expect(() => parseReviewRecord(reportFor(HEAD, { findings: [finding({ disposition: "accepted", rationale: "owner decision" })] }), options))
-    .toThrow("accepted without a person");
-  expect(() => parseReviewRecord(reportFor(HEAD, { findings: [finding({ disposition: "accepted" })] }), { packet: packetFor(HEAD), person: true }))
-    .toThrow("accepted without a rationale");
-  expect(parseReviewRecord(reportFor(HEAD, { findings: [finding({ disposition: "accepted", rationale: "owner decision" })] }), { packet: packetFor(HEAD), person: true })
-    .findings[0]?.disposition).toBe("accepted");
+test("a report that states accepted is refused from any caller, and false_positive needs evidence", () => {
+  const accepted = (changes: Record<string, unknown> = {}) => reportFor(HEAD, { findings: [finding({ id: "bugs:owner-risk", disposition: "accepted", ...changes })] });
+  // Accepted is the person's decision, taken through `arev resolve --as accepted`: running `arev record` is not that
+  // decision, so the disposition is refused before the terminal is ever consulted.
+  for (const report of [accepted(), accepted({ rationale: "owner decision" })]) {
+    expect(() => parseReviewRecord(report, options)).toThrow("findings[0] states accepted");
+  }
+  // The refusal names the finding and the one command that states the disposition.
+  expect(nextOf(accepted({ rationale: "owner decision" })))
+    .toBe(`run arev resolve bugs:owner-risk --as accepted --rationale "<what was accepted>" from your own terminal`);
   expect(() => parseReviewRecord(reportFor(HEAD, { findings: [finding({ disposition: "false_positive" })] }), options))
     .toThrow("false_positive without evidence");
   expect(parseReviewRecord(reportFor(HEAD, { findings: [finding({ disposition: "false_positive", evidence: ["src/a.ts:12"] })] }), options)
@@ -165,11 +177,11 @@ test("finding text is framed so reviewed content cannot imitate the report's own
 });
 
 test("--implementer overrides only when the report states none", () => {
-  const withFlag = parseReviewRecord(reportFor(HEAD, { findings: [finding()] }), { packet: packetFor(HEAD), person: false, implementer: "codex" });
+  const withFlag = parseReviewRecord(reportFor(HEAD, { findings: [finding()] }), { packet: packetFor(HEAD), implementer: "codex" });
   expect(withFlag.reviewer.implementer).toBe("codex");
   const agreeing = reportFor(HEAD, { reviewer: { id: "qwen", modelFamily: "qwen", started: "manual", implementer: "codex", sameFamilyFallback: true } });
-  expect(parseReviewRecord(agreeing, { packet: packetFor(HEAD), person: false, implementer: "codex" }).reviewer.implementer).toBe("codex");
-  expect(() => parseReviewRecord(agreeing, { packet: packetFor(HEAD), person: false, implementer: "qwen" }))
+  expect(parseReviewRecord(agreeing, { packet: packetFor(HEAD), implementer: "codex" }).reviewer.implementer).toBe("codex");
+  expect(() => parseReviewRecord(agreeing, { packet: packetFor(HEAD), implementer: "qwen" }))
     .toThrow("--implementer qwen disagrees with the report's reviewer.implementer codex");
 });
 
@@ -268,6 +280,56 @@ test("arev record, resolve and show read and append the same ledger", () => {
   expect(absent.stderr).toContain("cannot read the report");
 });
 
+test("arev record refuses a report that states accepted at a terminal too, naming arev resolve", () => {
+  const { root, repo, home } = fixture();
+  const commit = (body: string, message: string) => {
+    writeFileSync(join(repo, "a.ts"), body);
+    git(repo, ["add", "a.ts"]);
+    git(repo, ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", message]);
+    return gitOut(repo, ["rev-parse", "HEAD"]);
+  };
+  const base = commit("export const a = 1;\n", "base");
+  const head = commit("export const a = 2;\n", "head");
+  const built = run(repo, home, "packet", "--from", base, "--to", head, "--json");
+  expect(built.code).toBe(0);
+  const packet = JSON.parse(built.stdout);
+  const report = join(root, "report.json");
+  writeFileSync(report, JSON.stringify(reportFor(head, {
+    packet: { id: packet.id, subject: packet.subject },
+    coverage: { reviewed: packet.units.map((unit: { path: string }) => unit.path), skipped: [] },
+    findings: [finding({ id: "bugs:owner-risk", disposition: "accepted", rationale: "owner decision" })],
+  })));
+
+  // A person at a terminal running `arev record` is still running a report, not deciding the risk: the command refuses
+  // the disposition whatever the terminal says, because `arev gate` reads the disposition the record would carry.
+  const lines: string[] = [];
+  const printed = spyOn(console, "error").mockImplementation((...args: unknown[]) => void lines.push(args.join(" ")));
+  const previous = { stdin: process.stdin.isTTY, stdout: process.stdout.isTTY, home: process.env.AGENTHUB_HOME };
+  try {
+    process.stdin.isTTY = true;
+    process.stdout.isTTY = true;
+    process.env.AGENTHUB_HOME = home;
+    expect(recordCommand(repo, [report])).toBe(1);
+  } finally {
+    process.stdin.isTTY = previous.stdin;
+    process.stdout.isTTY = previous.stdout;
+    if (previous.home === undefined) delete process.env.AGENTHUB_HOME;
+    else process.env.AGENTHUB_HOME = previous.home;
+    printed.mockRestore();
+  }
+  expect(lines.join("\n")).toContain("findings[0] states accepted; accepted is the person's decision");
+  expect(lines.join("\n")).toContain("arev resolve bugs:owner-risk --as accepted --rationale");
+  // The refusal wrote nothing: the ledger holds the packet and no record.
+  const events = readFileSync(join(home, "review", "github.com/owner/repo", "ledger.jsonl"), "utf8")
+    .split("\n").filter(Boolean).map(line => JSON.parse(line));
+  expect(events.filter(event => event.type === "record")).toEqual([]);
+
+  // The same report from a caller with no terminal is refused the same way: the terminal is not what decides it.
+  const refused = run(repo, home, "record", report);
+  expect(refused.code).toBe(1);
+  expect(refused.stderr).toContain("states accepted");
+});
+
 test("arev record without a packet for the head names the packet command", () => {
   const { root, repo, home } = fixture();
   const report = join(root, "report.json");
@@ -332,7 +394,7 @@ test("arev record --light keeps the flag on the record it appends, and show --js
   const refused = run(repo, home, "record", stated);
   expect(refused.code).toBe(1);
   expect(refused.stderr).toContain("the report has an unknown field (light)");
-  // The refused run wrote nothing: the view still shows the last accepted record, and the ledger has two.
+  // The refused run wrote nothing: the view still shows the last record that was written, and the ledger has two.
   expect(JSON.parse(run(repo, home, "show", "--json").stdout).record).toBe(plain.record);
   expect(readFileSync(join(home, "review", "github.com/owner/repo", "ledger.jsonl"), "utf8")
     .split("\n").filter(Boolean).map(line => JSON.parse(line)).filter(event => event.type === "record")).toHaveLength(2);

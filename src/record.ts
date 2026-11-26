@@ -108,8 +108,6 @@ export interface RecordOptions {
   packet: PacketBlock;
   /** REVIEW.md's cap when the packet carries it, else `DEFAULT_ADVISORY_CAP`. */
   maxAdvisories?: number;
-  /** `accepted` is the person's decision: an interactive terminal is the only source of it. */
-  person: boolean;
   /** `--implementer`; when the report also states one, the two must agree. */
   implementer?: string;
   /** `--light`: the review was made without a REVIEW.md. Only the flag states it; the report may not carry it. */
@@ -120,8 +118,9 @@ export interface RecordOptions {
  * Validate one report against the packet for its head (AC3) and return it with the ledger's packet block.
  *
  * Refused: a packet id that is not the packet for that head, coverage that omits a unit, a positional finding id,
- * more advisory findings than the cap, and an empty finding list without `call.ok: true`. An `accepted` finding, or a
- * `false_positive` without evidence, is also refused: AC4's gate could never pass on it.
+ * more advisory findings than the cap, and an empty finding list without `call.ok: true`. An `accepted` finding is
+ * refused too, from any caller: accepting a risk is the person's decision, taken through `arev resolve --as accepted`
+ * and never stated by a report. A `false_positive` without evidence is refused because AC4's gate could never pass on it.
  */
 export function parseReviewRecord(raw: unknown, options: RecordOptions): ReviewRecordV1 {
   const cap = options.maxAdvisories ?? DEFAULT_ADVISORY_CAP;
@@ -211,9 +210,11 @@ export function parseReviewRecord(raw: unknown, options: RecordOptions): ReviewR
     const evidenceRows = finding.evidence === undefined ? undefined : rows(finding.evidence, MAX_EVIDENCE);
     if (finding.evidence !== undefined && !evidenceRows) refuse(`${at}.evidence must be an array of at most ${MAX_EVIDENCE} refs`, "list each evidence ref as a string such as path:line");
     const evidence = evidenceRows?.map((ref, position) => text(ref, MAX_REF, `${at}.evidence[${position}]`));
-    if (disposition === "accepted" && (!options.person || rationale === undefined)) {
-      refuse(`${at} is accepted without ${options.person ? "a rationale" : "a person"}; accepted is the person's decision`,
-        options.person ? "add a rationale naming what was accepted" : "run arev resolve --as accepted <id> from your own terminal");
+    if (disposition === "accepted") {
+      // A recorded report never carries this, at a terminal or anywhere else: running `arev record` is not the person's
+      // decision, and `arev gate` reads the disposition this writes. Only `arev resolve --as accepted` states it.
+      refuse(`${at} states accepted; accepted is the person's decision and is not a report's to make`,
+        `run arev resolve ${id} --as accepted --rationale "<what was accepted>" from your own terminal`);
     }
     if (disposition === "false_positive" && !evidence?.length) {
       refuse(`${at} is a false_positive without evidence`, "add evidence (path:line or a command's output) that settles it, or record it as open");
@@ -464,7 +465,7 @@ export function recordCommand(cwd: string, args: readonly string[]): number {
     }
     const cap = packetEvent.review?.advisory_cap ?? DEFAULT_ADVISORY_CAP;
     const implementer = parsed.flags["--implementer"]?.at(-1);
-    const record = parseReviewRecord(raw, { packet: packetEvent.packet, maxAdvisories: cap, person: interactive(),
+    const record = parseReviewRecord(raw, { packet: packetEvent.packet, maxAdvisories: cap,
       ...(implementer === undefined ? {} : { implementer }), ...(parsed.flags["--light"] === undefined ? {} : { light: true }) });
     const id = recordId(record);
     appendEvent(cwd, { v: 1, type: "record", at: new Date().toISOString(), id, record });

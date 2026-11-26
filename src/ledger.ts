@@ -7,7 +7,7 @@
  * path, the same shape amem falls back to.
  */
 import { createHash } from "node:crypto";
-import { appendFileSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { reviewGit } from "./review-git.ts";
@@ -87,12 +87,19 @@ const MAX_EVENT_BYTES = 256 * 1024;
 /**
  * A packet event is larger than any other by construction: one unit per changed file plus, per rule, the paths that
  * rule applied to. The 500-file ceiling (`MAX_FILES` in `src/packet.ts`) with 160-byte paths and three rules covering
- * them measures about 360 KB, and a record event embeds that same packet beside a coverage list of the same paths, which
- * measures about 440 KB. Both carry the bound that ceiling needs; the other events keep the smaller one.
+ * them measures about 360 KB. `arev record` refuses a report over `MAX_REPORT_BYTES`, so that is the bound its own
+ * definition states, and it lives here because the record event carries the report's findings and coverage inside it.
  */
 const MAX_PACKET_EVENT_BYTES = 1024 * 1024;
+export const MAX_REPORT_BYTES = 1024 * 1024;
+/**
+ * A record event embeds the packet it was validated against beside the report's own findings and coverage, so its bound
+ * is both halves: a packet that fits the packet bound and a report that fits the report bound still measure their sum.
+ * The other events keep the smaller bound.
+ */
+const MAX_RECORD_EVENT_BYTES = MAX_PACKET_EVENT_BYTES + MAX_REPORT_BYTES;
 const eventCap = (type: LedgerEvent["type"]): number =>
-  type === "packet" || type === "record" ? MAX_PACKET_EVENT_BYTES : MAX_EVENT_BYTES;
+  type === "packet" ? MAX_PACKET_EVENT_BYTES : type === "record" ? MAX_RECORD_EVENT_BYTES : MAX_EVENT_BYTES;
 /**
  * Ledger reads go through `reviewGit`, so they describe the same checkout the packet does: an inherited `GIT_DIR` or
  * `GIT_WORK_TREE` would key the ledger to one repository while `arev packet` built a packet for another.
@@ -172,8 +179,27 @@ export function ledgerPath(cwd: string, options: { home?: string } = {}): string
       throw new Refusal(`AGENTHUB_HOME resolves inside the reviewed worktree (${home}); the ledger is never kept there`,
         `set AGENTHUB_HOME to a directory outside ${top}`);
     }
+  } else if (gitMarkerAtOrAbove(cwd)) {
+    // The probe failed where a `.git` exists, so this is a checkout whose root arev cannot read (dubious ownership, an
+    // unreadable gitdir) and the containment check would be skipped rather than answered. A refusal there is the only
+    // fail-closed read; the same empty probe outside any repository is the supported case, which stays readable.
+    throw new Refusal(`arev cannot read the worktree root of ${cwd}, so where the ledger lives cannot be checked`,
+      "run arev from inside the checkout and make sure git can read it (git status)");
   }
   return path;
+}
+
+/** Whether a `.git` entry sits at or above `cwd`: the signal that separates a broken checkout from no repository at all. */
+function gitMarkerAtOrAbove(cwd: string): boolean {
+  let current = resolve(cwd);
+  for (let step = 0; step < 64; step++) {
+    // A `.git` directory, and the `.git` file a linked worktree or a submodule carries, both count.
+    if (existsSync(join(current, ".git"))) return true;
+    const parent = dirname(current);
+    if (parent === current) return false;
+    current = parent;
+  }
+  return false;
 }
 
 /** Every string an event carries, keys included, as it was written: `JSON.stringify` escapes whitespace first. */

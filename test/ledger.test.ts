@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
-import { canonicalJson, comparablePath, ledgerPath, readLedger, recordId, Refusal, reviewProjectId, secretShaped, appendEvent, type LedgerEvent, type PacketBlock, type ReviewRecordV1 } from "../src/ledger.ts";
+import { canonicalJson, comparablePath, ledgerPath, lineShaped, readLedger, recordId, Refusal, reviewProjectId, secretShaped, appendEvent, type LedgerEvent, type PacketBlock, type ReviewRecordV1 } from "../src/ledger.ts";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -344,9 +344,9 @@ test("a secret separated from its key by a tab or a newline is refused, in a nes
 test("a finding whose text is a bare host:port and whose rationale is an email records, because the line carries no credential", () => {
   const { repo, home } = fixture();
   // The two fields sit side by side in the serialized event: `...host:443","rationale":"a@b.example` is a colon, then
-  // the delimiters between the fields, then an `@`. A userinfo class that spans those delimiters reads one field's port
-  // and the next field's email as `user:password@host` and refuses a record with no credential in it - a real review
-  // finding over `https://example.org:443` with a rationale naming its author is the shape that hits it.
+  // the delimiters between the fields, then an `@`. The URL class may not span those delimiters, so the line is screened
+  // without it and each string with it - a real review finding over `https://example.org:443` with a rationale naming
+  // its author is the shape that hits it.
   const event: LedgerEvent = {
     v: 1, type: "record", at: "2026-11-26T00:00:00.000Z", id: "b".repeat(64),
     record: {
@@ -360,10 +360,33 @@ test("a finding whose text is a bare host:port and whose rationale is an email r
     },
   };
   appendEvent(repo, event, { home });
-  // The written line is what the screen reads, so the case pins it rather than the event object: this is the assertion
-  // the comma, quote and angle-bracket arms of the class exist for.
-  expect(secretShaped(readFileSync(ledgerPath(repo, { home }), "utf8").trim())).toBe(false);
+  // The written line is what the screen reads, so the case pins it rather than the event object: the line's screen holds
+  // the shapes that need a key beside its value and leaves the URL class out, which is what keeps two fields apart.
+  expect(lineShaped(readFileSync(ledgerPath(repo, { home }), "utf8").trim())).toBe(false);
   expect(readLedger(repo, { home })).toEqual([event]);
+});
+
+test("userinfo with a sub-delim is a credential in one string, and the line's screen is what keeps two fields apart", () => {
+  const { repo, home } = fixture();
+  // RFC 3986 allows every sub-delim in userinfo, so `,` and `'` are as valid in a password as a letter is. A class that
+  // excluded them to make the line's screen safe missed both, and a credential URL could then be stored or printed.
+  for (const credential of ["https://u:pa,ss@host", "https://u:it's@host", "https://u:p!$&()*+;w@host"]) {
+    expect(secretShaped(credential), credential).toBe(true);
+    expect(() => appendEvent(repo, resolveEvent(`could not fetch ${credential}`), { home }), credential)
+      .toThrow("matches a secret pattern");
+  }
+  expect(readLedger(repo, { home })).toEqual([]);
+  // One string is where a URL can live, and the line is where two unrelated fields sit side by side. The line's screen
+  // therefore does not look for a URL at all - that is the string screen's job - and it keeps the shapes only the line
+  // can see: an assignment whose key ends one value and whose secret starts the next is neither string's, and the line
+  // is the one place both halves meet. Merging the two lists would either miss a `,` credential or join two fields.
+  expect(lineShaped("could not fetch https://u:pa,ss@host"), "no URL detection on the line").toBe(false);
+  const line = JSON.stringify({ text: "https://example.org:443", rationale: "a@b.example" });
+  expect(secretShaped(line), "the string's screen alone").toBe(false);
+  expect(lineShaped(line)).toBe(false);
+  const split = { a: "token:", b: "abcdefgh1" };
+  expect(secretShaped(split.a) || secretShaped(split.b), "neither value alone").toBe(false);
+  expect(lineShaped(JSON.stringify(split))).toBe(true);
 });
 
 test("an origin that does not name a plain repository path is refused, and nothing is written outside review", () => {

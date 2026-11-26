@@ -6,14 +6,17 @@
  * offers `fixed` and `false_positive` only, because `accepted` is the person's decision at a terminal and a server
  * never has one; `arev_gate` takes no `--post`, so the one GitHub write stays CLI-only (AC5, AC9).
  */
+import { createHash } from "node:crypto";
+import { existsSync, lstatSync, readFileSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { EXIT } from "@staix/cli-output";
 import { serve, type Handler, type Tool } from "@staix/mcp-stdio";
 import { version } from "../package.json";
 import { gateReport } from "./gate.ts";
-import { Refusal, readLedger } from "./ledger.ts";
-import { buildPacket, packetResult, type PacketRequest } from "./packet.ts";
+import { MAX_REPORT_BYTES, Refusal, readLedger } from "./ledger.ts";
+import { buildPacket, packetBrief, packetResult, type PacketRequest, type ReviewPacket } from "./packet.ts";
 import { appendPacketEvent, packetSettings, rulesForPaths } from "./packet-cli.ts";
-import { ledgerEventsView, recordReview, resolveFinding, resolveHead, type ThreadSelector } from "./record.ts";
+import { assertReviewReportSafe, ledgerEventsView, parseReviewRecord, recordReview, resolveFinding, resolveHead, type ThreadSelector } from "./record.ts";
 
 const text = (value: unknown): string | undefined =>
   typeof value === "string" && value.trim() !== "" ? value : undefined;
@@ -249,6 +252,90 @@ export const MCP_TOOLS: readonly (Tool & { name: McpToolName })[] = [
   },
 ];
 
+export const RUN_STATE_FILE = ".arev-run.json";
+export const RUN_REPORT_FILE = "report.json";
+export const RUN_TOOL_NAMES = ["arev_packet", "arev_rules", "arev_show", "arev_record"] as const;
+
+function runArtifact(dir: string, name: string, limit: number): string {
+  const path = join(dir, name);
+  try {
+    const stat = lstatSync(path);
+    if (!stat.isFile() || stat.size > limit) throw new Error("not a bounded regular file");
+    const text = readFileSync(path, "utf8");
+    if (Buffer.byteLength(text) > limit) throw new Error("artifact exceeds its limit");
+    return text;
+  } catch {
+    return fail(`Cannot read the run artifact ${name}`, "use the output directory of the current arev run");
+  }
+}
+
+function runJson(dir: string, name: string): unknown {
+  const text = runArtifact(dir, name, MAX_REPORT_BYTES);
+  try { return JSON.parse(text); }
+  catch { return fail(`The run artifact ${name} is not valid JSON`, "use the output directory of the current arev run"); }
+}
+
+function runHandlers(dir: string): Record<typeof RUN_TOOL_NAMES[number], Handler> {
+  const state = runJson(dir, RUN_STATE_FILE) as { packetId?: string; advisoryCap?: number } | null;
+  const packet = runJson(dir, "packet.json") as ReviewPacket | null;
+  const cap = state?.advisoryCap;
+  if (!packet?.subject || !state || !/^[a-f0-9]{64}$/.test(state.packetId ?? "") ||
+      packet.id !== state.packetId || typeof cap !== "number" || !Number.isInteger(cap) || cap < 0 || cap > 64) {
+    return fail("The run metadata does not match a packet", "restart arev run with a fresh output directory");
+  }
+  const contract = packet.contract === undefined ? undefined : runArtifact(dir, "contract.md", 128 * 1024);
+  if (contract !== undefined && createHash("sha256").update(contract).digest("hex") !== packet.contract?.sha256) {
+    return fail("The run contract does not match the packet digest", "restart arev run with a fresh output directory");
+  }
+  const reportPath = join(dir, RUN_REPORT_FILE);
+  const rules = () => runArtifact(dir, "rules.md", 2 * 1024 * 1024);
+  return {
+    arev_packet: () => {
+      const briefFile = runArtifact(dir, "brief.md", 32 * 1024 * 1024);
+      // Remove the file-only pointer before packetResult supplies the structured result's pointer.
+      const bundle = { packet, brief: "", contractText: contract, rules: "", rulesMissing: [], diff: "" };
+      const pointer = packetBrief(bundle, "file");
+      const brief = pointer && briefFile.endsWith(pointer + "\n") ? briefFile.slice(0, -pointer.length - 1) : briefFile.trimEnd();
+      return packetResult({ ...bundle, brief });
+    },
+    arev_rules: () => ({ base: packet.subject.mergeBase, rules: rules() }),
+    arev_show: () => ({ head: packet.subject.head, packet: packet.id, staged: existsSync(reportPath) }),
+    arev_record: ({ report }) => {
+      if (!report || typeof report !== "object" || Array.isArray(report)) {
+        return fail("arev_record needs a report object", "pass the JSON report for this run's packet");
+      }
+      assertReviewReportSafe(report, "argument");
+      const staged = { ...report, reviewer: {} };
+      // Validate the report against the active packet, with no reviewer claim supplied by the caller.
+      // The outer runner alone attests and records it after checking the checkout.
+      parseReviewRecord(staged, { packet, maxAdvisories: cap,
+        run: { packetId: packet.id, host: "pending", model: "unknown", implementer: "pending", sameFamilyFallback: false } });
+      try {
+        writeFileSync(reportPath, JSON.stringify(staged) + "\n", { flag: "wx", mode: 0o600 });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+          return fail("A report is already staged for this run", "leave it in place and let arev run finish");
+        }
+        return fail("Cannot stage the reviewer report", "check the run output directory permissions and retry");
+      }
+      return { staged: true, packet: packet.id };
+    },
+  };
+}
+
+const RUN_TOOLS: readonly Tool[] = RUN_TOOL_NAMES.map(name => ({
+  name,
+  description: {
+    arev_packet: "Read the active run packet, framed brief and contract.",
+    arev_rules: "Read the framed rules of the active run packet.",
+    arev_show: "Show the active packet head and whether a report has been staged.",
+    arev_record: "Validate and stage one report for this run. arev run records it after checkout verification.",
+  }[name],
+  inputSchema: name === "arev_record"
+    ? { type: "object", properties: { report: REPORT_SCHEMA }, required: ["report"], additionalProperties: false }
+    : { type: "object", properties: {}, additionalProperties: false },
+}));
+
 const INSTRUCTIONS = "arev is deterministic review tooling. Build a packet, read its brief, record the report you wrote, settle findings, then gate the head. accepted findings, arev record --light and arev gate --post are CLI-only.";
 
 /**
@@ -263,12 +350,18 @@ export function mcpFailureText(error: unknown): string {
 
 /** `arev mcp`: serve until stdin closes. `bin/arev.js` sets an exit code and leaves the loop alive on stdin. */
 export function mcpCommand(cwd: string, args: readonly string[]): number {
-  if (args.length > 0) {
-    console.error(`arev: mcp takes no arguments (got ${args.length})`);
+  const run = args.length === 2 && args[0] === "--run" && args[1] ? resolve(cwd, args[1]) : undefined;
+  if (args.length > 0 && run === undefined) {
+    console.error("arev: mcp takes no arguments or --run DIR. Run arev mcp --help.");
     return EXIT.usage;
   }
-  void serve({ name: "arev", version, tools: MCP_TOOLS, handlers: mcpHandlers(cwd), instructions: INSTRUCTIONS,
-    failureText: mcpFailureText })
+  void serve({ name: "arev", version,
+    tools: run === undefined ? MCP_TOOLS : RUN_TOOLS,
+    handlers: run === undefined ? mcpHandlers(cwd) : runHandlers(run),
+    instructions: run === undefined ? INSTRUCTIONS : "Read the active packet with arev_packet, then stage one report using arev_record. The runner records it after checkout verification.",
+    failureText: mcpFailureText,
+    ...(run === undefined ? {} : { limits: { frameBytes: MAX_REPORT_BYTES + 8192, resultBytes: 32 * 1024 * 1024 } }),
+  })
     .catch(error => {
       console.error(`arev mcp: ${error instanceof Error ? error.message : "the server stopped"}`);
       process.exitCode = EXIT.fail;

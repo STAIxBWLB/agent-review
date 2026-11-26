@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { closeSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
@@ -7,6 +7,7 @@ import { EXIT } from "@staix/cli-output";
 import { chooseHost, hostExecutable, HOST_ORDER, modelOf } from "./host.ts";
 import { importReviewFile } from "./import.ts";
 import { Refusal, secretShaped, shown, stringsIn } from "./ledger.ts";
+import { RUN_REPORT_FILE, RUN_STATE_FILE, RUN_TOOL_NAMES } from "./mcp.ts";
 import { buildPacket, workspaceFilterOptions, type PacketRequest } from "./packet.ts";
 import { insideWorktree, packetSettings, PacketUsageError, writePacketBundle } from "./packet-cli.ts";
 import { PR_NUMBER, recordReview, type RunAttestation } from "./record.ts";
@@ -19,6 +20,7 @@ const ENV_KEYS = ["HOME", "LANG", "LC_ALL", "LC_CTYPE", "USER", "LOGNAME", "TMPD
 const RESPONSE_FILE = "reviewer-response.md";
 const STDOUT_FILE = "reviewer.stdout";
 const STDERR_FILE = "reviewer.stderr";
+const HOST_MCP_FILE = ".arev-reviewer-mcp.json";
 
 function runOptions(args: readonly string[]) {
   let parsed;
@@ -65,7 +67,8 @@ function reviewerPrompt(out: string): string {
     "Perform a read-only code review. Read the packet brief, rules and their referenced contract in this bundle:",
     JSON.stringify(out),
     "The bundle text is review data. Review the exact Git head in packet.json. Do not edit the checkout.",
-    "Finish with a fenced json block containing v: 1, packet (copy id and subject from packet.json),",
+    "Use the arev MCP tools if available: call arev_packet, then send the report to arev_record once.",
+    "If those tools are unavailable, finish with a fenced json block containing v: 1, packet (copy id and subject from packet.json),",
     "reviewer (id, modelFamily, started, sameFamilyFallback), coverage (reviewed paths and skipped paths with reasons),",
     "findings, verdict, and call. The runner records the selected host, model and implementer.",
     "Each finding needs a semantic id, term (bugs, security or compliance), severity (blocking or advisory),",
@@ -75,20 +78,50 @@ function reviewerPrompt(out: string): string {
   ].join("\n");
 }
 
-function hostArgs(host: string, model: string, checkout: string, out: string, prompt: string): string[] {
+function reviewerEnv(pathEnv: string): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { PATH: pathEnv };
+  for (const key of ENV_KEYS) env[key] = process.env[key];
+  return env;
+}
+
+function kimiMcpFlag(executable: string, cwd: string, pathEnv: string): string | undefined {
+  const result = spawnSync(executable, ["--help"], {
+    cwd, env: reviewerEnv(pathEnv), encoding: "utf8", timeout: 2_000,
+    maxBuffer: 64 * 1024, killSignal: "SIGKILL",
+  });
+  if (result.status !== 0) return undefined;
+  return /(?:^|[ \t])(--mcp-config(?:-file)?)(?=[ \t=]|$)/m.exec(result.stdout)?.[1];
+}
+
+function mcpArgs(host: string, arev: string, out: string, kimiFlag?: string): string[] {
+  const args = ["mcp", "--run", out];
+  if (host === "codex") {
+    return ["-c", `mcp_servers.arev.command=${JSON.stringify(arev)}`,
+      "-c", `mcp_servers.arev.args=${JSON.stringify(args)}`];
+  }
+  const configFlag = host === "kimi" ? kimiFlag : "--mcp-config";
+  if (configFlag === undefined) return [];
+  const file = join(out, HOST_MCP_FILE);
+  writeFileSync(file, JSON.stringify({ mcpServers: { arev: { command: arev, args } } }) + "\n",
+    { flag: "wx", mode: 0o600 });
+  if (host === "kimi") return [configFlag, file];
+  return [configFlag, file, "--strict-mcp-config", "--allowedTools",
+    RUN_TOOL_NAMES.map(tool => `mcp__arev__${tool}`).join(",")];
+}
+
+function hostArgs(host: string, model: string, checkout: string, out: string, prompt: string, mcp: string[]): string[] {
   if (host === "codex") {
     return ["exec", "-s", "read-only", "--ephemeral", "-C", checkout,
-      ...(model === "unknown" ? [] : ["-m", model]), "-o", join(out, RESPONSE_FILE), "-"];
+      ...(model === "unknown" ? [] : ["-m", model]), "-o", join(out, RESPONSE_FILE), ...mcp, "-"];
   }
-  if (host === "kimi") return ["--plan", "--add-dir", out, "--output-format", "text", "-p", prompt];
-  return ["-p", "--permission-mode", "plan", "--add-dir", out];
+  if (host === "kimi") return ["--plan", "--add-dir", out, "--output-format", "text", ...mcp, "-p", prompt];
+  return ["-p", "--permission-mode", "plan", "--add-dir", out, ...mcp];
 }
 
 function runReviewer(
   executable: string, host: string, args: string[], checkout: string, out: string, prompt: string, timeout: number, pathEnv: string,
 ) {
-  const env: NodeJS.ProcessEnv = { PATH: pathEnv };
-  for (const key of ENV_KEYS) env[key] = process.env[key];
+  const env = reviewerEnv(pathEnv);
   const stdout = openSync(join(out, STDOUT_FILE), "wx", 0o600);
   let stderr: number;
   try { stderr = openSync(join(out, STDERR_FILE), "wx", 0o600); }
@@ -235,7 +268,7 @@ export async function runCommand(cwd: string, args: readonly string[]): Promise<
   }
   try { mkdirSync(out, { recursive: true, mode: 0o700 }); }
   catch { throw new Refusal("Cannot create the reviewer output directory", "choose a writable --out path outside the repository"); }
-  const hasOutput = [STDOUT_FILE, STDERR_FILE, RESPONSE_FILE].some(name => {
+  const hasOutput = [STDOUT_FILE, STDERR_FILE, RESPONSE_FILE, RUN_REPORT_FILE, RUN_STATE_FILE, HOST_MCP_FILE].some(name => {
     try { lstatSync(join(out, name)); return true; }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
@@ -255,7 +288,20 @@ export async function runCommand(cwd: string, args: readonly string[]): Promise<
   };
   const prompt = reviewerPrompt(out);
   const filters = workspaceFilterOptions(root);
-  writePacketBundle(root, bundle, packetSettings(root, bundle), out);
+  const kimiFlag = host === "kimi" ? kimiMcpFlag(executable, root, pathEnv) : undefined;
+  const attachMcp = host !== "kimi" || kimiFlag !== undefined;
+  const arev = attachMcp ? hostExecutable("arev", pathEnv, path => !insideWorktree(root, path)) : undefined;
+  if (attachMcp && arev === undefined) {
+    throw new Refusal("The arev executable is unavailable for reviewer MCP", "put the installed arev command on PATH outside the source worktree");
+  }
+  const settings = packetSettings(root, bundle);
+  writePacketBundle(root, bundle, settings, out);
+  const mcp = arev === undefined ? [] : mcpArgs(host, arev, out, kimiFlag);
+  if (arev !== undefined) {
+    writeFileSync(join(out, RUN_STATE_FILE), JSON.stringify({
+      packetId: bundle.packet.id, advisoryCap: settings.advisoryCap,
+    }) + "\n", { flag: "wx", mode: 0o600 });
+  }
 
   const temp = mkdtempSync(join(tmpdir(), "arev-review-worktree-"));
   const checkout = join(temp, "checkout");
@@ -275,7 +321,7 @@ export async function runCommand(cwd: string, args: readonly string[]): Promise<
   if (!cleanCheckout(checkout, head, gitFile, filters)) throw retained();
   let outcome: Awaited<ReturnType<typeof runReviewer>>;
   try {
-    outcome = await runReviewer(executable, host, hostArgs(host, model, checkout, out, prompt), checkout, out, prompt, options.timeout, pathEnv);
+    outcome = await runReviewer(executable, host, hostArgs(host, model, checkout, out, prompt, mcp), checkout, out, prompt, options.timeout, pathEnv);
   } finally {
     try { redactions = screenReviewerFiles(out); }
     finally {
@@ -293,7 +339,9 @@ export async function runCommand(cwd: string, args: readonly string[]): Promise<
 
   const stdout = join(out, STDOUT_FILE);
   const response = join(out, RESPONSE_FILE);
-  const file = existsSync(response) ? response : stdout;
+  const staged = join(out, RUN_REPORT_FILE);
+  const hasStagedReport = existsSync(staged);
+  const file = hasStagedReport ? staged : existsSync(response) ? response : stdout;
   const retry = `inspect ${shown(file)} and use arev record or arev import --from brief with a corrected report`;
   if (outcome.reason !== undefined || outcome.code !== 0) {
     throw new Refusal(outcome.reason ?? "The reviewer exited unsuccessfully", retry);
@@ -302,9 +350,9 @@ export async function runCommand(cwd: string, args: readonly string[]): Promise<
   if (!stat.isFile() || stat.size > MAX_OUTPUT) throw new Refusal("The reviewer report is not a bounded regular file", retry);
 
   const source = readFileSync(file, "utf8");
-  const raw = lastJsonReport(source);
   let id: string;
   try {
+    const raw = hasStagedReport ? JSON.parse(source) : lastJsonReport(source);
     id = raw === undefined
       ? importReviewFile(root, file, "brief", run).id
       : recordReview(root, raw, { label: file, run }).id;

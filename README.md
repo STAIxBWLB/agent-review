@@ -123,6 +123,10 @@ the run reviews HEAD against the origin default branch and starts the
 automatic host rotation at the first host. Pass `--host ID` to select an
 installed reviewer explicitly.
 
+Supported reviewers submit one validated report over the scoped MCP stdio
+channel. The runner records the staged report after it verifies the checkout.
+When the reviewer cannot use MCP, it can return a JSON report in its output.
+
 The default timeout is 30 minutes. Use `--out DIR` outside the source
 worktree to choose where packet files and reviewer output are saved. A dirty
 reviewer checkout is retained for inspection and its review is void.

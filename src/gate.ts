@@ -8,13 +8,9 @@ import { spawnSync } from "node:child_process";
 import { EXIT, errorLine } from "@staix/cli-output";
 import { Refusal, appendEvent, readLedger, type LedgerEvent, type ReviewRecordV1 } from "./ledger.ts";
 import { ledgerEventsView } from "./record.ts";
+import { parseReviewMd } from "./review-md.ts";
 import { commitOid } from "./review-git.ts";
-import { readRules, type RuleText } from "./rules.ts";
-
-/** The `[gate]` settings a rules file may carry. Absent means the spec's safe default. */
-export interface GateSettings {
-  sameFamily: "allow" | "deny";
-}
+import { readRules } from "./rules.ts";
 
 /** One gate evaluation: what was gated, what the ledger says, and each condition still open. */
 export interface GateResult {
@@ -28,58 +24,6 @@ export interface GateResult {
 
 const FULL_OID = /^[a-f0-9]{40}$|^[a-f0-9]{64}$/;
 const STATUS_CONTEXT = "arev/gate";
-/** A commit status description is capped at 140 characters; `arev gate: record ` plus a full id is 84. */
-const SETTING = /^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:"([^"]*)"|(\S+))\s*$/;
-const GATE_HEADING = /^\[gate\]\s*(.*)$/;
-
-/**
- * The `[gate]` section of the base-tree `REVIEW.md`, read from the same `RuleText` the packet used (spec AC2). A line is
- * either a heading with its setting inline (`[gate] same_family = "allow"`, the shape the spec names) or a heading that
- * opens a block of `key = value` lines, and an optional Markdown bullet is accepted so it reads in this file's own style.
- * The only key the spec defines is `same_family`; anything else is refused by name rather than ignored, because a typo
- * would otherwise silently leave a guard off.
- */
-export function parseGateSection(rules: readonly RuleText[]): GateSettings {
-  const review = rules.find(rule => rule.name === "REVIEW.md");
-  const settings = new Map<string, string>();
-  let inGate = false;
-  const recordSetting = (text: string, where: string) => {
-    if (!text) return;
-    const match = SETTING.exec(text);
-    if (!match) throw new Refusal(`${where} in the [gate] section of REVIEW.md is not "key = value"`, 'write it as [gate] same_family = "allow"');
-    const key = match[1]!;
-    if (key !== "same_family") {
-      throw new Refusal(`${where} sets [gate] ${key}, which arev does not read`, 'REVIEW.md [gate] accepts only same_family = "allow" or "deny"');
-    }
-    if (settings.has(key)) throw new Refusal(`REVIEW.md sets [gate] ${key} twice`, "keep one same_family setting in the [gate] section");
-    settings.set(key, match[2] ?? match[3]!);
-  };
-  for (const raw of review?.text.split("\n") ?? []) {
-    const line = raw.trim().replace(/^-\s+/, "");
-    if (!line) {
-      inGate = false;
-      continue;
-    }
-    const heading = GATE_HEADING.exec(line);
-    if (heading) {
-      inGate = true;
-      recordSetting((heading[1] ?? "").trim(), "the heading");
-      continue;
-    }
-    if (line.startsWith("[")) {
-      inGate = false;
-      continue;
-    }
-    if (inGate) recordSetting(line, "a [gate] line");
-  }
-  const value = settings.get("same_family");
-  if (value === undefined) return { sameFamily: "deny" };
-  if (value !== "allow" && value !== "deny") {
-    throw new Refusal(`REVIEW.md sets [gate] same_family = "${value}", which arev does not read`,
-      'set it to "allow" to permit a same-family fallback review, or "deny" to refuse one');
-  }
-  return { sameFamily: value };
-}
 
 /** The commit a rules file is read from: the record's merge base, else its base. */
 function ruleBase(record: ReviewRecordV1): string | undefined {
@@ -90,7 +34,7 @@ function ruleBase(record: ReviewRecordV1): string | undefined {
 /**
  * The gate's decision, with no output and no side effect. `head` defaults to the repository's current HEAD.
  */
-export function gateReport(cwd: string, options: { head?: string; light?: boolean; home?: string } = {}): GateResult {
+export function gateReport(cwd: string, options: { head?: string; home?: string } = {}): GateResult {
   const head = options.head ?? commitOid(cwd, "HEAD");
   if (!FULL_OID.test(head)) throw new Refusal(`--head must be a full commit SHA (got ${head})`, "pass the full 40-character head SHA");
   const events = readLedger(cwd, { home: options.home });
@@ -109,7 +53,7 @@ export function gateReport(cwd: string, options: { head?: string; light?: boolea
     const selfReview = implementer !== undefined && implementer === reviewer.id;
     // One read of the base-tree rules: the [gate] settings and the REVIEW.md presence check both come from it (AC2).
     const rules = base === undefined ? undefined : readRules(cwd, base, []).rules;
-    const allowed = parseGateSection(rules ?? []).sameFamily === "allow";
+    const allowed = parseReviewMd(rules ?? []).sameFamily === "allow";
     // Spec AC4: pass iff the reviewer is not the implementer, or the fallback is declared and REVIEW.md allows it.
     if (selfReview && !(reviewer.sameFamilyFallback && allowed)) {
       open.push(`the reviewer ${reviewer.id} is the implementer; a self-review passes only with sameFamilyFallback and [gate] same_family = "allow"`);
@@ -120,8 +64,9 @@ export function gateReport(cwd: string, options: { head?: string; light?: boolea
     }
     if (view.openBlocking.length) open.push(`blocking findings are open: ${view.openBlocking.join(", ")}`);
     if (!record.call.ok) open.push(`the reviewer call failed${record.call.error ? `: ${record.call.error}` : ""}`);
-    if (!options.light && !(rules ?? []).some(rule => rule.name === "REVIEW.md")) {
-      open.push(`${base === undefined ? "the record names no base to read REVIEW.md at" : `REVIEW.md is not at the merge base ${base}`}; pass --light only when the review was made without one`);
+    // `--light` belongs to the record (spec #1, Decisions 2026-11-26): the reviewer states it, the gate reads it.
+    if (record.light !== true && !(rules ?? []).some(rule => rule.name === "REVIEW.md")) {
+      open.push(`${base === undefined ? "the record names no base to read REVIEW.md at" : `REVIEW.md is not at the merge base ${base}`}; record the review with --light only when it was made without one`);
     }
   }
 
@@ -188,14 +133,13 @@ function parseFlags(args: readonly string[], spec: { value: readonly string[]; b
   return { flags };
 }
 
-/** `arev gate [--head SHA] [--post] [--json] [--light]`. */
+/** `arev gate [--head SHA] [--post] [--json]`. */
 export function gateCommand(cwd: string, args: readonly string[]): number {
-  const parsed = parseFlags(args, { value: ["--head"], boolean: ["--post", "--json", "--light"] });
-  if (!parsed) return usageError("gate takes --head SHA, --post, --json and --light");
+  const parsed = parseFlags(args, { value: ["--head"], boolean: ["--post", "--json"] });
+  if (!parsed) return usageError("gate takes --head SHA, --post and --json");
   try {
     const result = gateReport(cwd, {
       ...(parsed.flags["--head"]?.at(-1) === undefined ? {} : { head: parsed.flags["--head"]!.at(-1)! }),
-      light: parsed.flags["--light"] !== undefined,
     });
     if (parsed.flags["--post"] !== undefined) {
       // No status is ever posted for a head the gate did not pass, and a failing gate posts nothing.

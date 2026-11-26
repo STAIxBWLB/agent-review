@@ -3,10 +3,9 @@ import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { gateReport, parseGateSection } from "../src/gate.ts";
+import { gateReport } from "../src/gate.ts";
 import { appendEvent, ledgerPath, recordId, type LedgerEvent, type PacketBlock, type ReviewRecordV1 } from "../src/ledger.ts";
 import { parseReviewRecord } from "../src/record.ts";
-import type { RuleText } from "../src/rules.ts";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -32,8 +31,8 @@ interface Fixture { repo: string; home: string; older: string; base: string; hea
 
 /**
  * A repository with three commits, so a record for one head can be checked against another. `REVIEW.md` is committed
- * in the oldest commit, so it is at every merge base this fixture can name; `null` leaves it out, which is the case
- * `--light` exists for. The ledger's home is a sibling of the worktree, never inside it.
+ * in the oldest commit, so it is at every merge base this fixture can name; `null` leaves it out, which is the case a
+ * record made with `--light` exists for. The ledger's home is a sibling of the worktree, never inside it.
  */
 function fixture(review: string | null = "# Review\n- Every change is reviewed against its packet.\n"): Fixture {
   const root = temp("arev-gate-");
@@ -80,8 +79,8 @@ const reportFor = (subject: Subject, changes: Record<string, unknown> = {}) => (
 });
 
 /** The record a reviewer files for a packet, through the real validator, so a test can only seed what it accepts. */
-const recordFor = (subject: Subject, changes: Record<string, unknown> = {}): ReviewRecordV1 =>
-  parseReviewRecord(reportFor(subject, changes), { packet: packetFor(subject), person: false });
+const recordFor = (subject: Subject, changes: Record<string, unknown> = {}, options: { light?: boolean } = {}): ReviewRecordV1 =>
+  parseReviewRecord(reportFor(subject, changes), { packet: packetFor(subject), person: false, ...(options.light ? { light: true } : {}) });
 
 const blocking = (changes: Record<string, unknown> = {}) => ({
   id: "bugs:open-one", term: "bugs", severity: "blocking", disposition: "open", origin: "introduced",
@@ -97,8 +96,6 @@ function seed(options: { repo: string; home: string; subject: Subject; record: R
   for (const event of extra) appendEvent(repo, event, { home });
   return id;
 }
-
-const rule = (text: string): RuleText[] => [{ name: "REVIEW.md", sha256: "e".repeat(64), appliesTo: [], text }];
 
 /** A `gh` that records its arguments instead of making a network call; `FAKE_GH_ERROR` makes it fail. */
 function fakeGh(argsPath: string): string {
@@ -221,33 +218,43 @@ test("a failed reviewer call fails the gate", () => {
   expect(result.open).toEqual(["the reviewer call failed: the reviewer call timed out"]);
 });
 
-test("REVIEW.md must be at the merge base unless the gate is told --light", () => {
-  const { repo, base, head, home } = fixture(null);
+test("REVIEW.md must be at the merge base unless the record says --light", () => {
+  const { repo, base, head } = fixture(null);
   const subject: Subject = { kind: "range", base, head, mergeBase: base };
-  const id = seed({ repo, home, subject, record: recordFor(subject) });
+  // Each home holds one record, because the gate reads the newest record for the head.
+  const gated = (light: boolean) => {
+    const home = temp("arev-hub-");
+    const id = seed({ repo, home, subject, record: recordFor(subject, {}, { light }) });
+    return { id, ...gateReport(repo, { head, home }) };
+  };
 
-  const strict = gateReport(repo, { head, home });
+  const strict = gated(false);
   expect(strict.ok).toBe(false);
-  expect(strict.open).toEqual([`REVIEW.md is not at the merge base ${base}; pass --light only when the review was made without one`]);
+  expect(strict.open).toEqual([`REVIEW.md is not at the merge base ${base}; record the review with --light only when it was made without one`]);
 
-  const light = gateReport(repo, { head, home, light: true });
-  expect(light).toMatchObject({ head, base, record: id, ok: true, open: [] });
+  // The flag lives on the record (spec #1, Decisions 2026-11-26): the reviewer states it there, and the gate reads it.
+  const light = gated(true);
+  expect(light).toMatchObject({ head, base, ok: true, open: [] });
+  expect(light.record).toBe(light.id);
 });
 
-test("[gate] same_family is read from REVIEW.md, and absent means deny", () => {
-  expect(parseGateSection([])).toEqual({ sameFamily: "deny" });
-  expect(parseGateSection(rule("# Review\n"))).toEqual({ sameFamily: "deny" });
-  expect(parseGateSection(rule('# Review\n[gate] same_family = "allow"\n'))).toEqual({ sameFamily: "allow" });
-  expect(parseGateSection(rule('# Review\n[gate]\nsame_family = "allow"\n'))).toEqual({ sameFamily: "allow" });
-  expect(parseGateSection(rule('# Review\n- [gate] same_family = "deny"\n'))).toEqual({ sameFamily: "deny" });
-  // The section closes on a blank line or the next heading, so a key below it is not a gate setting.
-  expect(parseGateSection(rule('[gate]\n\nsame_family = "allow"\n'))).toEqual({ sameFamily: "deny" });
+test("the gate takes no --light flag, and a bad [gate] setting refuses by name", () => {
+  const { repo, base, head, home } = fixture(null);
+  const subject: Subject = { kind: "range", base, head, mergeBase: base };
+  seed({ repo, home, subject, record: recordFor(subject, {}, { light: true }) });
 
-  // A key arev does not read is refused by name, because a typo would silently leave the guard off.
-  expect(() => parseGateSection(rule('[gate] same_famly = "allow"\n'))).toThrow("sets [gate] same_famly, which arev does not read");
-  expect(() => parseGateSection(rule('[gate] same_family = "allw"\n'))).toThrow('REVIEW.md sets [gate] same_family = "allw"');
-  expect(() => parseGateSection(rule("[gate] allow\n"))).toThrow('is not "key = value"');
-  expect(() => parseGateSection(rule('[gate]\nsame_family = "allow"\nsame_family = "deny"\n'))).toThrow("sets [gate] same_family twice");
+  // The light record passes with no flag anywhere on the command line; the flag is not accepted at all.
+  expect(run(repo, { AGENTHUB_HOME: home }, "gate", "--head", head).code).toBe(0);
+  const flag = run(repo, { AGENTHUB_HOME: home }, "gate", "--light");
+  expect(flag.code).toBe(2);
+  expect(flag.stderr).toContain("gate takes --head SHA, --post and --json");
+
+  // A key arev does not read is refused from REVIEW.md itself, through the one parser both commands use.
+  const typo = fixture('# Review\n[gate] same_famly = "allow"\n');
+  const typoSubject: Subject = { kind: "range", base: typo.base, head: typo.head, mergeBase: typo.base };
+  const typoHome = temp("arev-hub-");
+  seed({ repo: typo.repo, home: typoHome, subject: typoSubject, record: recordFor(typoSubject) });
+  expect(() => gateReport(typo.repo, { head: typo.head, home: typoHome })).toThrow("REVIEW.md sets [gate] same_famly, which arev does not read");
 });
 
 test("gate --post sets the arev/gate status on the full head and writes the post event", () => {

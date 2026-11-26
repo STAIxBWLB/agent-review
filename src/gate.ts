@@ -197,6 +197,11 @@ function checkBase(cwd: string, result: GateResult, pull: PullRequest): void {
   if (base === undefined) {
     throw new Refusal(`GitHub reports no base commit for PR ${pull.number}, so the review's merge base cannot be checked against it`, fix);
   }
+  // The reply is data, and this value is handed to `rev-parse` and `merge-base` as an argument: only a full commit SHA of
+  // either object format is compared, so a value gh returns like `--upload-pack=...` can never be read as an option.
+  if (!FULL_OID.test(base)) {
+    throw new Refusal(`GitHub reports a base commit for PR ${pull.number} that is not a full commit SHA, so the review's merge base cannot be checked against it`, fix);
+  }
   if (reviewGit(cwd, ["rev-parse", "--verify", "-q", `${base}^{commit}`]).status !== 0) {
     throw new Refusal(`the base commit ${base} of PR ${pull.number} is not in this checkout, so the review's merge base cannot be checked against it`,
       "fetch it (git fetch origin) and post again");

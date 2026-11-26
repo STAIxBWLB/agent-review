@@ -523,6 +523,19 @@ test("--post re-checks the review's merge base against the PR's own base, so a r
   expect(unfetched.stderr).toContain("→ fetch it (git fetch origin) and post again");
   expect(existsSync(args)).toBe(false);
 
+  // The reply's value is data that `rev-parse` and `merge-base` take as an argument, so only a full commit SHA is
+  // passed on: an option-shaped value never reaches git, and neither does a prefix git would happily resolve.
+  const injected = posted("--upload-pack=touch /tmp/pwned");
+  expect(injected.code).toBe(1);
+  expect(injected.stderr).toContain("GitHub reports a base commit for PR 7 that is not a full commit SHA");
+  expect(injected.stderr).toContain("→ re-review against the PR's current base with arev packet --pr 7");
+  expect(injected.stderr).not.toContain("upload-pack");
+  expect(existsSync(args)).toBe(false);
+  const abbreviated = posted(base.slice(0, 12));
+  expect(abbreviated.code).toBe(1);
+  expect(abbreviated.stderr).toContain("GitHub reports a base commit for PR 7 that is not a full commit SHA");
+  expect(existsSync(args)).toBe(false);
+
   // And a PR whose reply names no base commit cannot be checked against the record's base at all.
   const unbased = run(repo,
     { PATH: `${fakeGh(args)}:${process.env.PATH ?? ""}`, AGENTHUB_HOME: home, FAKE_GH_PULLS: JSON.stringify([{ number: 7, state: "open", head: { sha: head } }]) },

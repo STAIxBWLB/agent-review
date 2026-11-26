@@ -16,10 +16,9 @@ import { blocksApproval, findingTally, findingsForHead, positionalFindingId, typ
 import { sanitize } from "./frame.ts";
 import { Refusal, appendEvent, readLedger, recordId, reviewProjectId, secretShaped, type LedgerEvent, type PacketBlock, type RecordFinding, type ReviewRecordV1 } from "./ledger.ts";
 import { buildPacket, type PacketRequest } from "./packet.ts";
+import { DEFAULT_ADVISORY_CAP, MAX_ADVISORY_CAP } from "./review-md.ts";
 
-/** The spec's default advisory cap; a packet event may carry REVIEW.md's value as `review.advisory_cap`. */
-export const DEFAULT_MAX_ADVISORIES = 5;
-const MAX_REPORT_BYTES = 1024 * 1024, MAX_FINDINGS = 64, MAX_FINDING_BYTES = 64 * 1024;
+const MAX_REPORT_BYTES = 1024 * 1024, MAX_FINDINGS = MAX_ADVISORY_CAP, MAX_FINDING_BYTES = 64 * 1024;
 const MAX_ID = 96, MAX_PATH = 512, MAX_TEXT = 2048, MAX_REF = 512, MAX_NAME = 128, MAX_FAMILY = 64, MAX_EVIDENCE = 16;
 const TERMS = ["bugs", "security", "compliance"] as const, SEVERITIES = ["blocking", "advisory"] as const;
 const DISPOSITIONS = ["open", "fixed", "false_positive", "accepted"] as const, ORIGINS = ["introduced", "pre_existing", "indeterminate"] as const;
@@ -106,12 +105,14 @@ function optionalText(row: Record<string, unknown>, key: string, max: number, fi
 export interface RecordOptions {
   /** The packet arev built for this head, as the ledger holds it. */
   packet: PacketBlock;
-  /** REVIEW.md's cap when the packet carries it, else `DEFAULT_MAX_ADVISORIES`. */
+  /** REVIEW.md's cap when the packet carries it, else `DEFAULT_ADVISORY_CAP`. */
   maxAdvisories?: number;
   /** `accepted` is the person's decision: an interactive terminal is the only source of it. */
   person: boolean;
   /** `--implementer`; when the report also states one, the two must agree. */
   implementer?: string;
+  /** `--light`: the review was made without a REVIEW.md, which the gate then accepts. */
+  light?: boolean;
 }
 
 /**
@@ -122,8 +123,8 @@ export interface RecordOptions {
  * `false_positive` without evidence, is also refused: AC4's gate could never pass on it.
  */
 export function parseReviewRecord(raw: unknown, options: RecordOptions): ReviewRecordV1 {
-  const cap = options.maxAdvisories ?? DEFAULT_MAX_ADVISORIES;
-  if (!Number.isSafeInteger(cap) || cap < 0 || cap > MAX_FINDINGS) refuse(`the advisory cap ${cap} is not an integer in 0-${MAX_FINDINGS}`, "fix review.advisory_cap in the packet, or omit it for the default 5");
+  const cap = options.maxAdvisories ?? DEFAULT_ADVISORY_CAP;
+  if (!Number.isSafeInteger(cap) || cap < 0 || cap > MAX_FINDINGS) refuse(`the advisory cap ${cap} is not an integer in 0-${MAX_FINDINGS}`, `fix review.advisory_cap in the packet, or omit it for the default ${DEFAULT_ADVISORY_CAP}`);
   const row = closed(raw, RECORD_FIELDS, "the report");
   if (!row) refuse("the report must be a plain JSON object with own data fields only", "write the report as JSON with no accessors, prototypes or hidden fields");
   if (row.v !== 1) refuse(`the report's v must be the number 1 (got ${jsonType(row.v)}); this arev reads v: 1`, "set v to 1 in the report");
@@ -245,6 +246,8 @@ export function parseReviewRecord(raw: unknown, options: RecordOptions): ReviewR
     findings,
     verdict: oneOf(row.verdict, ["approved", "changes_requested"] as const, "verdict"),
     call,
+    // `--light` is the reviewer's claim about the run, not a report field: it travels only when it was passed.
+    ...(options.light ? { light: true } : {}),
   };
 }
 
@@ -387,10 +390,10 @@ function parseArgs(args: readonly string[], spec: { value: readonly string[]; bo
   return { positionals, flags };
 }
 
-/** `arev record <report.json> [--implementer NAME] [--json]`. */
+/** `arev record <report.json> [--implementer NAME] [--light] [--json]`. */
 export function recordCommand(cwd: string, args: readonly string[]): number {
-  const parsed = parseArgs(args, { value: ["--implementer"], boolean: ["--json"] });
-  if (!parsed) return usageError("record takes one report file and --implementer <name> | --json");
+  const parsed = parseArgs(args, { value: ["--implementer"], boolean: ["--json", "--light"] });
+  if (!parsed) return usageError("record takes one report file and --implementer <name> | --light | --json");
   if (parsed.positionals.length !== 1) return usageError(`record takes exactly one report file (got ${parsed.positionals.length})`);
   const file = resolve(parsed.positionals[0]!);
   try {
@@ -433,9 +436,10 @@ export function recordCommand(cwd: string, args: readonly string[]): number {
           "rerun arev packet and rewrite the report from the new packet.json; a workspace subject counts every uncommitted file, the report included, so keep the report outside the worktree");
       }
     }
-    const cap = packetEvent.review?.advisory_cap ?? DEFAULT_MAX_ADVISORIES;
+    const cap = packetEvent.review?.advisory_cap ?? DEFAULT_ADVISORY_CAP;
     const implementer = parsed.flags["--implementer"]?.at(-1);
-    const record = parseReviewRecord(raw, { packet: packetEvent.packet, maxAdvisories: cap, person: interactive(), ...(implementer === undefined ? {} : { implementer }) });
+    const record = parseReviewRecord(raw, { packet: packetEvent.packet, maxAdvisories: cap, person: interactive(),
+      ...(implementer === undefined ? {} : { implementer }), ...(parsed.flags["--light"] === undefined ? {} : { light: true }) });
     const id = recordId(record);
     appendEvent(cwd, { v: 1, type: "record", at: new Date().toISOString(), id, record });
     const blockingOpen = record.findings.filter(finding => finding.severity === "blocking" && finding.disposition === "open").length;

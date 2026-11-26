@@ -71,6 +71,8 @@ export interface ReviewRecordV1 {
   findings: RecordFinding[];
   verdict: "approved" | "changes_requested";
   call: { ok: boolean; error?: string };
+  /** `arev record --light`: the review was made without a REVIEW.md, which `arev gate` accepts (spec AC2). */
+  light?: boolean;
 }
 
 /**

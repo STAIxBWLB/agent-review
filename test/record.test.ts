@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { ledgerEventsView, parseReviewRecord } from "../src/record.ts";
@@ -252,6 +252,43 @@ test("arev record without a packet for the head names the packet command", () =>
   expect(result.code).toBe(1);
   expect(result.stderr).toContain(`no packet for head ${HEAD} is in the ledger`);
   expect(result.stderr).toContain("arev packet");
+});
+
+test("--light is the record's claim about its run, never a report field", () => {
+  expect(parseReviewRecord(reportFor(HEAD), options).light).toBeUndefined();
+  expect(parseReviewRecord(reportFor(HEAD), { ...options, light: true }).light).toBe(true);
+  expect(() => parseReviewRecord(reportFor(HEAD, { light: true }), options)).toThrow("has an unknown field (light)");
+});
+
+test("arev record --light keeps the flag on the record it appends", () => {
+  const { root, repo, home } = fixture();
+  const commit = (body: string, message: string) => {
+    writeFileSync(join(repo, "a.ts"), body);
+    git(repo, ["add", "a.ts"]);
+    git(repo, ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", message]);
+    return gitOut(repo, ["rev-parse", "HEAD"]);
+  };
+  const base = commit("export const a = 1;\n", "base");
+  const head = commit("export const a = 2;\n", "head");
+  const built = run(repo, home, "packet", "--from", base, "--to", head, "--json");
+  expect(built.code).toBe(0);
+  const packet = JSON.parse(built.stdout);
+  const report = join(root, "report.json");
+  writeFileSync(report, JSON.stringify(reportFor(head, {
+    packet: { id: packet.id, subject: packet.subject },
+    coverage: { reviewed: packet.units.map((unit: { path: string }) => unit.path), skipped: [] },
+  })));
+
+  expect(run(repo, home, "record", report, "--light").code).toBe(0);
+  expect(run(repo, home, "record", report).code).toBe(0);
+  const records = readFileSync(join(home, "review", "github.com/owner/repo", "ledger.jsonl"), "utf8")
+    .split("\n").filter(Boolean).map(line => JSON.parse(line)).filter(event => event.type === "record");
+
+  expect(records).toHaveLength(2);
+  expect(records[0].record.light).toBe(true);
+  expect(records[1].record.light).toBeUndefined();
+  // The flag is part of the record, so it is part of the id the merge-time gate names.
+  expect(records[1].id).not.toBe(records[0].id);
 });
 
 const SECRET = `ghp_${"a".repeat(36)}`;

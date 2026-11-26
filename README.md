@@ -159,27 +159,23 @@ Use `arev gate` to check the recorded result.
 
 ## Release
 
-For the first release, wait until PRs #44 and #45 have merged. An npm maintainer
-must create the public `@staix/agent-review` package and configure GitHub
-Actions as a trusted publisher in the package settings on npmjs.com.
+The [Release workflow](.github/workflows/release.yml) publishes tags through
+npm trusted publishing. An npm maintainer configures GitHub Actions for the
+public `@staix/agent-review` package in the package settings on npmjs.com.
+Set the owner to `STAIxBWLB`, repository to `agent-review`, workflow filename
+to `release.yml`, and allow `npm publish`. Validate a new connection by
+publishing within two days. See [npm trusted publishing](https://docs.npmjs.com/trusted-publishers/).
 
-- npm requires the package to exist before trusted publishing can be
-  configured. If the name is new, the maintainer can publish a minimal
-  placeholder at `0.0.0` with the `bootstrap` dist-tag from a separate
-  directory using their interactive npm login and 2FA. Leave version
-  `0.1.0` for the release workflow.
-- In npm package settings, set the owner to `STAIxBWLB`, repository to
-  `agent-review`, workflow filename to `release.yml`, and allow
-  `npm publish`. Validate the new connection by publishing within two days.
-  See [npm trusted publishing](https://docs.npmjs.com/trusted-publishers/).
-- From the verified release commit on `main`, create and push the matching
-  tag. For the first release, run `git tag -a v0.1.0 -m "v0.1.0"` and
-  `git push origin v0.1.0`.
+- From the verified release commit on `main`, create and push the tag that
+  matches `package.json`. For 0.1.1, run
+  `git tag -a v0.1.1 -m "v0.1.1"` and `git push origin v0.1.1`.
 - Confirm the **Release** workflow succeeded and check the published version
-  with `npm view @staix/agent-review@0.1.0 version`. The workflow checks
+  with `npm view @staix/agent-review@0.1.1 version`. The workflow checks
   ancestry, version, tests and package contents before publishing via OIDC.
 
-See the [v0.1.0 release notes](https://github.com/STAIxBWLB/agent-review/blob/main/docs/releases/v0.1.0.md).
+Release notes for
+[v0.1.1](https://github.com/STAIxBWLB/agent-review/blob/main/docs/releases/v0.1.1.md)
+and [v0.1.0](https://github.com/STAIxBWLB/agent-review/blob/main/docs/releases/v0.1.0.md).
 
 ## Development
 

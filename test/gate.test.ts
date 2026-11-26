@@ -315,7 +315,44 @@ test("a head two PRs share refuses without --pr, and each PR gates on its own re
 
   const badPr = run(repo, { AGENTHUB_HOME: home }, "gate", "--pr", "seven");
   expect(badPr.code).toBe(2);
-  expect(badPr.stderr).toContain("Invalid PR number. Pass a positive integer to --pr.");
+  expect(badPr.stderr).toContain("Invalid PR number. Pass a positive integer to --pr, or none for a review with no PR.");
+});
+
+test("a review with no PR is a thread of its own, named --pr none", () => {
+  const { repo, base, head, home } = fixture();
+  const plain: Subject = { kind: "range", base, head, mergeBase: base };
+  const seven: Subject = { kind: "range", base, head, mergeBase: base, pr: 7 };
+  const plainId = seed({ repo, home, subject: plain, record: recordFor(plain) });
+  const sevenId = seed({ repo, home, subject: seven, record: recordFor(seven, {
+    findings: [blocking({ id: "bugs:seven-only" })], verdict: "changes_requested",
+  }) });
+
+  // The two threads share the SHA, so the default read refuses, spelling the no-PR thread the way the view does.
+  const outcome = (): { message: string; next: string } | string => {
+    try {
+      gateReport(repo, { head, home });
+      return "passed";
+    } catch (error) {
+      if (!(error instanceof Refusal)) throw error;
+      return { message: error.message, next: error.next };
+    }
+  };
+  expect(outcome()).toEqual({
+    message: `head ${head} is reviewed in more than one thread (no PR, PR 7), so arev cannot tell which review you mean`,
+    next: "pass --pr none or --pr 7 to choose the review thread",
+  });
+
+  // Each named thread reads only its own record: the no-PR review is its own head's, never PR 7's at the same SHA.
+  expect(gateReport(repo, { head, home, pr: "none" })).toMatchObject({ head, ok: true, record: plainId, verdict: "approved", open: [] });
+  expect(gateReport(repo, { head, home, pr: 7 })).toMatchObject({
+    head, ok: false, record: sevenId, verdict: "changes_requested", open: ["blocking findings are open: bugs:seven-only"],
+  });
+
+  // The spelling the refusal printed is one the command accepts, so its next step is a command that runs.
+  const named = run(repo, { AGENTHUB_HOME: home }, "gate", "--pr", "none");
+  expect(named.code).toBe(0);
+  expect(named.stdout).toContain(`record ${plainId}`);
+  expect(named.stdout).toContain("gate: passes");
 });
 
 test("--post refuses a head more than one thread reviewed, because a commit status is per commit", () => {
@@ -598,7 +635,7 @@ test("the gate takes no --light flag, and a bad [gate] setting refuses by name",
   expect(run(repo, { AGENTHUB_HOME: home }, "gate", "--head", head).code).toBe(0);
   const flag = run(repo, { AGENTHUB_HOME: home }, "gate", "--light");
   expect(flag.code).toBe(2);
-  expect(flag.stderr).toContain("gate takes --head <sha>, --pr <n>, --post and --json");
+  expect(flag.stderr).toContain("gate takes --head <sha>, --pr <n|none>, --post and --json");
 
   // A key arev does not read is refused from REVIEW.md itself, through the one parser both commands use.
   const typo = fixture('# Review\n[gate] same_famly = "allow"\n');

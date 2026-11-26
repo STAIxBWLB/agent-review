@@ -59,9 +59,10 @@ const shownHead = (value: string): string =>
 
 /**
  * The gate's decision, with no output and no side effect. `head` defaults to the repository's current HEAD, and `pr`
- * names the review thread when more than one PR was reviewed at that head.
+ * names the review thread when more than one PR was reviewed at that head; `"none"` names the thread with no PR, which
+ * is the exact-head review a packet built without `--pr` produces.
  */
-export function gateReport(cwd: string, options: { head?: string; pr?: number; home?: string } = {}): GateResult {
+export function gateReport(cwd: string, options: { head?: string; pr?: number | "none"; home?: string } = {}): GateResult {
   const head = options.head ?? commitOid(cwd, "HEAD");
   if (!FULL_OID.test(head)) throw new Refusal(`--head must be a full commit SHA${shownHead(head)}`, "pass the full 40-character head SHA");
   const mergeBase = currentMergeBase(cwd, head);
@@ -262,16 +263,20 @@ function parseFlags(args: readonly string[], spec: { value: readonly string[]; b
   return { flags };
 }
 
-/** `arev gate [--head SHA] [--pr N] [--post] [--json]`. */
+/** `arev gate [--head SHA] [--pr N|none] [--post] [--json]`. */
 export function gateCommand(cwd: string, args: readonly string[]): number {
   const parsed = parseFlags(args, { value: ["--head", "--pr"], boolean: ["--post", "--json"] });
-  if (!parsed) return usageError("gate takes --head <sha>, --pr <n>, --post and --json");
+  if (!parsed) return usageError("gate takes --head <sha>, --pr <n|none>, --post and --json");
+  // `none` names the thread with no PR, the spelling `show`, `resolve` and the view's own refusals use: a head whose
+  // review without a PR shares its SHA with a numbered thread can only be gated by naming that one this way.
   const prFlag = parsed.flags["--pr"]?.at(-1);
-  if (prFlag !== undefined && !PR_NUMBER.test(prFlag)) return usageError("Invalid PR number. Pass a positive integer to --pr.");
+  if (prFlag !== undefined && prFlag !== "none" && !PR_NUMBER.test(prFlag)) {
+    return usageError("Invalid PR number. Pass a positive integer to --pr, or none for a review with no PR.");
+  }
   try {
     const result = gateReport(cwd, {
       ...(parsed.flags["--head"]?.at(-1) === undefined ? {} : { head: parsed.flags["--head"]!.at(-1)! }),
-      ...(prFlag === undefined ? {} : { pr: Number(prFlag) }),
+      ...(prFlag === undefined ? {} : { pr: prFlag === "none" ? "none" : Number(prFlag) }),
     });
     // A commit status belongs to the commit, not to the PR: on a head more than one thread reviewed, a success posted
     // from one PR's pass shows on every other PR's checks, which is a status the gate did not pass there. The plain gate

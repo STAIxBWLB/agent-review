@@ -74,10 +74,10 @@ function flow(dir: string, base: string): { request: Record<string, unknown>; re
   return { request, report };
 }
 
-test("the tool table is AC9's six tools: no accepted, no post", () => {
+test("the tool table routes accepted to the refusal and offers no post", () => {
   expect(MCP_TOOLS.map(tool => tool.name))
     .toEqual(["arev_packet", "arev_rules", "arev_record", "arev_resolve", "arev_show", "arev_gate"]);
-  expect(schemaOf("arev_resolve").properties?.as?.enum).toEqual(["fixed", "false_positive"]);
+  expect(schemaOf("arev_resolve").properties?.as?.enum).toEqual(["fixed", "false_positive", "accepted"]);
   // The one GitHub write stays CLI-only, whatever a description says: no tool takes a post flag.
   expect(tools.some(tool => Object.hasOwn(tool.inputSchema.properties ?? {}, "post"))).toBe(false);
 });
@@ -228,7 +228,10 @@ test("stdio packet, record and gate complete over actual JSON-RPC", () => {
   const recorded = JSON.parse(replies[2].result.content[0].text);
   expect(recorded.id).toMatch(/^[a-f0-9]{64}$/);
   expect(JSON.parse(replies[3].result.content[0].text)).toMatchObject({ ok: true, record: recorded.id });
-  expect(replies[4].error.code).toBe(-32602);
+  expect(replies[4].error).toBeUndefined();
+  expect(replies[4].result.isError).toBe(true);
+  expect(replies[4].result.content[0].text).toContain("arev resolve <id> --as accepted");
+  expect(replies[4].result.content[0].text).toContain("at their terminal");
   expect(readLedger(dir).map(event => event.type)).toEqual(["packet", "record"]);
 });
 

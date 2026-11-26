@@ -46,7 +46,7 @@ const MAX_PACKET_BYTES = 8 * 1024 * 1024;
 const LOCKFILES = new Set(["bun.lock", "bun.lockb", "package-lock.json", "yarn.lock",
   "pnpm-lock.yaml", "Cargo.lock", "poetry.lock", "uv.lock", "go.sum", "composer.lock", "Gemfile.lock"]);
 const RENAME_OPTIONS = ["-M", "-C", "--find-copies-harder"];
-const DIFF_OPTIONS = ["--no-ext-diff", "--no-textconv", "--no-color", "--ignore-submodules=dirty"];
+const DIFF_OPTIONS = ["--no-ext-diff", "--no-textconv", "--no-color", "--ignore-submodules=dirty", "-O/dev/null"];
 const FULL_OID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 interface Group { status: string; paths: string[]; opaque?: true }
 
@@ -213,9 +213,16 @@ function buildPacketFromIndex(
 ): PacketBundle {
   const trees = subject.kind === "workspace" || subject.kind === "files"
     ? [subject.head] : [subject.mergeBase, subject.head];
-  const diff = (options: string[], paths: readonly string[], maxBuffer?: number) =>
-    reviewGit(root, [...gitOptions, `--attr-source=${subject.mergeBase}`, "diff", ...DIFF_OPTIONS,
-      ...options, ...trees, "--", ...paths], { indexFile, maxBuffer: maxBuffer ?? 16 * 1024 * 1024 });
+  const diff = (options: string[], paths: readonly string[], maxBuffer?: number) => {
+    // A literal pathspec can match descendants. Force Git's whole-path glob matcher
+    // by escaping one leading character and all glob metacharacters.
+    const exact = paths.map(path =>
+      `:(top,glob)\\${path[0]!}${path.slice(1).replace(/[\\*?\[\]]/g, "\\$&")}`);
+    return reviewGit(root, [...gitOptions, `--attr-source=${subject.mergeBase}`, "diff", ...DIFF_OPTIONS,
+      ...options, ...trees, "--", ...exact], {
+      indexFile, literalPathspecs: exact.length === 0, maxBuffer: maxBuffer ?? 16 * 1024 * 1024,
+    });
+  };
 
   const fields = names(checkedOutput(diff([...RENAME_OPTIONS, "--name-status", "-z"], []), "the changed paths"));
   let groups: Group[] = [];

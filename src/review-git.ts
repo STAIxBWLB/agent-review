@@ -1,7 +1,7 @@
 import { memoryGitEnv, memoryGitSync } from "@staix/agent-mem/platform";
 
-const gitArgs = (cwd: string, args: string[]) =>
-  ["-C", cwd, "-c", "protocol.allow=never", "--literal-pathspecs", ...args];
+const gitArgs = (cwd: string, args: string[], literalPathspecs = true) =>
+  ["-C", cwd, "-c", "protocol.allow=never", ...(literalPathspecs ? ["--literal-pathspecs"] : []), ...args];
 
 const gitOptions = () => ({
   env: memoryGitEnv(process.env, { repositoryIsolation: true, readOnlyDiagnostic: true }),
@@ -13,10 +13,11 @@ export function reviewGit(cwd: string, args: string[], options: {
   input?: string;
   maxBuffer?: number;
   indexFile?: string;
+  literalPathspecs?: boolean;
 } = {}) {
-  const { indexFile, ...limits } = options;
+  const { indexFile, literalPathspecs, ...limits } = options;
   const defaults = gitOptions();
-  return memoryGitSync(gitArgs(cwd, args), {
+  return memoryGitSync(gitArgs(cwd, args, literalPathspecs), {
     ...defaults, encoding: "utf8", ...limits,
     ...(indexFile === undefined ? {} : { env: { ...defaults.env, GIT_INDEX_FILE: indexFile } }),
   });

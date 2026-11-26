@@ -345,3 +345,68 @@ test("workspace preserves a staged deletion when the path remains on disk", () =
     }
   }
 });
+
+test("file and directory swaps keep denied and sibling patches out of each patch group", () => {
+  const { dir, git, write } = fixture();
+  write("to-dir", "original file\n");
+  write("to-file/.env", "DENIED_BASE_PAYLOAD\n");
+  write("to-file/public.txt", "original sibling\n");
+  git("add", ".");
+  git("commit", "-qm", "base");
+
+  rmSync(join(dir, "to-dir"));
+  write("to-dir/.env", "DENIED_HEAD_PAYLOAD\n");
+  write("to-dir/public.txt", "new sibling\n");
+  rmSync(join(dir, "to-file"), { recursive: true });
+  write("to-file", "new file\n");
+
+  function assertExact(bundle: ReturnType<typeof isolatedPacket>) {
+    expect(bundle.packet.excluded).toEqual(expect.arrayContaining([
+      { path: "to-dir/.env", reason: "denied" }, { path: "to-file/.env", reason: "denied" },
+    ]));
+    for (const output of [bundle.diff, bundle.brief]) {
+      expect(output).not.toContain("DENIED_");
+      expect(output).not.toContain(".env");
+      for (const line of ["new sibling", "original sibling"]) {
+        expect(output.split(line)).toHaveLength(2);
+      }
+    }
+  }
+
+  assertExact(isolatedPacket(dir, { kind: "workspace" }));
+  git("add", ".");
+  git("commit", "-qm", "swap files and directories");
+  assertExact(isolatedPacket(dir, { kind: "commit", commit: "HEAD" }));
+});
+
+test("local diff ordering cannot change packet identity", () => {
+  const { dir, git, write } = fixture();
+  write("a.txt", "before\n");
+  write("z.txt", "before\n");
+  git("add", ".");
+  git("commit", "-qm", "base");
+  write("a.txt", "after a\n");
+  write("z.txt", "after z\n");
+  git("commit", "-qam", "head");
+  const request = { kind: "commit", commit: "HEAD" } as const;
+  const initial = isolatedPacket(dir, request);
+  write("diff-order", "z.txt\na.txt\n");
+  git("config", "diff.orderFile", join(dir, "diff-order"));
+  expect(isolatedPacket(dir, request)).toEqual(initial);
+});
+
+test("an exact patch retains both sides of a rename into the old pathname", () => {
+  const { dir, git, write } = fixture();
+  const content = "the file moves into an exact descendant\n".repeat(8);
+  write("[old]", content);
+  git("add", ".");
+  git("commit", "-qm", "base");
+  rmSync(join(dir, "[old]"));
+  write("[old]/child?.txt", content);
+  git("add", ".");
+  git("commit", "-qm", "move");
+  const bundle = isolatedPacket(dir, { kind: "commit", commit: "HEAD" });
+  expect(bundle.packet.units).toEqual([{ path: "[old]/child?.txt", status: "R", insertions: 0, deletions: 0 }]);
+  expect(bundle.diff).toContain("rename from [old]");
+  expect(bundle.diff).toContain("rename to [old]/child?.txt");
+});

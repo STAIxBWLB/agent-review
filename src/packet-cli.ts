@@ -1,5 +1,5 @@
-import { mkdirSync, unlinkSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { closeSync, mkdirSync, openSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { buildPacket, repositoryPath, type PacketRequest } from "./packet.ts";
 import { commitOid, mergeBaseOid, repositoryRoot, reviewGit } from "./review-git.ts";
@@ -61,8 +61,9 @@ export function runPacket(cwd: string, args: readonly string[]): void {
   if (values.out !== undefined) {
     const destination = resolve(cwd, values.out);
     const created: string[] = [];
+    let createdRoot: string | undefined;
     try {
-      mkdirSync(destination, { recursive: true });
+      createdRoot = mkdirSync(destination, { recursive: true });
       for (const [name, text] of Object.entries({
         "packet.json": `${json}\n`,
         "diff.patch": bundle.diff,
@@ -70,11 +71,21 @@ export function runPacket(cwd: string, args: readonly string[]): void {
         "brief.md": `${bundle.brief}\n`,
       })) {
         const path = resolve(destination, name);
-        writeFileSync(path, text, { flag: "wx", mode: 0o600 });
+        const file = openSync(path, "wx", 0o600);
         created.push(path);
+        try { writeFileSync(file, text); }
+        finally { closeSync(file); }
       }
     } catch {
-      for (const path of created) unlinkSync(path);
+      for (const path of created) {
+        try { unlinkSync(path); } catch { /* Preserve the original write failure. */ }
+      }
+      if (createdRoot) {
+        for (let dir = destination; ; dir = dirname(dir)) {
+          try { rmdirSync(dir); } catch { break; }
+          if (dir === createdRoot) break;
+        }
+      }
       throw new Error("Cannot write packet files. Choose a writable output directory without existing packet files.");
     }
   } else {

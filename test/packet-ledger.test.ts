@@ -131,6 +131,28 @@ test("a REVIEW.md section arev does not read refuses the packet and writes no pa
   expect(badValue.cli("show").stdout).toContain("no review ledger");
 });
 
+test("arev packet --pr N names the PR in the packet's subject, and the report written from it records", () => {
+  const bin = mkdtempSync(join(tmpdir(), "arev-gh-"));
+  scratch.push(bin);
+  // A fake `gh` keeps this offline: `--pr` reads the base and head from it, and the values are the fixture's own commits,
+  // which the command validates as full OIDs before using them.
+  const { base, head, cli } = reviewedFlow("# Review\n", { PATH: `${bin}:${process.env.PATH ?? ""}` });
+  writeFileSync(join(bin, "gh"), `#!/bin/sh\nprintf '{"baseRefOid":"${base}","headRefOid":"${head}"}'\n`, { mode: 0o755 });
+  const built = cli("packet", "--pr", "7", "--json");
+  expect(built.status).toBe(0);
+  const packet = JSON.parse(built.stdout) as BuiltPacket & { subject: { pr?: number } };
+  expect(packet.subject).toMatchObject({ kind: "range", base, head, pr: 7 });
+
+  // The packet event carries the thread, and `record`'s rebuild has to reproduce it: a rebuild that dropped `pr` would
+  // build a different id and refuse this report.
+  const recorded = cli("record", report(reportFor(packet)));
+  expect(recorded.stderr).toBe("");
+  expect(recorded.status).toBe(0);
+  const shown = JSON.parse(cli("show", "--json").stdout);
+  expect(shown.packet).toBe(packet.id);
+  expect(shown.head).toBe(head);
+});
+
 test("a report whose packet id is not the packet arev built for that head is refused", () => {
   const { base, head, cli } = reviewedFlow();
   const packet = JSON.parse(cli("packet", "--from", base, "--to", head, "--json").stdout) as BuiltPacket;

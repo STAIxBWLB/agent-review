@@ -36,12 +36,16 @@ function run(cwd: string, home: string, ...args: string[]) {
 }
 
 const HEAD = "a".repeat(40), NEXT = "b".repeat(40), BASE = "c".repeat(40), PACKET = "d".repeat(64), NEXT_PACKET = "f".repeat(64);
+/** The PR these cases review, so one PR's two heads are one thread. */
+const PR = 7;
 const UNITS = ["src/a.ts", "src/b.ts"];
 
-const packetFor = (head: string): PacketBlock => ({
+// `null` is "no PR" rather than `undefined`, because a default parameter fires on an explicit `undefined` too.
+const packetFor = (head: string, pr: number | null = PR): PacketBlock => ({
   id: head === HEAD ? PACKET : NEXT_PACKET,
   profile: "code",
-  subject: { kind: "range", base: BASE, head, mergeBase: BASE },
+  // `pr` is the review thread: the lifecycle carries a finding across this PR's heads and never into another PR.
+  subject: { kind: "range", base: BASE, head, mergeBase: BASE, ...(pr === null ? {} : { pr }) },
   units: UNITS.map(path => ({ path, status: "M", insertions: 1, deletions: 0 })),
   excluded: [{ path: "bun.lock", reason: "generated" }],
   rules: [{ name: "REVIEW.md", sha256: "e".repeat(64), appliesTo: UNITS }],
@@ -70,8 +74,8 @@ const nextOf = (report: unknown): string | undefined => {
     return error instanceof Refusal ? error.next : undefined;
   }
 };
-const recordAt = (head: string, findings: unknown[], verdict = "changes_requested", call: unknown = { ok: true }) =>
-  parseReviewRecord(reportFor(head, { findings, verdict, call }), { packet: packetFor(head) });
+const recordAt = (head: string, findings: unknown[], verdict = "changes_requested", call: unknown = { ok: true }, pr: number | null = PR) =>
+  parseReviewRecord(reportFor(head, { findings, verdict, call }), { packet: packetFor(head, pr) });
 
 test("a report is recorded against the ledger's packet, not the copy it carries", () => {
   const record = parseReviewRecord(reportFor(HEAD), options);
@@ -214,6 +218,54 @@ test("the view carries an open blocking finding to a later head and a resolve se
   const unknownHead = ledgerEventsView(events, "9".repeat(40));
   expect(unknownHead.packet).toBeUndefined();
   expect(unknownHead.record).toBeUndefined();
+});
+
+test("a finding's lifecycle is scoped to its PR: one PR's resolve leaves another PR's same id open", () => {
+  // One ledger per project, so both PRs' events sit in the same file with the same semantic id.
+  const other = { ...packetFor(NEXT, 8) };
+  const events: LedgerEvent[] = [
+    { v: 1, type: "packet", at: "t0", packet: packetFor(HEAD) },
+    { v: 1, type: "record", at: "t1", id: "record-1", record: recordAt(HEAD, [finding()]) },
+    { v: 1, type: "packet", at: "t2", packet: other },
+    { v: 1, type: "record", at: "t3", id: "record-2", record: recordAt(NEXT, [finding({ text: "the other PR's frame is missing" })], "changes_requested", { ok: true }, 8) },
+    { v: 1, type: "resolve", at: "t4", head: HEAD, finding: "bugs:missing-frame", as: "fixed", evidence: ["src/a.ts:40"] },
+  ];
+  // PR 7's own head is settled, and PR 8's finding is not in PR 7's view at all.
+  const mine = ledgerEventsView(events, HEAD);
+  expect(mine.openBlocking).toEqual([]);
+  expect(mine.counts).toMatchObject({ fixed: 1, openImportant: 0 });
+  expect(mine.findings.find(entry => entry.id === "bugs:missing-frame")?.text).toBe("raw reviewed content reached the packet");
+  // PR 8's view replays only its own report: the resolve at PR 7's head neither settles nor appears there.
+  const theirs = ledgerEventsView(events, NEXT);
+  expect(theirs.openBlocking).toEqual(["bugs:missing-frame"]);
+  expect(theirs.counts).toMatchObject({ important: 1, openImportant: 1, fixed: 0 });
+  expect(theirs.findings.find(entry => entry.id === "bugs:missing-frame")?.text).toBe("the other PR's frame is missing");
+  expect(theirs.findings.find(entry => entry.id === "bugs:missing-frame")?.disposition).toBe("open");
+});
+
+test("without a PR a finding's lifecycle is that exact head, and nothing carries between heads", () => {
+  const events: LedgerEvent[] = [
+    { v: 1, type: "packet", at: "t0", packet: packetFor(HEAD, null) },
+    { v: 1, type: "record", at: "t1", id: "record-1", record: recordAt(HEAD, [finding()], "changes_requested", { ok: true }, null) },
+    { v: 1, type: "packet", at: "t2", packet: packetFor(NEXT, null) },
+    { v: 1, type: "record", at: "t3", id: "record-2", record: recordAt(NEXT, [], "approved", { ok: true }, null) },
+  ];
+  // A packet built without `--pr` names no thread, so the spec's rule is the exact head: NEXT's view is NEXT's record.
+  expect(ledgerEventsView(events, NEXT).openBlocking).toEqual([]);
+  expect(ledgerEventsView(events, NEXT).counts).toMatchObject({ important: 0 });
+  expect(ledgerEventsView(events, HEAD).openBlocking).toEqual(["bugs:missing-frame"]);
+});
+
+test("a later resolve states its own evidence, so one without evidence clears the earlier one", () => {
+  const events: LedgerEvent[] = [
+    { v: 1, type: "packet", at: "t0", packet: packetFor(HEAD) },
+    { v: 1, type: "record", at: "t1", id: "record-1", record: recordAt(HEAD, [finding()]) },
+    { v: 1, type: "resolve", at: "t2", head: HEAD, finding: "bugs:missing-frame", as: "fixed", evidence: ["src/a.ts:40"] },
+  ];
+  expect(ledgerEventsView(events, HEAD).findings[0]?.evidence).toEqual(["src/a.ts:40"]);
+  const second = ledgerEventsView([...events, { v: 1, type: "resolve", at: "t3", head: HEAD, finding: "bugs:missing-frame", as: "fixed" }], HEAD);
+  expect(second.findings[0]?.evidence).toBeUndefined();
+  expect(second.findings[0]?.disposition).toBe("fixed");
 });
 
 test("the view shows a finding's path, anchor and text from the records it replays, never from a later head", () => {

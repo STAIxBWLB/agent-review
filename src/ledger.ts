@@ -38,7 +38,7 @@ export type LedgerEvent =
 export interface PacketBlock {
   id: string;
   profile?: string;
-  subject: { kind?: string; base?: string; head: string; mergeBase?: string };
+  subject: { kind?: string; base?: string; head: string; mergeBase?: string; pr?: number };
   units?: { path: string; status?: string; insertions?: number; deletions?: number }[];
   excluded?: { path: string; reason?: string }[];
   rules?: { name: string; sha256?: string; appliesTo?: string[] }[];

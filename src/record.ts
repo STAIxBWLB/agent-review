@@ -288,7 +288,11 @@ const lifecycle = (finding: RecordFinding): ReviewFinding => ({
  * the same packet; a workspace subject does not, because it names HEAD while the tree is what moved.
  */
 function rebuildRequest(subject: PacketBlock["subject"]): PacketRequest | undefined {
-  if (subject.kind === "range" && subject.base) return { kind: "range", base: subject.base, head: subject.head };
+  if (subject.kind === "range" && subject.base) {
+    // The PR number rides along: a packet built with `--pr` carries it in its subject, so a rebuild without it would
+    // produce a different id and refuse every report written from a PR packet.
+    return { kind: "range", base: subject.base, head: subject.head, ...(subject.pr === undefined ? {} : { pr: subject.pr }) };
+  }
   if (subject.kind === "commit") return { kind: "commit", commit: subject.head };
   if (subject.kind === "workspace") return { kind: "workspace" };
   // ponytail: a `files` packet does not keep the scope paths it was built from, so it cannot be rebuilt and its report
@@ -297,11 +301,17 @@ function rebuildRequest(subject: PacketBlock["subject"]): PacketRequest | undefi
   return undefined;
 }
 
+/** The review thread a packet belongs to: its PR number, or `undefined` for a packet built without one. */
+const threadOf = (subject: PacketBlock["subject"] | undefined): number | undefined => subject?.pr;
+
 /**
- * Replay the ledger into the review of one head. Records are finding sets keyed by their head; a resolve is an explicit
- * disposition for its id at the head it was recorded at, carrying the severity and term of the latest report of it, so
- * settling a blocking finding once settles it for later heads too. A resolve naming an id no report ever carried has
- * nothing to settle and is ignored (`arev resolve` refuses to write one).
+ * Replay the ledger into the review of one head, scoped to that head's review thread: the records and resolves whose
+ * packet carries the same `subject.pr`, or - for a head whose packet has none - only those recorded at that exact head.
+ * The ledger is one file per project, so a resolve in one PR would otherwise settle the same finding id in another.
+ *
+ * Within a thread, records are finding sets keyed by their head; a resolve is an explicit disposition for its id at the
+ * head it was recorded at, carrying the severity and term of the latest report of it, so settling a blocking finding once
+ * settles it for later heads of the same PR too. A resolve naming an id no report of the thread carried is ignored.
  */
 export function ledgerEventsView(events: readonly LedgerEvent[], head?: string): ReviewView {
   const newest = (type: LedgerEvent["type"]) => [...events].reverse().find(event => event.type === type);
@@ -313,16 +323,30 @@ export function ledgerEventsView(events: readonly LedgerEvent[], head?: string):
     ? (lastPacket?.type === "packet" ? lastPacket : undefined)
     : [...events].reverse().find(event => event.type === "packet" && event.packet.subject.head === target);
   const recordEvent = [...events].reverse().find(event => event.type === "record" && event.record.packet.subject.head === target);
+  // A record's own packet is the one its report was validated against, so it wins over the newest packet event for the
+  // head: a later packet (a re-run, a new base) describes a review this head's record never saw.
+  const recordedPacket = recordEvent?.type === "record" ? recordEvent.record.packet : undefined;
+  const thread = threadOf(recordedPacket?.subject ?? (packetEvent?.type === "packet" ? packetEvent.packet.subject : undefined));
+  const inThread = (subject: PacketBlock["subject"]): boolean =>
+    thread === undefined ? subject.head === target : threadOf(subject) === thread;
   // The text and evidence a view prints belong to the records it replays: a record for a later head describes a review
   // this head never had, so a report text from it is not shown here.
   const recordIndex = recordEvent === undefined ? -1 : events.lastIndexOf(recordEvent);
 
   const sets: ReviewFindingSet[] = [];
   const latest = new Map<string, RecordFinding>(), shown = new Map<string, RecordFinding>(), evidence = new Map<string, string[]>();
+  // A resolve's thread is the thread of the record it settles: the report at its head, which every resolver has before
+  // the resolve it writes. A resolve naming a head with no report of its own falls back to the newest report of its id
+  // in this thread, so `resolve --head` can name a head whose record is written later.
+  const headThread = new Map<string, number | undefined>(), reportedThread = new Map<string, number | undefined>();
   for (const [index, event] of events.entries()) {
     if (event.type === "record") {
-      sets.push({ head: event.record.packet.subject.head, items: event.record.findings.map(lifecycle) });
+      const subject = event.record.packet.subject;
+      headThread.set(subject.head, threadOf(subject));
+      if (!inThread(subject)) continue;
+      sets.push({ head: subject.head, items: event.record.findings.map(lifecycle) });
       for (const finding of event.record.findings) {
+        reportedThread.set(finding.id, threadOf(subject));
         latest.set(finding.id, finding);
         if (recordIndex !== -1 && index > recordIndex) continue;
         shown.set(finding.id, finding);
@@ -332,6 +356,8 @@ export function ledgerEventsView(events: readonly LedgerEvent[], head?: string):
     } else if (event.type === "resolve") {
       const reported = latest.get(event.finding);
       if (!reported) continue;
+      const settled = headThread.has(event.head) ? headThread.get(event.head) : reportedThread.get(event.finding);
+      if ((thread === undefined ? event.head !== target : settled !== thread)) continue;
       sets.push({
         head: event.head,
         items: [{
@@ -340,7 +366,9 @@ export function ledgerEventsView(events: readonly LedgerEvent[], head?: string):
           ...(event.rationale === undefined ? {} : { rationale: event.rationale }),
         }],
       });
+      // A resolve states its own evidence, so one without evidence clears what an earlier one showed.
       if (event.evidence?.length) evidence.set(event.finding, [...event.evidence]);
+      else evidence.delete(event.finding);
     }
   }
 
@@ -360,9 +388,8 @@ export function ledgerEventsView(events: readonly LedgerEvent[], head?: string):
       ...(evidence.has(finding.id) ? { evidence: evidence.get(finding.id)! } : {}),
     };
   });
-  // A record's own packet is the one its report was validated against, so it wins over the newest packet event for the
-  // head: a later packet (a re-run, a new base) describes a review this head's record never saw.
-  const recordedPacket = recordEvent?.type === "record" ? recordEvent.record.packet : undefined;
+  // `recordedPacket` is the packet the head's record was validated against, taken above so the replay is scoped to the
+  // same thread the view reports.
   const subject = recordedPacket?.subject ?? (packetEvent?.type === "packet" ? packetEvent.packet.subject : undefined);
   const packetId = recordedPacket?.id ?? (packetEvent?.type === "packet" ? packetEvent.packet.id : undefined);
   return {

@@ -9,6 +9,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { Readable } from "node:stream";
 import { EXIT } from "@staix/cli-output";
 import { serve, type Handler, type Tool } from "@staix/mcp-stdio";
 import { version } from "../package.json";
@@ -348,6 +349,47 @@ export function mcpFailureText(error: unknown): string {
   return "the tool failed before it answered. Run the same step with the CLI (arev <command> --help) to see the cause.";
 }
 
+const RUN_FRAME_BYTES = MAX_REPORT_BYTES + 8192;
+
+// mcp-stdio 0.1.0 rejects nonempty tools/list metadata. Codex requests a
+// progress token for this call; enumeration is immediate and emits no progress.
+function listingFrame(frame: Buffer): Buffer | string {
+  try {
+    const message = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(frame));
+    const meta = message?.params?._meta;
+    if (message?.method === "tools/list" && meta && Object.keys(meta).length === 1 &&
+        (typeof meta.progressToken === "string" || Number.isSafeInteger(meta.progressToken))) {
+      delete message.params._meta;
+      return JSON.stringify(message) + "\n";
+    }
+  } catch { /* Let the server handle malformed input. */ }
+  return frame;
+}
+
+async function* runInput(input: Readable) {
+  let parts: Buffer[] = [], bytes = 0;
+  for await (const chunk of input) {
+    const data = Buffer.from(chunk);
+    let start = 0;
+    while (start < data.length) {
+      const newline = data.indexOf(10, start);
+      const end = newline < 0 ? data.length : newline + 1;
+      const part = data.subarray(start, end);
+      parts.push(part);
+      bytes += part.length;
+      // Pass oversized input through to the existing server limit.
+      if (bytes > RUN_FRAME_BYTES + 1 || newline >= 0) {
+        if (bytes <= RUN_FRAME_BYTES + 1) yield listingFrame(Buffer.concat(parts));
+        else yield* parts;
+        parts = [];
+      }
+      if (newline >= 0) bytes = 0;
+      start = end;
+    }
+  }
+  yield* parts;
+}
+
 /** `arev mcp`: serve until stdin closes. `bin/arev.js` sets an exit code and leaves the loop alive on stdin. */
 export function mcpCommand(cwd: string, args: readonly string[]): number {
   const run = args.length === 2 && args[0] === "--run" && args[1] ? resolve(cwd, args[1]) : undefined;
@@ -360,7 +402,7 @@ export function mcpCommand(cwd: string, args: readonly string[]): number {
     handlers: run === undefined ? mcpHandlers(cwd) : runHandlers(run),
     instructions: run === undefined ? INSTRUCTIONS : "Read the active packet with arev_packet, then stage one report using arev_record. The runner records it after checkout verification.",
     failureText: mcpFailureText,
-    ...(run === undefined ? {} : { limits: { frameBytes: MAX_REPORT_BYTES + 8192, resultBytes: 32 * 1024 * 1024 } }),
+    ...(run === undefined ? {} : { input: Readable.from(runInput(process.stdin)), limits: { frameBytes: RUN_FRAME_BYTES, resultBytes: 32 * 1024 * 1024 } }),
   })
     .catch(error => {
       console.error(`arev mcp: ${error instanceof Error ? error.message : "the server stopped"}`);

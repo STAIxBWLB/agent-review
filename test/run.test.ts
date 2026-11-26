@@ -115,6 +115,7 @@ printf '%s\\n' '{"baseRefOid":"${base}","headRefOid":"${head}","title":"Review f
     if (mode === "mcp" || mode === "mcp-dirty" || mode === "mcp-failed") {
       const config = Object.fromEntries(process.argv.filter(arg => arg.startsWith("mcp_servers.arev."))
         .map(arg => [arg.slice(0, arg.indexOf("=")), JSON.parse(arg.slice(arg.indexOf("=") + 1))]));
+      if (config["mcp_servers.arev.required"] !== true) process.exit(20);
       const command = config["mcp_servers.arev.command"];
       const args = config["mcp_servers.arev.args"];
       const report = { v: 1, packet, reviewer, coverage, call, verdict: "approved", findings: [] };
@@ -123,7 +124,7 @@ printf '%s\\n' '{"baseRefOid":"${base}","headRefOid":"${head}","title":"Review f
         { jsonrpc: "2.0", id: 1, method: "initialize",
           params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "fixture", version: "1" } } },
         { jsonrpc: "2.0", method: "notifications/initialized" },
-        { jsonrpc: "2.0", id: 2, method: "tools/list" },
+        { jsonrpc: "2.0", id: 2, method: "tools/list", params: { _meta: { progressToken: 0 } } },
         callTool(3, "arev_packet", {}),
         callTool(4, "arev_record", { report: { ...report, packet: { ...packet, id: "a".repeat(64) } } }),
         callTool(5, "arev_record", { report }),

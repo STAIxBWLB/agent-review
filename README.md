@@ -127,7 +127,15 @@ installed reviewer explicitly.
 
 Supported reviewers submit one validated report over the scoped MCP stdio
 channel. The runner records the staged report after it verifies the checkout.
-When the reviewer cannot use MCP, it can return a JSON report in its output.
+Codex waits for the run-scoped server to initialize before its first turn. A
+server startup failure stops the Codex run. If a reviewer finishes without
+staging a report, the runner can still read a JSON report from its output.
+
+To verify the MCP channel with an installed and authenticated Codex CLI, run
+`arev run --host codex --implementer <id> --out <fresh-dir>` on a reviewable
+branch. A successful run with `report.json` in the output directory confirms
+that the report was staged over MCP. A successful run without that file used
+the output fallback.
 
 The default timeout is 30 minutes. Use `--out DIR` outside the source
 worktree to choose where packet files and reviewer output are saved. A dirty

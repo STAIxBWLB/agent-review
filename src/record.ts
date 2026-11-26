@@ -15,7 +15,7 @@ import { parseReviewAnchor, reviewAnchorErrorMessage, type ReviewAnchor } from "
 import { blocksApproval, findingTally, findingsForHead, positionalFindingId, type ReviewFinding, type ReviewFindingSet, type ReviewFindingTally } from "./findings.ts";
 import { deniedReportPath } from "./deny.ts";
 import { sanitize } from "./frame.ts";
-import { MAX_REPORT_BYTES, Refusal, appendEvent, readLedger, recordId, reviewProjectId, secretShaped, shown, stringsIn, type LedgerEvent, type PacketBlock, type RecordFinding, type ReviewRecordV1 } from "./ledger.ts";
+import { MAX_REPORT_BYTES, Refusal, appendEvent, lineShaped, readLedger, recordId, reviewProjectId, secretShaped, shown, stringsIn, type LedgerEvent, type PacketBlock, type RecordFinding, type ReviewRecordV1 } from "./ledger.ts";
 import { buildPacket, type PacketRequest } from "./packet.ts";
 import { PacketUsageError } from "./packet-cli.ts";
 import { reviewGit } from "./review-git.ts";
@@ -41,7 +41,7 @@ const COMMITISH = /^(?:[a-f0-9]{4,64})$/;
  * looked up. A value that resolves to no commit here is refused by name, because "no review at that head" and "that is
  * not a head here" are different facts. Callers shape-check the value with `COMMITISH` first, so this echo is hex.
  */
-function resolveHead(cwd: string, value: string): string {
+export function resolveHead(cwd: string, value: string): string {
   const result = reviewGit(cwd, ["rev-parse", "--verify", "-q", `${value}^{commit}`]);
   if (result.status === 0) return result.stdout.replace(/\r?\n$/, "");
   // What counts as full is the repository's own object format: 40 hexadecimal characters is a whole OID in a SHA-1
@@ -629,6 +629,46 @@ function parseArgs(args: readonly string[], spec: { value: readonly string[]; bo
   return { positionals, flags };
 }
 
+/** Validate and append one report for callers that already have its decoded value. */
+export function recordReview(
+  cwd: string, raw: unknown, options: { label: string; implementer?: string; light?: boolean },
+) {
+  const { implementer, light } = options;
+  const label = shown(options.label);
+  // The raw screen cannot see a JSON escape, which the parse has now decoded: `\u0041` spells `A`, so a report can carry
+  // a secret-shaped value past it. Every string the parsed report holds is screened the same way, still naming no value.
+  const serialized = JSON.stringify(raw) ?? "";
+  if (Buffer.byteLength(serialized) > MAX_REPORT_BYTES) {
+    throw new Refusal(`the report ${label} exceeds ${MAX_REPORT_BYTES} bytes`, "shorten the report's text and retry");
+  }
+  if ([...stringsIn(raw)].some(secretShaped) || lineShaped(serialized)) {
+    throw new Refusal(`the report ${label} matches a secret pattern, so nothing from it was recorded or shown`,
+      "remove the secret-shaped value from the report, then write it again");
+  }
+  const head = own(own(own(raw, "packet"), "subject"), "head");
+  // The head is checked before it is ever echoed: it is report text, and the refusals below print it.
+  if (typeof head !== "string" || !FULL_OID.test(head)) {
+    throw new Refusal(`the report ${label} has no full commit SHA at packet.subject.head`,
+      "write the report from the packet.json arev wrote: arev packet --pr N --out DIR");
+  }
+  const events = readLedger(cwd);
+  // The report names the packet it was written from, and that is the one it is checked against: one head SHA can carry
+  // a packet for each of two PRs opened against different bases, so the newest packet for the head is not the report's.
+  const packetId = own(own(raw, "packet"), "id");
+  if (typeof packetId !== "string" || !PACKET_ID.test(packetId)) {
+    throw new Refusal(`the report ${label} has no packet id at packet.id`,
+      "write the report from the packet.json arev wrote: arev packet --pr N --out DIR");
+  }
+  const packetEvent = requireCurrentPacket(cwd, head, packetId, events);
+  const cap = packetEvent.review?.advisory_cap ?? DEFAULT_ADVISORY_CAP;
+  const record = parseReviewRecord(raw, { packet: packetEvent.packet, maxAdvisories: cap,
+    ...(implementer === undefined ? {} : { implementer }), ...(light ? { light: true } : {}) });
+  const id = recordId(record);
+  appendEvent(cwd, { v: 1, type: "record", at: new Date().toISOString(), id, record });
+  const blockingOpen = record.findings.filter(finding => finding.severity === "blocking" && finding.disposition === "open").length;
+  return { id, head: record.packet.subject.head, verdict: record.verdict, call: record.call, findings: record.findings.length, blockingOpen };
+}
+
 /** `arev record <report.json> [--implementer NAME] [--light] [--json]`. */
 export function recordCommand(cwd: string, args: readonly string[]): number {
   const parsed = parseArgs(args, { value: ["--implementer"], boolean: ["--json", "--light"] });
@@ -646,7 +686,7 @@ export function recordCommand(cwd: string, args: readonly string[]): number {
     // A report is untrusted text and every refusal below can name a value out of it, so the file is screened before it is
     // parsed and before any of it reaches a message. The ledger screens each event again as it is written; this screen is
     // what keeps a secret-shaped value out of stderr, and it names no value at all.
-    if (secretShaped(source)) {
+    if (lineShaped(source)) {
       throw new Refusal(`the report ${shown(file)} matches a secret pattern, so nothing from it was recorded or shown`,
         "remove the secret-shaped value from the report, then write it again");
     }
@@ -656,44 +696,69 @@ export function recordCommand(cwd: string, args: readonly string[]): number {
     } catch {
       throw new Refusal(`${shown(file)} is not valid JSON`, "fix the report file and run arev record again");
     }
-    // The raw screen cannot see a JSON escape, which the parse has now decoded: `\u0041` spells `A`, so a report can carry
-    // a secret-shaped value past it. Every string the parsed report holds is screened the same way, still naming no value.
-    if ([...stringsIn(raw)].some(secretShaped)) {
-      throw new Refusal(`the report ${shown(file)} matches a secret pattern, so nothing from it was recorded or shown`,
-        "remove the secret-shaped value from the report, then write it again");
-    }
-    const head = own(own(own(raw, "packet"), "subject"), "head");
-    // The head is checked before it is ever echoed: it is report text, and the refusals below print it.
-    if (typeof head !== "string" || !FULL_OID.test(head)) {
-      throw new Refusal(`the report ${shown(file)} has no full commit SHA at packet.subject.head`,
-        "write the report from the packet.json arev wrote: arev packet --pr N --out DIR");
-    }
-    const events = readLedger(cwd);
-    // The report names the packet it was written from, and that is the one it is checked against: one head SHA can carry
-    // a packet for each of two PRs opened against different bases, so the newest packet for the head is not the report's.
-    const packetId = own(own(raw, "packet"), "id");
-    if (typeof packetId !== "string" || !PACKET_ID.test(packetId)) {
-      throw new Refusal(`the report ${shown(file)} has no packet id at packet.id`,
-        "write the report from the packet.json arev wrote: arev packet --pr N --out DIR");
-    }
-    const packetEvent = requireCurrentPacket(cwd, head, packetId, events);
-    const cap = packetEvent.review?.advisory_cap ?? DEFAULT_ADVISORY_CAP;
     const implementer = parsed.flags["--implementer"]?.at(-1);
-    const record = parseReviewRecord(raw, { packet: packetEvent.packet, maxAdvisories: cap,
-      ...(implementer === undefined ? {} : { implementer }), ...(parsed.flags["--light"] === undefined ? {} : { light: true }) });
-    const id = recordId(record);
-    appendEvent(cwd, { v: 1, type: "record", at: new Date().toISOString(), id, record });
-    const blockingOpen = record.findings.filter(finding => finding.severity === "blocking" && finding.disposition === "open").length;
+    const { id, head, verdict, call, findings, blockingOpen } = recordReview(cwd, raw, {
+      label: file, ...(implementer === undefined ? {} : { implementer }),
+      ...(parsed.flags["--light"] === undefined ? {} : { light: true }),
+    });
     if (parsed.flags["--json"] !== undefined) {
-      console.log(JSON.stringify({ id, head: record.packet.subject.head, verdict: record.verdict, call: record.call, findings: record.findings.length, blockingOpen }, null, 2));
+      console.log(JSON.stringify({ id, head, verdict, call, findings, blockingOpen }, null, 2));
     } else {
-      console.log(`recorded ${id} for head ${record.packet.subject.head}`);
-      console.log(`  ${record.findings.length} finding(s), ${blockingOpen} blocking open; next: arev show, then arev gate`);
+      console.log(`recorded ${id} for head ${head}`);
+      console.log(`  ${findings} finding(s), ${blockingOpen} blocking open; next: arev show, then arev gate`);
     }
     return EXIT.ok;
   } catch (error) {
     return failure(error);
   }
+}
+
+/** Append a disposition using the same thread and authority checks as the CLI. */
+export function resolveFinding(cwd: string, id: string, options: {
+  as: "fixed" | "false_positive" | "accepted"; evidence?: readonly string[];
+  rationale?: string; head?: string; pr?: ThreadSelector; person: boolean;
+}) {
+  const { as, rationale, head: headFlag, pr } = options;
+  const evidence = (options.evidence ?? []).map((ref, index) => cliText(ref, MAX_REF, `--evidence[${index}]`));
+  if (as === "accepted" && !options.person) {
+    throw new Refusal("accepted is the person's decision and is refused outside an interactive terminal", `run arev resolve ${echoName(id)} --as accepted --rationale "<what was accepted>" from your own terminal`);
+  }
+  if (as === "accepted" && rationale === undefined) throw new Refusal("--as accepted needs --rationale", `pass --rationale "<what was accepted>"`);
+  if (as === "false_positive" && evidence.length === 0) {
+    throw new Refusal("--as false_positive needs --evidence", `pass --evidence path:line (or the command output) that settles ${echoName(id)}`);
+  }
+  const events = readLedger(cwd);
+  // `--pr N` resolves inside that thread, and without `--head` it reads that PR's newest record rather than the ledger's
+  // newest: two PRs can share a head, and the newest record there belongs to whichever was recorded last. `--pr none`
+  // is the thread with no PR, so it reads the newest record that names none.
+  const newestRecord = [...events].reverse().find(event => event.type === "record"
+    && (pr === undefined || threadOf(event.record.packet.subject) === (pr === "none" ? undefined : pr)));
+  const head = headFlag === undefined
+    ? (newestRecord?.type === "record" ? newestRecord.record.packet.subject.head : undefined)
+    : resolveHead(cwd, headFlag);
+  if (!head) throw new Refusal("the ledger has no head to resolve against", "pass --head <sha> or record a review first");
+  // The thread is the head's own: `--pr` when given, else the only thread that head carries, refused when it carries
+  // more than one. The resolve states it on the event, and it refuses an id that thread never reported, so one PR's
+  // resolve cannot settle another PR's finding.
+  const thread = threadAtHead(events, head, pr);
+  const reports = (event: LedgerEvent): boolean =>
+    event.type === "record" && event.record.findings.some(finding => finding.id === id)
+    && inThread(threadOf(event.record.packet.subject), event.record.packet.subject.head, thread, head);
+  if (!events.some(reports)) {
+    throw new Refusal(thread === undefined
+      ? `no record at ${shown(head)} reports the finding ${echoName(id)}`
+      : `no record of PR ${thread} reports the finding ${echoName(id)}`,
+      thread === undefined ? `pass --head of a head whose record reports it, or record that review first` : "run arev show to list the finding ids recorded for that PR");
+  }
+  const event: LedgerEvent = {
+    v: 1, type: "resolve", at: new Date().toISOString(), head, finding: id, as,
+    ...(thread === undefined ? {} : { pr: thread }),
+    ...(evidence.length ? { evidence } : {}),
+    ...(rationale === undefined ? {} : { rationale: cliText(rationale, MAX_TEXT, "--rationale") }),
+  };
+  appendEvent(cwd, event);
+  return { finding: id, as, head, ...(thread === undefined ? {} : { pr: thread }), evidence,
+    ...(rationale === undefined ? {} : { rationale }) };
 }
 
 /** `arev resolve <finding-id> --as fixed|false_positive|accepted [--evidence REF]... [--rationale TEXT] [--head SHA] [--pr N|none] [--json]`. */
@@ -710,47 +775,14 @@ export function resolveCommand(cwd: string, args: readonly string[]): number {
   const headFlag = parsed.flags["--head"]?.at(-1);
   if (headFlag !== undefined && !COMMITISH.test(headFlag)) return usageError("--head must be a commit SHA: 4 to 64 hexadecimal characters");
   try {
-    const evidence = (parsed.flags["--evidence"] ?? []).map((ref, index) => cliText(ref, MAX_REF, `--evidence[${index}]`));
     const rationale = parsed.flags["--rationale"]?.at(-1);
-    if (as === "accepted" && !interactive()) {
-      throw new Refusal("accepted is the person's decision and is refused outside an interactive terminal", `run arev resolve ${shown(id)} --as accepted --rationale "<what was accepted>" from your own terminal`);
-    }
-    if (as === "accepted" && rationale === undefined) throw new Refusal("--as accepted needs --rationale", `pass --rationale "<what was accepted>"`);
-    if (as === "false_positive" && evidence.length === 0) {
-      throw new Refusal("--as false_positive needs --evidence", `pass --evidence path:line (or the command output) that settles ${shown(id)}`);
-    }
-    const events = readLedger(cwd);
-    // `--pr N` resolves inside that thread, and without `--head` it reads that PR's newest record rather than the ledger's
-    // newest: two PRs can share a head, and the newest record there belongs to whichever was recorded last. `--pr none`
-    // is the thread with no PR, so it reads the newest record that names none.
-    const newestRecord = [...events].reverse().find(event => event.type === "record"
-      && (pr === undefined || threadOf(event.record.packet.subject) === (pr === "none" ? undefined : pr)));
-    const head = headFlag === undefined
-      ? (newestRecord?.type === "record" ? newestRecord.record.packet.subject.head : undefined)
-      : resolveHead(cwd, headFlag);
-    if (!head) throw new Refusal("the ledger has no head to resolve against", "pass --head <sha> or record a review first");
-    // The thread is the head's own: `--pr` when given, else the only thread that head carries, refused when it carries
-    // more than one. The resolve states it on the event, and it refuses an id that thread never reported, so one PR's
-    // resolve cannot settle another PR's finding.
-    const thread = threadAtHead(events, head, pr);
-    const reports = (event: LedgerEvent): boolean =>
-      event.type === "record" && event.record.findings.some(finding => finding.id === id)
-      && inThread(threadOf(event.record.packet.subject), event.record.packet.subject.head, thread, head);
-    if (!events.some(reports)) {
-      throw new Refusal(thread === undefined
-        ? `no record at ${shown(head)} reports the finding ${shown(id)}`
-        : `no record of PR ${thread} reports the finding ${shown(id)}`,
-        thread === undefined ? `pass --head of a head whose record reports it, or record that review first` : "run arev show to list the finding ids recorded for that PR");
-    }
-    const event: LedgerEvent = {
-      v: 1, type: "resolve", at: new Date().toISOString(), head, finding: id, as,
-      ...(thread === undefined ? {} : { pr: thread }),
-      ...(evidence.length ? { evidence } : {}),
-      ...(rationale === undefined ? {} : { rationale: cliText(rationale, MAX_TEXT, "--rationale") }),
-    };
-    appendEvent(cwd, event);
-    if (parsed.flags["--json"] !== undefined) console.log(JSON.stringify({ finding: id, as, head, ...(thread === undefined ? {} : { pr: thread }), evidence, ...(rationale === undefined ? {} : { rationale }) }, null, 2));
-    else console.log(`resolved ${id} as ${as} at ${head}; next: arev show, then arev gate`);
+    const outcome = resolveFinding(cwd, id, {
+      as, person: interactive(), evidence: parsed.flags["--evidence"] ?? [],
+      ...(rationale === undefined ? {} : { rationale }), ...(headFlag === undefined ? {} : { head: headFlag }),
+      ...(pr === undefined ? {} : { pr }),
+    });
+    if (parsed.flags["--json"] !== undefined) console.log(JSON.stringify(outcome, null, 2));
+    else console.log(`resolved ${id} as ${as} at ${outcome.head}; next: arev show, then arev gate`);
     return EXIT.ok;
   } catch (error) {
     return failure(error);

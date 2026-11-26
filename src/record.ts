@@ -650,12 +650,8 @@ function parseArgs(args: readonly string[], spec: { value: readonly string[]; bo
   return { positionals, flags };
 }
 
-/** Validate and append one report for callers that already have its decoded value. */
-export function recordReview(
-  cwd: string, raw: unknown, options: { label: string; implementer?: string; light?: boolean; run?: RunAttestation },
-) {
-  const { implementer, light, run } = options;
-  const label = shown(options.label);
+/** Screen decoded reports before validation or staging can expose any value. */
+export function assertReviewReportSafe(raw: unknown, label: string): void {
   // The raw screen cannot see a JSON escape, which the parse has now decoded: `\u0041` spells `A`, so a report can carry
   // a secret-shaped value past it. Every string the parsed report holds is screened the same way, still naming no value.
   const serialized = JSON.stringify(raw) ?? "";
@@ -666,6 +662,15 @@ export function recordReview(
     throw new Refusal(`the report ${label} matches a secret pattern, so nothing from it was recorded or shown`,
       "remove the secret-shaped value from the report, then write it again");
   }
+}
+
+/** Validate and append one report for callers that already have its decoded value. */
+export function recordReview(
+  cwd: string, raw: unknown, options: { label: string; implementer?: string; light?: boolean; run?: RunAttestation },
+) {
+  const { implementer, light, run } = options;
+  const label = shown(options.label);
+  assertReviewReportSafe(raw, label);
   const head = own(own(own(raw, "packet"), "subject"), "head");
   // The head is checked before it is ever echoed: it is report text, and the refusals below print it.
   if (typeof head !== "string" || !FULL_OID.test(head)) {

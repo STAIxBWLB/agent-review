@@ -12,7 +12,11 @@ reviewed answer to it, and the gate is the only thing that decides whether that 
 
 Use `arev host --pr N --implementer ID` to preview reviewer selection.
 Use `arev run --pr N --implementer ID --out DIR` to build the contract-bearing
-packet, run the reviewer read-only and record its report. If the run is void
+packet, run the reviewer read-only and record its report. In a run session,
+read the packet with `arev_packet` and submit once through `arev_record`.
+The runner verifies the checkout before it records the staged report.
+When MCP is unavailable, return the report as the final fenced JSON block.
+If the run is void
 or the report is invalid, inspect the output artifacts and rerun or correct
 the report before recording. Then run `arev gate` for the reviewed head.
 

@@ -118,10 +118,16 @@ configuration to revert what setup installed.
 ## Running a review
 
 Run `arev run --pr N --implementer ID` to select a reviewer, export the packet
-and contract, and run the reviewer in a detached worktree. Without `--pr`,
+and contract, and review a detached worktree. The reviewer and its scoped MCP
+server start outside that worktree, and the reviewer gets its path for reading.
+Without `--pr`,
 the run reviews HEAD against the origin default branch and starts the
 automatic host rotation at the first host. Pass `--host ID` to select an
 installed reviewer explicitly.
+
+Supported reviewers submit one validated report over the scoped MCP stdio
+channel. The runner records the staged report after it verifies the checkout.
+When the reviewer cannot use MCP, it can return a JSON report in its output.
 
 The default timeout is 30 minutes. Use `--out DIR` outside the source
 worktree to choose where packet files and reviewer output are saved. A dirty

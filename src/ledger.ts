@@ -140,7 +140,15 @@ function comparable(path: string): string {
  * the branch and let a change rewrite the review it is judged by.
  */
 export function ledgerPath(cwd: string, options: { home?: string } = {}): string {
-  const home = reviewHome(options.home), path = join(home, "review", reviewProjectId(cwd), "ledger.jsonl");
+  const home = reviewHome(options.home), review = join(home, "review");
+  const segments = reviewProjectId(cwd).split("/");
+  const path = join(review, ...segments, "ledger.jsonl");
+  // The project key comes from the origin URL, which is not arev's to trust: a `..` or an empty segment would put the
+  // ledger outside `<home>/review`, beside another project's.
+  if (segments.some(segment => !segment || segment === "." || segment === "..") || !path.startsWith(review + sep)) {
+    throw new Refusal("the origin remote does not name a plain repository path, so the ledger directory is refused",
+      "set origin to a plain host/owner/repo URL, or remove it to key the ledger by the working tree");
+  }
   const top = git(cwd, ["rev-parse", "--show-toplevel"]);
   if (top) {
     const root = comparable(top), inside = (candidate: string) => candidate === root || candidate.startsWith(root + sep);
@@ -152,12 +160,29 @@ export function ledgerPath(cwd: string, options: { home?: string } = {}): string
   return path;
 }
 
+/** Every string an event carries, keys included, as it was written: `JSON.stringify` escapes whitespace first. */
+function* stringsIn(value: unknown): Generator<string> {
+  if (typeof value === "string") yield value;
+  else if (Array.isArray(value)) for (const item of value) yield* stringsIn(item);
+  else if (value && typeof value === "object") {
+    for (const [key, item] of Object.entries(value)) {
+      yield key;
+      yield* stringsIn(item);
+    }
+  }
+}
+
 /** One line per event, appended. The file is never rewritten, truncated or reordered. */
 export function appendEvent(cwd: string, event: LedgerEvent, options: { home?: string } = {}): void {
   const line = JSON.stringify(event);
   if (Buffer.byteLength(line) > MAX_EVENT_BYTES) throw new Refusal(`the ${event.type} event exceeds ${MAX_EVENT_BYTES} bytes; shorten its text`, "arev show");
-  if (secretShaped(line)) throw new Refusal(`the ${event.type} event matches a secret pattern and was not written`,
-    "remove the secret value from the report or rationale and retry");
+  // A tab or newline inside a string becomes the two characters `\t` / `\n` in the line, so an assignment the pattern
+  // needs whitespace for (`token<TAB>: <value>`) stops matching there. Every string is screened as it was written, and
+  // the line as well: serialization also joins a key to its value.
+  if ([...stringsIn(event)].some(secretShaped) || secretShaped(line)) {
+    throw new Refusal(`the ${event.type} event matches a secret pattern and was not written`,
+      "remove the secret value from the report or rationale and retry");
+  }
   const path = ledgerPath(cwd, options);
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   appendFileSync(path, line + "\n", { mode: 0o600 });

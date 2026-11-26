@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonicalJson, ledgerPath, readLedger, recordId, Refusal, reviewProjectId, secretShaped, appendEvent, type LedgerEvent, type ReviewRecordV1 } from "../src/ledger.ts";
@@ -88,6 +88,50 @@ test("a secret-shaped value is refused before it reaches the ledger", () => {
   expect(() => appendEvent(repo, resolveEvent("token = abcdefgh1234"), { home })).toThrow("matches a secret pattern");
   expect(readLedger(repo, { home })).toEqual([]);
   expect(() => readFileSync(path, "utf8")).toThrow();
+});
+
+test("a secret separated from its key by a tab or a newline is refused, in a nested string too", () => {
+  const { repo, home } = fixture();
+  // The line-level screen runs on the serialized JSON, where one tab or newline is the two characters `\t` / `\n`. An
+  // assignment that separates its key from `:` or `=` with one of them needs that whitespace as whitespace, so the
+  // serialized line no longer matches it - and the write would put the value in the ledger and in `show --json`.
+  expect(secretShaped(JSON.stringify({ text: "token\t: abcdefgh1" }))).toBe(false);
+  for (const text of ["token\t: abcdefgh1", "token\n= abcdefgh1", "password\t: hunter2hunter2", "api_key\n= abcdefgh1"]) {
+    expect(() => appendEvent(repo, resolveEvent(text), { home }), JSON.stringify(text)).toThrow("matches a secret pattern");
+  }
+  // A tab or a newline straight after the colon, and a string nested inside the event, are refused the same way.
+  for (const text of ["token:\tabcdefgh1", "token:\nabcdefgh1"]) {
+    expect(() => appendEvent(repo, resolveEvent(text), { home }), JSON.stringify(text)).toThrow("matches a secret pattern");
+  }
+  // A string nested inside the event is screened the same way: here a finding's text.
+  const nested: LedgerEvent = {
+    v: 1, type: "record", at: "2026-11-26T00:00:00.000Z", id: "e".repeat(64),
+    record: {
+      v: 1,
+      packet: { id: "c".repeat(64), subject: { kind: "range", head: HEAD } },
+      reviewer: { id: "claude", modelFamily: "anthropic", started: "self", sameFamilyFallback: false },
+      coverage: { reviewed: [], skipped: [] },
+      findings: [{ id: "bugs:one", term: "bugs", severity: "blocking", text: "token\t: abcdefgh1", disposition: "open", origin: "introduced" }],
+      verdict: "changes_requested",
+      call: { ok: true },
+    },
+  };
+  expect(() => appendEvent(repo, nested, { home })).toThrow("matches a secret pattern");
+  expect(readLedger(repo, { home })).toEqual([]);
+});
+
+test("an origin that does not name a plain repository path is refused, and nothing is written outside review", () => {
+  const { repo, home } = fixture();
+  git(repo, ["remote", "add", "origin", "https://github.com/../evil.git"]);
+  expect(reviewProjectId(repo)).toBe("github.com/../evil");
+  expect(() => ledgerPath(repo, { home })).toThrow("does not name a plain repository path");
+  expect(() => appendEvent(repo, resolveEvent(), { home })).toThrow(Refusal);
+  // An empty segment is refused by the component check alone, and the read path is closed too.
+  git(repo, ["remote", "set-url", "origin", "ssh://git@example.com//team/r.git"]);
+  expect(reviewProjectId(repo)).toBe("example.com//team/r");
+  expect(() => ledgerPath(repo, { home })).toThrow("does not name a plain repository path");
+  expect(() => readLedger(repo, { home })).toThrow("does not name a plain repository path");
+  expect(existsSync(join(home, "review"))).toBe(false);
 });
 
 test("the record id is the sha256 of the canonical JSON, so key order does not change it", () => {

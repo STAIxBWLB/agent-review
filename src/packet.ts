@@ -51,10 +51,12 @@ const MAX_PACKET_BYTES = 8 * 1024 * 1024;
 const LOCKFILES = new Set(["bun.lock", "bun.lockb", "package-lock.json", "yarn.lock",
   "pnpm-lock.yaml", "Cargo.lock", "poetry.lock", "uv.lock", "go.sum", "composer.lock", "Gemfile.lock"]);
 const RENAME_OPTIONS = ["-l0", "-M", "-C", "--find-copies-harder"];
-const DIFF_CONFIG = ["-c", "core.quotePath=true"];
+const DIFF_CONFIG = ["-c", "core.quotePath=true", "-c", "diff.suppressBlankEmpty=false",
+  "-c", "core.bigFileThreshold=512m"];
 const DIFF_OPTIONS = ["--no-ext-diff", "--no-textconv", "--no-color", "--ignore-submodules=dirty",
   "-O/dev/null", "-U3", "--inter-hunk-context=0", "--diff-algorithm=myers",
-  "--src-prefix=a/", "--dst-prefix=b/", "--indent-heuristic"];
+  "--src-prefix=a/", "--dst-prefix=b/", "--indent-heuristic", "--full-index",
+  "--no-relative", "--no-color-moved", "--word-diff=none", "--submodule=short"];
 const FULL_OID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 interface Group { status: string; paths: string[]; opaque?: true }
 interface WorkspaceInventory {
@@ -364,7 +366,7 @@ function buildPacketFromIndex(
       continue;
     }
     const patch = diff([...RENAME_OPTIONS, ...(group.status === "C" ? ["--diff-filter=CR"] : []),
-      "--patch", "--submodule=short"], group.paths, MAX_PATCH_BYTES + 1);
+      "--patch"], group.paths, MAX_PATCH_BYTES + 1);
     if ((patch.error as NodeJS.ErrnoException | undefined)?.code === "ENOBUFS" ||
         Buffer.byteLength(patch.stdout ?? "") > MAX_PATCH_BYTES) {
       excluded.push({ path, reason: "too large" });

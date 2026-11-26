@@ -381,38 +381,68 @@ test("file and directory swaps keep denied and sibling patches out of each patch
   assertExact(isolatedPacket(dir, { kind: "commit", commit: "HEAD" }));
 });
 
-test("local diff and path quoting settings cannot change packet identity", () => {
+test("hostile diff configuration cannot change rendered patches or packet IDs", () => {
   const { dir, git, write } = fixture();
-  write("a.txt", "before\n");
-  write("z.txt", "before\n");
-  write("é.txt", "before\n");
+  write("a.txt", "context\n\nbefore\n");
+  write("é.txt", "context\n\nbefore é\n");
+  write("source.txt", "unchanged lines for a rename\n".repeat(8));
   git("add", ".");
   git("commit", "-qm", "base");
-  write("a.txt", "after a\n");
-  write("z.txt", "after z\n");
-  write("é.txt", "after é\n");
+  const base = git("rev-parse", "HEAD").trim();
+  write("a.txt", "context\n\nafter a\n");
+  write("é.txt", "context\n\nafter é\n");
+  git("mv", "source.txt", "destination.txt");
   git("commit", "-qam", "head");
-  const request = { kind: "commit", commit: "HEAD" } as const;
-  const initial = isolatedPacket(dir, request);
-  write("diff-order", "z.txt\na.txt\n");
-  git("config", "diff.orderFile", join(dir, "diff-order"));
-  git("config", "diff.context", "0");
-  git("config", "diff.interHunkContext", "12");
-  git("config", "diff.algorithm", "histogram");
-  for (const option of ["diff.noprefix", "diff.mnemonicPrefix"]) {
-    git("config", option, "true");
-    git("config", "diff.indentHeuristic", "false");
-    expect(isolatedPacket(dir, request)).toEqual(initial);
+  const head = git("rev-parse", "HEAD").trim();
+  git("reset", "--soft", base);
+
+  const requests = [
+    { kind: "range", base, head }, { kind: "commit", commit: head }, { kind: "workspace" },
+  ] as const;
+  const clean = requests.map(request => isolatedPacket(dir, request));
+  for (const initial of clean) {
+    expect(initial.diff).toContain("diff --git a/a.txt b/a.txt");
+    expect(initial.diff).toContain("\n \n");
+    expect(initial.diff).toMatch(/index [a-f0-9]{40}\.\.[a-f0-9]{40}/);
+    expect(initial.packet.units.some(unit => unit.path === "é.txt")).toBe(true);
+    expect(initial.packet.units.some(unit => unit.status === "R")).toBe(true);
   }
-  for (const quotePath of ["true", "false"]) {
-    git("config", "core.quotePath", quotePath);
-    const rebuilt = isolatedPacket(dir, request);
-    expect(rebuilt.packet.units.some(unit => unit.path === "é.txt")).toBe(true);
-    expect(rebuilt.packet.diffSha256).toBe(initial.packet.diffSha256);
-    expect(rebuilt.packet.id).toBe(initial.packet.id);
-    expect(rebuilt.diff).toBe(initial.diff);
+
+  // Write local settings so the test exercises the Git configuration packets actually inherit.
+  const order = join(dir, ".git", "hostile-diff-order");
+  writeFileSync(order, "destination.txt\né.txt\na.txt\n");
+  for (const [key, value] of Object.entries({
+    "core.abbrev": "7",
+    "core.quotePath": "false",
+    "core.bigFileThreshold": "1",
+    "diff.relative": "true",
+    "diff.suppressBlankEmpty": "true",
+    "diff.noprefix": "true",
+    "diff.mnemonicPrefix": "true",
+    "diff.srcPrefix": "old/",
+    "diff.dstPrefix": "new/",
+    "diff.algorithm": "histogram",
+    "diff.context": "0",
+    "diff.interHunkContext": "12",
+    "diff.orderFile": order,
+    "diff.renames": "false",
+    "diff.renameLimit": "1",
+    "diff.indentHeuristic": "false",
+    "diff.submodule": "log",
+    "diff.colorMoved": "zebra",
+    "color.diff": "always",
+  })) git("config", key, value);
+
+  for (const abbreviation of ["40", "7"]) {
+    git("config", "core.abbrev", abbreviation);
+    requests.forEach((request, index) => {
+      const expected = clean[index]!;
+      const packet = isolatedPacket(dir, request);
+      expect(packet.diff).toBe(expected.diff);
+      expect(packet.packet.diffSha256).toBe(expected.packet.diffSha256);
+      expect(packet.packet.id).toBe(expected.packet.id);
+    });
   }
-  expect(initial.diff).toContain("diff --git a/a.txt b/a.txt");
 });
 
 test("an exact patch retains both sides of a rename into the old pathname", () => {

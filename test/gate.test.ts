@@ -15,6 +15,11 @@ afterEach(() => {
 const GIT_ENV = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1",
   GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" };
 
+/** `GH_TIMEOUT_MS` in `src/gate.ts`: the bound a case that asserts a call returns inside it compares against. */
+const GH_BOUND_MS = 15_000;
+/** `GH_READ_MAX_BUFFER` in `src/gate.ts`: the reply bound the pulls read takes, which a real list stays under. */
+const GH_READ_BOUND = 16 * 1024 * 1024;
+
 function gitOut(cwd: string, args: string[]): string {
   const result = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf8", env: GIT_ENV });
   if (result.status !== 0) throw new Error(`${args.join(" ")}: ${result.stderr}`);
@@ -111,9 +116,9 @@ function seed(options: { repo: string; home: string; subject: Subject; record: R
  * read's to `argsPath.read`. `FAKE_GH_PULLS` is the JSON the read returns - a page array when the case exercises
  * pagination - `FAKE_GH_READ_ERROR` makes the read fail, `FAKE_GH_ERROR` makes the write fail, and `FAKE_GH_HANG_READ` /
  * `FAKE_GH_HANG_WRITE` make that call sit there until the gate gives up on its timeout. Two knobs are the shapes a
- * killed call does not cover: `FAKE_GH_STUBBORN_READ` ignores the signal and exits 0, which `spawnSync` still reports
- * as a timeout, and `FAKE_GH_FLOOD_WRITE` prints more than the write's buffer keeps, which fills `maxBuffer` on a call
- * that also exits 0.
+ * killed call does not cover: `FAKE_GH_STUBBORN_READ` and the write's own hang trap SIGTERM and never exit, so that
+ * call returns only if the deadline kills it outright, and `FAKE_GH_FLOOD_READ` / `FAKE_GH_FLOOD_WRITE` print more than
+ * that call's buffer keeps, which fills `maxBuffer` on a call that also exits 0.
  */
 function fakeGh(argsPath: string): string {
   const bin = temp("arev-bin-");
@@ -124,14 +129,15 @@ function fakeGh(argsPath: string): string {
     "  *repos/*/pulls*)",
     `    for arg in "$@"; do printf '%s\\n' "$arg" >> ${JSON.stringify(argsPath)}.read; done`,
     '    if [ -n "$FAKE_GH_HANG_READ" ]; then sleep 25; fi',
-    "    if [ -n \"$FAKE_GH_STUBBORN_READ\" ]; then trap '' TERM; sleep 16; exit 0; fi",
+    "    if [ -n \"$FAKE_GH_STUBBORN_READ\" ]; then trap '' TERM; exec sleep 600; fi",
+    `    if [ -n "$FAKE_GH_FLOOD_READ" ]; then head -c ${GH_READ_BOUND + 1} /dev/zero | tr '\\0' x; exit 0; fi`,
     '    if [ -n "$FAKE_GH_READ_ERROR" ]; then printf "%s\\n" "$FAKE_GH_READ_ERROR" >&2; exit 1; fi',
     '    printf \'%s\' "${FAKE_GH_PULLS:-[]}"',
     "    exit 0 ;;",
     "esac",
     `: > ${JSON.stringify(argsPath)}`,
     `for arg in "$@"; do printf '%s\\n' "$arg" >> ${JSON.stringify(argsPath)}; done`,
-    'if [ -n "$FAKE_GH_HANG_WRITE" ]; then sleep 25; fi',
+    "if [ -n \"$FAKE_GH_HANG_WRITE\" ]; then trap '' TERM; exec sleep 600; fi",
     'if [ -n "$FAKE_GH_FLOOD_WRITE" ]; then head -c 40000 /dev/zero | tr \'\\0\' x; exit 0; fi',
     'if [ -n "$FAKE_GH_ERROR" ]; then printf "%s\\n" "$FAKE_GH_ERROR" >&2; exit 1; fi',
     "exit 0",
@@ -813,29 +819,56 @@ test("a status write that runs out of time is refused on the same bound, after a
     "gate", "--post");
   expect(write.code).toBe(1);
   expect(write.stderr).toContain(`cannot post the arev/gate status on ${head}: gh did not answer within 15 s`);
-  // Run without `--pr`, so the retry names the head alone: the flag is added when it was given, never invented.
-  expect(write.stderr).toContain(`→ retry arev gate --post --head ${head} once github.com is reachable from this machine`);
+  // A write that ran out of time may already have landed, so the next step looks for the status before writing it again,
+  // and the retry it ends with names the head alone: `--pr` is added when the run was given it, never invented.
+  expect(write.stderr).toContain(`check for an existing arev/gate status on ${head} (gh api --hostname github.com repos/owner/repo/commits/${head}/statuses`);
+  expect(write.stderr).toContain("may already have landed");
+  expect(write.stderr).toContain(`so retry arev gate --post --head ${head} once github.com is reachable from this machine`);
   expect(gating(repo, home).map(event => event.type)).toEqual(["gate"]);
+  // The write's stub traps the signal and never exits either, so the bound is asserted here the same way: this case's
+  // own 25 s allowance is only reachable if the write call returns at the 15 s deadline rather than with the child.
 }, 25_000);
 
-test("a gh call that ignores the signal it was sent is still a refused call, not an empty answer", () => {
+test("a gh call that ignores the signal it was sent still returns inside the bound, as a refusal", () => {
   const { repo, base, head, home } = fixture();
   const subject: Subject = { kind: "range", base, head, mergeBase: base, pr: 7 };
   seed({ repo, home, subject, record: recordFor(subject) });
   const args = join(home, "gh-args.txt");
-  // A child that ignores the signal exits 0 on its own, and `spawnSync` reports the timeout in `error` beside that
-  // status. Read by status alone, this call would look like a successful read of an empty list - the gate would then
-  // post on a list it never got. Measured on Bun 1.4.4 with this stub: status 0, signal null, error.code ETIMEDOUT,
-  // after the child's own 16 s rather than the gate's 15 - the bound fires, the exit comes later, and only the error
-  // says so.
+  // The stub never exits and traps SIGTERM, so `spawnSync`'s default kill signal cannot end it: with SIGTERM the call
+  // stays inside spawnSync until the child exits on its own (measured on Bun 1.4.4: a 500 ms bound returned after
+  // 2013 ms) and the gate's bound is not a bound. `killSignal: "SIGKILL"` makes it a hard return - 502 ms on the same
+  // probe, `status: null`, `signal: "SIGKILL"`, `error.code: "ETIMEDOUT"`. The case's own 17 s bun timeout is the
+  // assertion: with the default signal this stub would hold the run for its 600 s sleep and the case would be killed.
+  const started = Date.now();
   const read = run(repo,
     { PATH: `${fakeGh(args)}:${process.env.PATH ?? ""}`, AGENTHUB_HOME: home, FAKE_GH_STUBBORN_READ: "1" },
     "gate", "--pr", "7", "--post");
+  const elapsed = Date.now() - started;
   expect(read.code).toBe(1);
   expect(read.stderr).toContain(`cannot read the open pull requests at ${head}: gh did not answer within 15 s`);
   expect(read.stderr).toContain(`→ retry arev gate --post --head ${head} --pr 7 once github.com is reachable from this machine`);
   expect(gating(repo, home).map(event => event.type)).toEqual(["gate"]);
-}, 25_000);
+  // The bound plus the child process and CLI startup, not the stub's own lifetime.
+  expect(elapsed).toBeLessThan(GH_BOUND_MS + 2_000);
+}, 17_000);
+
+test("a pulls reply over the read's own bound is refused by its size, with the manual read as the next step", () => {
+  const { repo, base, head, home } = fixture();
+  const subject: Subject = { kind: "range", base, head, mergeBase: base, pr: 7 };
+  seed({ repo, home, subject, record: recordFor(subject) });
+  const args = join(home, "gh-args.txt");
+  // The read's bound and the write's are not the same number, so the refusal names the one it reached. The repair
+  // repeats the read the gate made, flags included: without `--paginate --slurp` the same endpoint answers one document
+  // per page, so a by-hand list without them is not the list the gate asked for.
+  const read = run(repo, { PATH: `${fakeGh(args)}:${process.env.PATH ?? ""}`, AGENTHUB_HOME: home, FAKE_GH_FLOOD_READ: "1" }, "gate", "--post");
+  expect(read.code).toBe(1);
+  expect(read.stderr).toContain(`cannot read the open pull requests at ${head}: gh printed more than the ${GH_READ_BOUND} bytes this call keeps`);
+  expect(read.stderr).toContain(`read the same list by hand (gh api --hostname github.com --paginate --slurp repos/owner/repo/commits/${head}/pulls)`);
+  // Size is not the deadline, and a repair is not the retry: the same read returns the same oversized reply.
+  expect(read.stderr).not.toContain("gh did not answer within");
+  expect(read.stderr).not.toContain("retry arev gate");
+  expect(gating(repo, home).map(event => event.type)).toEqual(["gate"]);
+}, 17_000);
 
 test("a gh reply over the buffer is refused by its size, and the next step is not the retry", () => {
   const { repo, base, head, home } = fixture();
@@ -900,4 +933,8 @@ test("a diagnostic carrying URL userinfo is withheld, and the pattern does not s
   expect(secretShaped("https://:ghs-Sup3rS3cretValue@github.com/owner/repo")).toBe(true);
   expect(secretShaped("https://example.org:443?to=a@b")).toBe(false);
   expect(secretShaped("https://example.org/x?to=a@b")).toBe(false);
+  // Two neighbouring JSON fields are not one credential: a compact line puts a finding's text and its rationale side by
+  // side, and a class that allows quotes, commas or angle brackets reads `...:443","rationale":"a@b` as userinfo.
+  expect(secretShaped(`{"text":"https://example.org:443","rationale":"a@b.example"}`)).toBe(false);
+  expect(secretShaped(`<https://example.org:443>,a@b.example`)).toBe(false);
 });

@@ -142,29 +142,69 @@ function statusRepository(cwd: string): string {
   return `${owner}/${repo}`;
 }
 
+/** A pull request at a head, as the pulls read reports it: the number, and the base it currently merges into. */
+interface PullRequest {
+  number: number;
+  base?: { sha?: string; ref?: string };
+}
+
 /**
  * The open pull requests GitHub says have this commit as their head: a metadata read, and the only gh call besides the
  * status write (AC5). The ledger cannot answer this one - a PR arev never built a packet for is the case it misses.
  */
-function openPrsAt(cwd: string, repository: string, head: string): number[] {
-  const result = spawnSync("gh", ["api", `repos/${repository}/commits/${head}/pulls`], { cwd, encoding: "utf8" });
+function openPrsAt(cwd: string, repository: string, head: string): PullRequest[] {
+  // `--hostname` is pinned because `GH_HOST` or gh's own default would send this read, and the status write with it, to
+  // another host. `--paginate --slurp` reads every page: a second page can hold an open PR at this head too.
+  const result = spawnSync("gh", ["api", "--hostname", "github.com", "--paginate", "--slurp", `repos/${repository}/commits/${head}/pulls`],
+    { cwd, encoding: "utf8" });
   if (result.status !== 0) {
     const detail = (result.stderr || result.stdout || "").trim().split("\n").filter(Boolean)[0] ?? `gh exited ${result.status}`;
     throw new Refusal(`cannot read the open pull requests at ${head}: ${detail}`,
       "check that gh is authenticated and may read this repository's pull requests");
   }
-  let pulls: unknown;
-  try { pulls = JSON.parse(result.stdout); } catch { pulls = undefined; }
-  if (!Array.isArray(pulls)) {
+  let parsed: unknown;
+  try { parsed = JSON.parse(result.stdout); } catch { parsed = undefined; }
+  if (!Array.isArray(parsed)) {
     throw new Refusal(`the pull requests at ${head} came back in a shape arev does not read`,
       "run gh auth status, and check that gh api prints JSON for this repository");
   }
+  // `--slurp` wraps each page in one array, so a multi-page reply is an array of arrays; a plain array of pull requests
+  // is read as the single page it is.
+  const pages = parsed.every((page: unknown) => Array.isArray(page)) ? parsed.map((page: unknown) => page as unknown[]) : [parsed as unknown[]];
+  const pulls = pages.flatMap((page: unknown[]) => page);
   // The endpoint lists every pull request the commit appears in, which includes one that merely contains it: only a PR
   // whose own head is this commit can inherit a status posted here.
   return pulls.flatMap((pull: unknown) => {
-    const item = pull as { number?: unknown; state?: unknown; head?: { sha?: unknown } };
-    return item.state === "open" && item.head?.sha === head && typeof item.number === "number" ? [item.number] : [];
+    const item = pull as { number?: unknown; state?: unknown; head?: { sha?: unknown }; base?: { sha?: unknown; ref?: unknown } };
+    if (item.state !== "open" || item.head?.sha !== head || typeof item.number !== "number") return [];
+    const base = typeof item.base?.sha === "string"
+      ? { ...(item.base.sha === undefined ? {} : { sha: item.base.sha }), ...(typeof item.base.ref === "string" ? { ref: item.base.ref } : {}) }
+      : undefined;
+    return [{ number: item.number, ...(base === undefined ? {} : { base }) }];
   });
+}
+
+/**
+ * The pull request's current base and the reviewed one are the same change only when their merge bases agree: a PR
+ * retargeted after its review carries a record of a different change (AC4 gates the head *and* the base). A base commit
+ * this checkout does not hold is refused rather than fetched - a `git fetch` here would be a network call arev does not
+ * make - and the next step is the fetch.
+ */
+function checkBase(cwd: string, result: GateResult, pull: PullRequest): void {
+  const fix = `re-review against the PR's current base with arev packet --pr ${pull.number}, then post from the new head`;
+  const base = pull.base?.sha;
+  if (base === undefined) {
+    throw new Refusal(`GitHub reports no base commit for PR ${pull.number}, so the review's merge base cannot be checked against it`, fix);
+  }
+  if (reviewGit(cwd, ["rev-parse", "--verify", "-q", `${base}^{commit}`]).status !== 0) {
+    throw new Refusal(`the base commit ${base} of PR ${pull.number} is not in this checkout, so the review's merge base cannot be checked against it`,
+      "fetch it (git fetch origin) and post again");
+  }
+  const current = mergeBaseOid(cwd, base, result.head);
+  if (current !== result.mergeBase) {
+    throw new Refusal(`PR ${pull.number} now merges into a base whose merge base is ${current}, and the record was made against ${result.mergeBase ?? "(none)"}, so the review is of a different change`,
+      fix);
+  }
 }
 
 /**
@@ -177,7 +217,8 @@ export function postStatus(head: string, record: string, repository: string, cwd
     throw new Refusal(`the status description would be ${Buffer.byteLength(description)} bytes; a commit status allows 140`,
       "shorten the record id or the context");
   }
-  const result = spawnSync("gh", ["api", "--method", "POST", `repos/${repository}/statuses/${head}`,
+  // The host is pinned for the write as well: `GH_HOST` would otherwise decide where this status lands.
+  const result = spawnSync("gh", ["api", "--hostname", "github.com", "--method", "POST", `repos/${repository}/statuses/${head}`,
     "-f", "state=success", "-f", `context=${STATUS_CONTEXT}`, "-f", `description=${description}`], { cwd, encoding: "utf8" });
   if (result.status !== 0) {
     const detail = (result.stderr || result.stdout || "").trim().split("\n").filter(Boolean)[0] ?? `gh exited ${result.status}`;
@@ -244,18 +285,32 @@ export function gateCommand(cwd: string, args: readonly string[]): number {
           "push a distinct commit for each PR and post the gate from that PR's own head");
       }
     }
-    // The ledger only knows the pull requests arev built a packet for, and a status lives on the commit: the open PRs at
-    // this head are read from GitHub, and one that is not the thread this gate posts for would inherit the status. Both
-    // this read and the status write name the repository origin gives, never the one gh resolves for itself.
-    // ponytail: a pull request opened on this head after the status is posted still inherits it; a status is per commit.
+    // The ledger only knows the pull requests arev built a packet for, and a status lives on the commit: every open PR
+    // at this head is read from GitHub, page by page, and one that is not the thread this gate posts for would inherit
+    // the status. Both this read and the status write name the repository origin gives and the host github.com, never
+    // the ones gh resolves for itself, and the PR's current base is compared with the reviewed merge base.
+    // ponytail: a pull request opened on this head after the status is posted still inherits it, and GitHub lists open
+    // PRs for this endpoint only while the commit is outside the default branch - a head already on main has no open PR
+    // to protect. Both follow from a status being per commit.
     let repository: string | undefined;
     if (parsed.flags["--post"] !== undefined && result.ok && result.record !== undefined) {
       repository = statusRepository(cwd);
-      const others = openPrsAt(cwd, repository, result.head).filter(number => number !== result.pr);
+      const pulls = openPrsAt(cwd, repository, result.head);
+      const others = pulls.filter(pull => pull.number !== result.pr);
       if (others.length > 0) {
-        const named = others.map(number => `PR ${number}`).join(", ");
+        const named = others.map(pull => `PR ${pull.number}`).join(", ");
         throw new Refusal(`head ${result.head} heads open ${named} ${result.pr === undefined ? "and this review names no PR thread" : `besides PR ${result.pr}`}, and a commit status is per commit: a success posted here would satisfy their checks, though the gate did not pass for ${others.length === 1 ? "that PR" : "those PRs"}`,
           "push a distinct commit for each PR and post the gate from that PR's own head");
+      }
+      // The thread this gate posts for must be the PR that heads the commit now, merging into the reviewed base: a PR
+      // retargeted since its review would get a status for a different change.
+      if (result.pr !== undefined) {
+        const own = pulls.find(pull => pull.number === result.pr);
+        if (own === undefined) {
+          throw new Refusal(`the gate posts for PR ${result.pr}, and GitHub does not report it open at head ${result.head}`,
+            "check that the pull request is open at this head, or post the gate from the commit it now heads");
+        }
+        checkBase(cwd, result, own);
       }
     }
     // The spec's ledger has a `gate` event, so each evaluation is recorded: it is written here, never inside the pure

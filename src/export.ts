@@ -9,9 +9,18 @@ import { commitOid } from "./review-git.ts";
 type RecordEvent = Extract<LedgerEvent, { type: "record" }>;
 type EffectiveFinding = ReviewView["findings"][number];
 
+/**
+ * One finding as a hub argument. A hub argument has no field for the description, and `rationale` is where the hub reads
+ * one, so that is the field this fills: OCR and brief imports store the description in `text` alone, and a finding
+ * carried forward from an earlier review has no matching original hub argument to take words from. Dropping `text` here
+ * exported such a finding with its id, path and disposition and nothing said about it.
+ *
+ * A rationale already on the finding is left exactly as it is, and the substitution is framed because the hub reads that
+ * field as untrusted text.
+ */
 function hubFinding(finding: EffectiveFinding) {
-  const { text: _text, evidence: _evidence, ...args } = finding;
-  return args;
+  const { text, evidence: _evidence, ...args } = finding;
+  return finding.rationale === undefined && text !== undefined ? { ...args, rationale: frame(text) } : args;
 }
 
 function exportHub(event: RecordEvent, view: ReviewView): unknown {

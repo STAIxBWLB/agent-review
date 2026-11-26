@@ -29,12 +29,20 @@ the merge base with `origin`'s default branch. A stacked pull request therefore
 passes only once its base is `main`.
 
 `arev gate --post` writes one commit status, `arev/gate`, on the head, and only
-after a pass. It is the only GitHub write `arev` makes. The status goes to the
-repository `origin` names, never to one `gh` resolves for itself, and it is
-refused when the head belongs to more than one review thread in the ledger or
-to an open pull request the gate was not asked about: a commit status is per
-commit, so it would show as a pass on every other pull request at that head,
-including one opened after the status was posted.
+after a pass. It is the only GitHub write `arev` makes. Both the status and the
+pull-request read before it pin `github.com` and the repository `origin` names,
+never the host or repository `gh` resolves for itself, and the read takes every
+page. The status is refused when the head belongs to more than one review
+thread in the ledger or to an open pull request the gate was not asked about: a
+commit status is per commit, so it would show as a pass on every other pull
+request at that head, including one opened after the status was posted. For the
+pull request the review names, the gate also re-reads that pull request's base
+and refuses when its merge base with the head is not the reviewed one, so a
+retargeted pull request is re-reviewed rather than posted green.
+
+GitHub lists open pull requests for this endpoint only while the commit is
+outside the default branch, so a head already on `main` has no open pull
+request for a status to leak onto.
 
 ## Development
 

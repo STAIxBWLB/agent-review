@@ -39,9 +39,13 @@ page. The status is refused when the head belongs to more than one review
 thread in the ledger or to an open pull request the gate was not asked about: a
 commit status is per commit, so it would show as a pass on every other pull
 request at that head, including one opened after the status was posted. For the
-pull request the review names, the gate also re-reads that pull request's base
-and refuses when its merge base with the head is not the reviewed one, so a
-retargeted pull request is re-reviewed rather than posted green.
+pull request the review names, the gate also re-reads that pull request's base,
+and the rule it applies is that the pull request's current merge base must equal
+the reviewed one. The target branch is not what is checked: a base on another
+branch that merges into the same commit is the same change. A base that moved is
+refused, so a retargeted pull request is re-reviewed rather than posted green.
+Both gh calls give up after 15 seconds, and the refusal that reaches that bound
+names it and the retry.
 
 GitHub lists open pull requests for this endpoint only while the commit is
 outside the default branch, so a head already on `main` has no open pull

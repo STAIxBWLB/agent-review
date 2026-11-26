@@ -519,6 +519,15 @@ test("a secret-shaped report is refused before it is parsed, and its value reach
   expect(ledgerText.split("\n").filter(Boolean).map(line => JSON.parse(line)).filter(event => event.type === "record")).toEqual([]);
   expect(ledgerText).not.toContain(secretId);
 
+  // A JSON escape decodes past the raw screen (`\u0041` spells `A`), so the parsed report is screened as well.
+  const escapedPath = join(root, "escaped.json");
+  writeFileSync(escapedPath, JSON.stringify(reportFor(HEAD, { findings: [finding({ id: secretId })] }))
+    .replace(secretId, "\\u0041KIAABCDEFGHIJKLMNOP"));
+  const escaped = run(repo, home, "record", escapedPath);
+  expect(escaped.code).toBe(1);
+  expect(escaped.stderr).toContain("matches a secret pattern");
+  expect(escaped.stderr).not.toContain(secretId);
+
   // A value the screen does not catch is still named by its type, never echoed, and the head must be a full OID.
   const plainHead = run(repo, home, "record", write("plain-head.json", reportFor(HEAD, { packet: { id: PACKET, subject: { head: "not-a-full-sha" } } })));
   expect(plainHead.stderr).toContain("has no full commit SHA at packet.subject.head");

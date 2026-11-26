@@ -14,7 +14,7 @@ import { EXIT, errorLine } from "@staix/cli-output";
 import { parseReviewAnchor, reviewAnchorErrorMessage, type ReviewAnchor } from "./anchor.ts";
 import { blocksApproval, findingTally, findingsForHead, positionalFindingId, type ReviewFinding, type ReviewFindingSet, type ReviewFindingTally } from "./findings.ts";
 import { sanitize } from "./frame.ts";
-import { Refusal, appendEvent, readLedger, recordId, reviewProjectId, secretShaped, type LedgerEvent, type PacketBlock, type RecordFinding, type ReviewRecordV1 } from "./ledger.ts";
+import { Refusal, appendEvent, readLedger, recordId, reviewProjectId, secretShaped, stringsIn, type LedgerEvent, type PacketBlock, type RecordFinding, type ReviewRecordV1 } from "./ledger.ts";
 import { buildPacket, type PacketRequest } from "./packet.ts";
 import { PacketUsageError } from "./packet-cli.ts";
 import { DEFAULT_ADVISORY_CAP, MAX_ADVISORY_CAP } from "./review-md.ts";
@@ -41,6 +41,12 @@ const jsonType = (value: unknown): string =>
  */
 const echoName = (value: unknown): string =>
   typeof value === "string" && /^[A-Za-z0-9._:-]{1,96}$/.test(value) && !secretShaped(value) ? value : jsonType(value);
+/**
+ * A validated report string a refusal may print: the value itself, or `<withheld>` when it is secret-shaped. A `\u`
+ * escape decodes into a secret the raw-text screen cannot see, so this guard is what keeps the decoded value out of the
+ * message whichever field carried it.
+ */
+const shown = (value: string): string => secretShaped(value) ? "<withheld>" : value;
 
 /** A plain own-data object with only the named fields: accessors, proxies, hidden fields and inherited keys are refused. */
 function closed(raw: unknown, fields: readonly string[], what: string): Record<string, unknown> | undefined {
@@ -176,7 +182,7 @@ export function parseReviewRecord(raw: unknown, options: RecordOptions): ReviewR
   const covered = new Set([...reviewedRows.map(exactPath), ...skippedRows.map(entry => exactPath(own(entry, "path")))]);
   const missing = (options.packet.units ?? []).map(unit => unit.path).filter(path => !covered.has(path));
   if (missing.length > 0) {
-    refuse(`coverage omits ${missing.length} packet unit(s): ${missing.slice(0, 5).join(", ")}${missing.length > 5 ? ", ..." : ""}`,
+    refuse(`coverage omits ${missing.length} packet unit(s): ${missing.slice(0, 5).map(shown).join(", ")}${missing.length > 5 ? ", ..." : ""}`,
       "review or skip every unit in the packet's units, then run arev record again");
   }
 
@@ -215,7 +221,7 @@ export function parseReviewRecord(raw: unknown, options: RecordOptions): ReviewR
       // decision, and `arev gate` reads the disposition this writes. Only `arev resolve --as accepted` states it, and that
       // command needs a report of the id first, so the next step starts by recording the finding as open.
       refuse(`${at} states accepted; accepted is the person's decision and is not a report's to make`,
-        `record the finding as open, then run arev resolve ${id} --as accepted --rationale "<what was accepted>" from your own terminal`);
+        `record the finding as open, then run arev resolve ${shown(id)} --as accepted --rationale "<what was accepted>" from your own terminal`);
     }
     if (disposition === "false_positive" && !evidence?.length) {
       refuse(`${at} is a false_positive without evidence`, "add evidence (path:line or a command's output) that settles it, or record it as open");
@@ -472,6 +478,12 @@ export function recordCommand(cwd: string, args: readonly string[]): number {
     } catch {
       throw new Refusal(`${file} is not valid JSON`, "fix the report file and run arev record again");
     }
+    // The raw screen cannot see a JSON escape, which the parse has now decoded: `\u0041` spells `A`, so a report can carry
+    // a secret-shaped value past it. Every string the parsed report holds is screened the same way, still naming no value.
+    if ([...stringsIn(raw)].some(secretShaped)) {
+      throw new Refusal(`the report ${file} matches a secret pattern, so nothing from it was recorded or shown`,
+        "remove the secret-shaped value from the report, then write it again");
+    }
     const head = own(own(own(raw, "packet"), "subject"), "head");
     // The head is checked before it is ever echoed: it is report text, and the refusals below print it.
     if (typeof head !== "string" || !FULL_OID.test(head)) {
@@ -533,7 +545,7 @@ export function resolveCommand(cwd: string, args: readonly string[]): number {
     }
     if (as === "accepted" && rationale === undefined) throw new Refusal("--as accepted needs --rationale", `pass --rationale "<what was accepted>"`);
     if (as === "false_positive" && evidence.length === 0) {
-      throw new Refusal("--as false_positive needs --evidence", `pass --evidence path:line (or the command output) that settles ${id}`);
+      throw new Refusal("--as false_positive needs --evidence", `pass --evidence path:line (or the command output) that settles ${shown(id)}`);
     }
     const events = readLedger(cwd);
     const known = events.some(event => event.type === "record" && event.record.findings.some(finding => finding.id === id));

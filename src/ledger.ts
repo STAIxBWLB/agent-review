@@ -168,7 +168,7 @@ export function ledgerPath(cwd: string, options: { home?: string } = {}): string
 }
 
 /** Every string an event carries, keys included, as it was written: `JSON.stringify` escapes whitespace first. */
-function* stringsIn(value: unknown): Generator<string> {
+export function* stringsIn(value: unknown): Generator<string> {
   if (typeof value === "string") yield value;
   else if (Array.isArray(value)) for (const item of value) yield* stringsIn(item);
   else if (value && typeof value === "object") {

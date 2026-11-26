@@ -253,3 +253,82 @@ test("arev record without a packet for the head names the packet command", () =>
   expect(result.stderr).toContain(`no packet for head ${HEAD} is in the ledger`);
   expect(result.stderr).toContain("arev packet");
 });
+
+const SECRET = `ghp_${"a".repeat(36)}`;
+
+test("a refusal names the field, never the report text that filled it", () => {
+  const refusal = (raw: unknown, overrides = {}): string => {
+    try {
+      parseReviewRecord(raw, { ...options, ...overrides });
+    } catch (error) {
+      return (error as Error).message;
+    }
+    return "";
+  };
+  // A plain typo is still named, so the refusal keeps its use.
+  expect(refusal(reportFor(HEAD, { surpise: true }))).toContain("has an unknown field (surpise)");
+  // A secret-shaped value or key is replaced by its JSON type.
+  expect(refusal(reportFor(HEAD, { v: SECRET }))).toBe("the report's v must be the number 1 (got string); this arev reads v: 1");
+  expect(refusal(reportFor(HEAD, { [SECRET]: 1 }))).toContain("has an unknown field (string)");
+  expect(refusal(reportFor(HEAD, { reviewer: { id: "claude", modelFamily: "anthropic", started: "self", implementer: SECRET, sameFamilyFallback: false } }), { implementer: "codex" }))
+    .toContain("reviewer.implementer string");
+  expect(refusal(reportFor(HEAD, { findings: [finding(), finding({ id: "bugs:missing-frame" })] })))
+    .toContain("findings[1].id bugs:missing-frame repeats an earlier finding's id");
+});
+
+test("a secret-shaped report value never reaches stderr", () => {
+  const { root, repo, home } = fixture();
+  const write = (name: string, body: unknown) => {
+    const path = join(root, name);
+    writeFileSync(path, JSON.stringify(body));
+    return path;
+  };
+
+  // A head that cannot be a commit SHA is refused before it is echoed, so no packet event is needed.
+  const head = run(repo, home, "record", write("head.json", reportFor(HEAD, { packet: { id: PACKET, subject: { head: SECRET } } })));
+  expect(head.code).toBe(1);
+  expect(head.stderr).not.toContain(SECRET);
+  expect(head.stderr).toContain("has no full commit SHA at packet.subject.head");
+
+  // A report value is only reached once the ledger holds a packet for the head, so this is the real flow.
+  const commit = (body: string, message: string) => {
+    writeFileSync(join(repo, "a.ts"), body);
+    git(repo, ["add", "a.ts"]);
+    git(repo, ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", message]);
+    return gitOut(repo, ["rev-parse", "HEAD"]);
+  };
+  const base = commit("export const a = 1;\n", "base");
+  const packetHead = commit("export const a = 2;\n", "head");
+  const built = run(repo, home, "packet", "--from", base, "--to", packetHead, "--json");
+  expect(built.code).toBe(0);
+  const packet = JSON.parse(built.stdout);
+  const v = run(repo, home, "record", write("v.json", reportFor(packetHead, {
+    v: SECRET,
+    packet: { id: packet.id, subject: packet.subject },
+    coverage: { reviewed: packet.units.map((unit: { path: string }) => unit.path), skipped: [] },
+  })));
+  expect(v.code).toBe(1);
+  expect(v.stderr).not.toContain(SECRET);
+  expect(v.stderr).toContain("the report's v must be the number 1 (got string)");
+});
+
+test("the view takes its base and packet from the record, not from a later packet for the same head", () => {
+  const laterBase = "f".repeat(40);
+  const laterPacket = { ...packetFor(HEAD), id: "1".repeat(64), subject: { kind: "range", base: laterBase, head: HEAD, mergeBase: laterBase } };
+  const packet: LedgerEvent = { v: 1, type: "packet", at: "t0", packet: packetFor(HEAD) };
+  const record: LedgerEvent = { v: 1, type: "record", at: "t1", id: "record-1", record: recordAt(HEAD, [], "approved") };
+  const repacket: LedgerEvent = { v: 1, type: "packet", at: "t2", packet: laterPacket };
+
+  const view = ledgerEventsView([packet, record, repacket], HEAD);
+  expect(view.base).toBe(BASE);
+  expect(view.mergeBase).toBe(BASE);
+  expect(view.packet).toBe(PACKET);
+  expect(view.record).toBe("record-1");
+  expect(view.verdict).toBe("approved");
+
+  // With no record for the head, the newest packet event is still what the view describes.
+  const packetOnly = ledgerEventsView([packet, repacket], HEAD);
+  expect(packetOnly.base).toBe(laterBase);
+  expect(packetOnly.packet).toBe(laterPacket.id);
+  expect(packetOnly.record).toBeUndefined();
+});

@@ -4,6 +4,7 @@ import { commandUsage, commands, usage } from "./commands-table.ts";
 import { setupCommand } from "./setup.ts";
 import { mcpCommand } from "./mcp.ts";
 import { gateCommand } from "./gate.ts";
+import { hostCommand } from "./host.ts";
 import { Refusal } from "./ledger.ts";
 import { PacketUsageError, runPacket, runRules } from "./packet-cli.ts";
 import { recordCommand, resolveCommand, showCommand } from "./record.ts";
@@ -12,6 +13,7 @@ import { exportCommand } from "./export.ts";
 
 type Runner = (cwd: string, args: readonly string[]) => number | void;
 const RUN = {
+  host: hostCommand,
   packet: runPacket,
   rules: runRules,
   import: importCommand,

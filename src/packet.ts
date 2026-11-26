@@ -1,9 +1,10 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { lstatSync, readFileSync, realpathSync } from "node:fs";
-import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
+import { copyFileSync, lstatSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { isDenied } from "@staix/agent-mem/platform";
-import { frame, sanitize } from "./frame.ts";
+import { frame } from "./frame.ts";
 import { commitOid, globalIgnoreOptions, mergeBaseOid, repositoryRoot, reviewGit } from "./review-git.ts";
 import { readAttributes, readRules, renderRules, type RuleMissing, type RuleText } from "./rules.ts";
 
@@ -47,7 +48,7 @@ const LOCKFILES = new Set(["bun.lock", "bun.lockb", "package-lock.json", "yarn.l
 const RENAME_OPTIONS = ["-M", "-C", "--find-copies-harder"];
 const DIFF_OPTIONS = ["--no-ext-diff", "--no-textconv", "--no-color", "--ignore-submodules=dirty"];
 const FULL_OID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
-interface Group { status: string; paths: string[]; untracked?: true }
+interface Group { status: string; paths: string[]; opaque?: true }
 
 function prRefs(cwd: string, number: string): { base: string; head: string } {
   if (!/^[1-9][0-9]*$/.test(number)) throw new Error("Invalid PR number. Pass a positive integer to --pr.");
@@ -160,11 +161,46 @@ export function buildPacket(cwd: string, request: PacketRequest): PacketBundle {
   const workspace = request.kind === "workspace" || request.kind === "files";
   const scopes = request.kind === "files" ? request.paths.map(path => repositoryPath(cwd, root, path, true)) : [];
   if (request.kind === "files" && scopes.length === 0) throw new Error("No file scope given. Pass paths after --files.");
-  const trees = workspace ? [subject.head] : [subject.mergeBase, subject.head];
-  const gitOptions = workspace ? workspaceFilterOptions(root) : [];
+  if (!workspace) return buildPacketFromIndex(root, subject, scopes, []);
+  const gitOptions = [...workspaceFilterOptions(root), ...globalIgnoreOptions(root),
+    "-c", "core.splitIndex=false", "-c", "add.ignoreErrors=false"];
+  const untracked = names(checkedOutput(
+    reviewGit(root, [...gitOptions, "ls-files", "-z", "--others", "--exclude-standard"]),
+    "untracked paths",
+  ));
+  const opaque: Group[] = [], intent: string[] = [];
+  for (const path of untracked) {
+    const stat = lstatSync(resolve(root, path));
+    if (stat.isFile() || stat.isSymbolicLink()) intent.push(path);
+    else opaque.push({ status: "A", paths: [path], opaque: true });
+  }
+  if (!intent.length) return buildPacketFromIndex(root, subject, scopes, gitOptions, undefined, opaque);
+
+  // Pair workspace copies and renames in one inventory without changing the real index.
+  const indexPath = checkedOutput(reviewGit(root, ["rev-parse", "--git-path", "index"]), "the Git index path");
+  const temp = mkdtempSync(join(tmpdir(), "arev-index-"));
+  try {
+    const indexFile = join(temp, "index");
+    try { copyFileSync(resolve(root, indexPath.replace(/\r?\n$/, "")), indexFile); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    checkedOutput(reviewGit(root, [...gitOptions, "add", "--intent-to-add", "--pathspec-from-file=-", "--pathspec-file-nul"], {
+      indexFile, input: intent.join("\0") + "\0",
+    }), "untracked entries in the temporary Git index");
+    return buildPacketFromIndex(root, subject, scopes, gitOptions, indexFile, opaque);
+  } finally {
+    rmSync(temp, { recursive: true, force: true });
+  }
+}
+
+function buildPacketFromIndex(
+  root: string, subject: PacketSubject, scopes: string[], gitOptions: string[],
+  indexFile?: string, opaque: Group[] = [],
+): PacketBundle {
+  const trees = subject.kind === "workspace" || subject.kind === "files"
+    ? [subject.head] : [subject.mergeBase, subject.head];
   const diff = (options: string[], paths: readonly string[], maxBuffer?: number) =>
     reviewGit(root, [...gitOptions, `--attr-source=${subject.mergeBase}`, "diff", ...DIFF_OPTIONS,
-      ...options, ...trees, "--", ...paths], { maxBuffer: maxBuffer ?? 16 * 1024 * 1024 });
+      ...options, ...trees, "--", ...paths], { indexFile, maxBuffer: maxBuffer ?? 16 * 1024 * 1024 });
 
   const fields = names(checkedOutput(diff([...RENAME_OPTIONS, "--name-status", "-z"], []), "the changed paths"));
   let groups: Group[] = [];
@@ -188,13 +224,7 @@ export function buildPacket(cwd: string, request: PacketRequest): PacketBundle {
     throw new Error("Git changed-name inventory does not match the packet. Check for concurrent worktree edits and retry.");
   }
 
-  if (workspace) {
-    const untracked = checkedOutput(reviewGit(root, [...globalIgnoreOptions(root), "ls-files", "-z", "--others", "--exclude-standard", "--",
-      ...(scopes.includes(".") ? [] : scopes)]), "untracked paths");
-    for (const path of names(untracked)) {
-      if (!listed.has(path)) groups.push({ status: "A", paths: [path], untracked: true });
-    }
-  }
+  groups.push(...opaque);
   // Scope after pairing, so selecting only a public rename destination cannot hide its denied source.
   if (scopes.length && !scopes.includes(".")) {
     groups = groups.filter(group => group.paths.some(path =>
@@ -217,23 +247,12 @@ export function buildPacket(cwd: string, request: PacketRequest): PacketBundle {
       excluded.push({ path, reason: "denied" });
       continue;
     }
-    if (group.untracked) {
-      const stat = lstatSync(resolve(root, path));
-      if (!stat.isFile() && !stat.isSymbolicLink()) {
-        throw new Error(`Untracked path ${sanitize(JSON.stringify(path))} is not a regular file or symlink. Use --files to select reviewable files.`);
-      }
+    if (group.opaque) {
+      excluded.push({ path, reason: "binary" });
+      continue;
     }
 
-    const readDiff = (option: string[], limit?: number) => group.untracked
-      ? reviewGit(root, [...gitOptions, `--attr-source=${subject.mergeBase}`, "diff", ...DIFF_OPTIONS, "--no-index", ...option,
-          "--", "/dev/null", path], { maxBuffer: limit ?? 16 * 1024 * 1024 })
-      : diff([...RENAME_OPTIONS, ...(group.status === "C" ? ["--diff-filter=CR"] : []), ...option], group.paths, limit);
-    const diffText = (result: ReturnType<typeof reviewGit>, label: string) =>
-      group.untracked && result.status === 1 ? result.stdout : checkedOutput(result, label);
-
-    const counts = group.untracked
-      ? parseNumstat(diffText(readDiff(["--numstat", "-z"]), "file counts")).get(path)
-      : trackedCounts.get(path);
+    const counts = trackedCounts.get(path);
     if (!counts) throw new Error("Git file counts changed while building the packet. Stabilize the worktree and retry.");
     if (counts.binary) {
       excluded.push({ path, reason: "binary" });
@@ -245,13 +264,14 @@ export function buildPacket(cwd: string, request: PacketRequest): PacketBundle {
       excluded.push({ path, reason: "generated" });
       continue;
     }
-    const patch = readDiff(["--patch", "--submodule=short"], MAX_PATCH_BYTES + 1);
+    const patch = diff([...RENAME_OPTIONS, ...(group.status === "C" ? ["--diff-filter=CR"] : []),
+      "--patch", "--submodule=short"], group.paths, MAX_PATCH_BYTES + 1);
     if ((patch.error as NodeJS.ErrnoException | undefined)?.code === "ENOBUFS" ||
         Buffer.byteLength(patch.stdout ?? "") > MAX_PATCH_BYTES) {
       excluded.push({ path, reason: "too large" });
       continue;
     }
-    const text = diffText(patch, "a file patch");
+    const text = checkedOutput(patch, "a file patch");
     patchBytes += Buffer.byteLength(text);
     if (patchBytes > MAX_PACKET_BYTES) throw new Error("Combined review patches exceed 8 MiB. Choose a smaller subject.");
     patches.push(text);

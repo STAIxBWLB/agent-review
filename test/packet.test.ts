@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { copyFileSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { coverageGap, repositoryPath, type ReviewPacket } from "../src/packet.ts";
@@ -257,4 +257,42 @@ test("workspace inventory honors the effective ignore file from system Git confi
   expect(result.status).toBe(0);
   assertParity(JSON.parse(result.stdout), git("ls-files", "--others", "--exclude-standard", "-z").split("\0").filter(Boolean));
   expect(result.stdout).not.toContain("system-ignored.txt");
+});
+
+test("unstaged renames and copies of denied sources stay out of workspace artifacts", () => {
+  const { dir, git, write } = fixture();
+  write(".env.old", "DENIED_RENAME_FIXTURE\n".repeat(8));
+  write(".env", "DENIED_COPY_FIXTURE\n".repeat(8));
+  write("ordinary.txt", "before\n");
+  git("add", ".");
+  git("commit", "-qm", "base");
+  const index = join(dir, ".git", "index");
+  const indexBefore = readFileSync(index);
+  renameSync(join(dir, ".env.old"), join(dir, "renamed.txt"));
+  copyFileSync(join(dir, ".env"), join(dir, "copied.txt"));
+  write("ordinary.txt", "after\n");
+
+  const workspace = isolatedPacket(dir, { kind: "workspace" });
+  const scoped = isolatedPacket(dir, { kind: "files", paths: ["renamed.txt", "copied.txt"] });
+  for (const bundle of [workspace, scoped]) {
+    expect(bundle.packet.excluded).toEqual(expect.arrayContaining([
+      { path: "renamed.txt", reason: "denied" }, { path: "copied.txt", reason: "denied" },
+    ]));
+    expect(bundle.diff).not.toContain("DENIED_");
+    expect(bundle.brief).not.toContain("DENIED_");
+  }
+  expect(workspace.diff).toContain("+after");
+  expect(readFileSync(index)).toEqual(indexBefore);
+});
+
+test("an untracked nested repository is an opaque exclusion", () => {
+  const { dir, git, write } = fixture();
+  git("commit", "--allow-empty", "-qm", "base");
+  git("init", "-q", "nested");
+  write("nested/local.txt", "opaque fixture content\n");
+  write("ordinary.txt", "ordinary fixture content\n");
+  const bundle = isolatedPacket(dir, { kind: "files", paths: ["."] });
+  expect(bundle.packet.excluded).toContainEqual({ path: "nested/", reason: "binary" });
+  expect(bundle.diff).not.toContain("opaque fixture content");
+  expect(bundle.diff).toContain("ordinary fixture content");
 });

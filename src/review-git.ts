@@ -12,8 +12,14 @@ const gitOptions = () => ({
 export function reviewGit(cwd: string, args: string[], options: {
   input?: string;
   maxBuffer?: number;
+  indexFile?: string;
 } = {}) {
-  return memoryGitSync(gitArgs(cwd, args), { ...gitOptions(), encoding: "utf8", ...options });
+  const { indexFile, ...limits } = options;
+  const defaults = gitOptions();
+  return memoryGitSync(gitArgs(cwd, args), {
+    ...defaults, encoding: "utf8", ...limits,
+    ...(indexFile === undefined ? {} : { env: { ...defaults.env, GIT_INDEX_FILE: indexFile } }),
+  });
 }
 
 export function reviewBlob(cwd: string, object: string) {

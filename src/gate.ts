@@ -58,26 +58,58 @@ const shownHead = (value: string): string =>
   HEX.test(value) ? ` (got ${value})` : ` (got ${value.length} characters that are not a hexadecimal commit SHA)`;
 
 /**
- * The bound both gh calls take, the same one `arev packet --pr` gives its own `gh pr view` (src/packet.ts): a metadata
- * read or a status write that has not answered in fifteen seconds is a network that is not going to, and the gate is
- * meant to be runnable in a hook.
+ * The bound both gh calls take for time, the same one `arev packet --pr` gives its own `gh pr view` (src/packet.ts): a
+ * metadata read or a status write that has not answered in fifteen seconds is a network that is not going to, and the
+ * gate is meant to be runnable in a hook.
  */
 const GH_TIMEOUT_MS = 15_000;
-const GH_MAX_BUFFER = 32_000;
-/** Both gh calls here are repeatable, so a call that ran out of time is answered with the retry rather than a repair. */
-const GH_TIMEOUT_NEXT = "retry arev gate --post once github.com is reachable from this machine";
+/**
+ * A status write answers with one small object, so its reply bound stays narrow. The pulls read cannot: the endpoint
+ * returns whole pull request objects, bodies included - one open pull request with a 3,574-byte body measured 19,779
+ * bytes - so two of them overflow a metadata-sized bound. It takes the bound every git read in `src/review-git.ts`
+ * takes instead. A reply over either bound is refused by its size, never as a timeout: the same call returns the same.
+ */
+const GH_WRITE_MAX_BUFFER = 32_000;
+const GH_READ_MAX_BUFFER = 16 * 1024 * 1024;
 
-/** A gh call `spawnSync` killed on that bound: no status, and either the timeout error or the signal that ended it. */
-const timedOut = (result: { status: number | null; error?: Error; signal?: string | null }): boolean =>
-  result.status === null && ((result.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT" || result.signal === "SIGTERM");
+/** One finished `gh` call. A bound `spawnSync` enforced, and a buffer it filled, arrive as `error`, not as a status. */
+interface GhCall {
+  status: number | null;
+  stdout: string;
+  stderr: string;
+  error?: Error;
+  signal?: string | null;
+}
+
+const errorCode = (call: GhCall): string | undefined => (call.error as NodeJS.ErrnoException | undefined)?.code;
 
 /**
- * What a refusal may say about a failed `gh` call. A call that ran out of time printed nothing to screen, so the bound
- * is the detail; otherwise gh's own first line goes through `shown`, because it is data read from outside arev.
+ * A refused call, whichever way it says so, and read before the status: a child that ignores the signal it is sent
+ * exits 0 while `spawnSync` still reports `ETIMEDOUT`, and a reply that filled `maxBuffer` exits 0 as well. Testing
+ * `status !== 0` alone would read both as a success - the first as an answer that never came, the second by handing a
+ * truncated reply to `JSON.parse`.
  */
-const ghDetail = (result: { status: number | null; stdout: string; stderr: string; error?: Error; signal?: string | null }): string =>
-  timedOut(result) ? `gh did not answer within ${GH_TIMEOUT_MS / 1000} s`
-    : shown((result.stderr || result.stdout || "").trim().split("\n").filter(Boolean)[0] ?? `gh exited ${result.status}`);
+const failed = (call: GhCall): boolean => call.error !== undefined || call.status !== 0;
+
+/**
+ * A call that ran out of its bound: the error code, or - only when the call carries no error of its own - the signal
+ * that ended it. The signal cannot decide on its own: a reply that fills `maxBuffer` also ends with the child signalled
+ * (measured: `ENOBUFS` beside `SIGTERM`), and reading that as a timeout would name a bound it never reached.
+ */
+const timedOut = (call: GhCall): boolean => errorCode(call) === "ETIMEDOUT" || (call.error === undefined && call.signal === "SIGTERM");
+
+/** A reply that reached `maxBuffer`, where what came back is a prefix of it. */
+const overBuffer = (call: GhCall): boolean => errorCode(call) === "ENOBUFS";
+
+/**
+ * What a refusal may say about a failed `gh` call: the bound it ran out of, the buffer it filled, or gh's own first
+ * line through `shown`, because that line is data read from outside arev.
+ */
+const ghDetail = (call: GhCall, maxBuffer: number): string =>
+  timedOut(call) ? `gh did not answer within ${GH_TIMEOUT_MS / 1000} s`
+    : overBuffer(call) ? `gh printed more than the ${maxBuffer} bytes this call keeps`
+      : shown((call.stderr || call.stdout || "").trim().split("\n").filter(Boolean)[0] ?? `gh exited ${call.status}`);
+
 
 /**
  * The gate's decision, with no output and no side effect. `head` defaults to the repository's current HEAD, and `pr`
@@ -176,14 +208,16 @@ interface PullRequest {
  * The open pull requests GitHub says have this commit as their head: a metadata read, and the only gh call besides the
  * status write (AC5). The ledger cannot answer this one - a PR arev never built a packet for is the case it misses.
  */
-function openPrsAt(cwd: string, repository: string, head: string): PullRequest[] {
+function openPrsAt(cwd: string, repository: string, head: string, retry: string): PullRequest[] {
   // `--hostname` is pinned because `GH_HOST` or gh's own default would send this read, and the status write with it, to
   // another host. `--paginate --slurp` reads every page: a second page can hold an open PR at this head too.
   const result = spawnSync("gh", ["api", "--hostname", "github.com", "--paginate", "--slurp", `repos/${repository}/commits/${head}/pulls`],
-    { cwd, encoding: "utf8", timeout: GH_TIMEOUT_MS, maxBuffer: GH_MAX_BUFFER });
-  if (result.status !== 0) {
-    throw new Refusal(`cannot read the open pull requests at ${head}: ${ghDetail(result)}`,
-      timedOut(result) ? GH_TIMEOUT_NEXT : "check that gh is authenticated and may read this repository's pull requests");
+    { cwd, encoding: "utf8", timeout: GH_TIMEOUT_MS, maxBuffer: GH_READ_MAX_BUFFER });
+  if (failed(result)) {
+    throw new Refusal(`cannot read the open pull requests at ${head}: ${ghDetail(result, GH_READ_MAX_BUFFER)}`,
+      timedOut(result) ? retry
+        : overBuffer(result) ? `read the same list by hand (gh api --hostname github.com repos/${repository}/commits/${head}/pulls); the reply is larger than arev keeps, and the same read returns the same list`
+          : "check that gh is authenticated and may read this repository's pull requests");
   }
   let parsed: unknown;
   try { parsed = JSON.parse(result.stdout); } catch { parsed = undefined; }
@@ -241,7 +275,7 @@ function checkBase(cwd: string, result: GateResult, pull: PullRequest): void {
  * Post the `arev/gate` success status for a head the gate just passed. The description names the record, so the status
  * on the commit says which review it stands for. Nothing here decides whether to post.
  */
-export function postStatus(head: string, record: string, repository: string, cwd: string): void {
+export function postStatus(head: string, record: string, repository: string, cwd: string, retry: string): void {
   const description = `${STATUS_CONTEXT}: record ${record}`;
   if (Buffer.byteLength(description) > 140) {
     throw new Refusal(`the status description would be ${Buffer.byteLength(description)} bytes; a commit status allows 140`,
@@ -250,10 +284,12 @@ export function postStatus(head: string, record: string, repository: string, cwd
   // The host is pinned for the write as well: `GH_HOST` would otherwise decide where this status lands.
   const result = spawnSync("gh", ["api", "--hostname", "github.com", "--method", "POST", `repos/${repository}/statuses/${head}`,
     "-f", "state=success", "-f", `context=${STATUS_CONTEXT}`, "-f", `description=${description}`],
-    { cwd, encoding: "utf8", timeout: GH_TIMEOUT_MS, maxBuffer: GH_MAX_BUFFER });
-  if (result.status !== 0) {
-    throw new Refusal(`cannot post the ${STATUS_CONTEXT} status on ${head}: ${ghDetail(result)}`,
-      timedOut(result) ? GH_TIMEOUT_NEXT : "check that gh is authenticated and the token may write commit statuses for this repository");
+    { cwd, encoding: "utf8", timeout: GH_TIMEOUT_MS, maxBuffer: GH_WRITE_MAX_BUFFER });
+  if (failed(result)) {
+    throw new Refusal(`cannot post the ${STATUS_CONTEXT} status on ${head}: ${ghDetail(result, GH_WRITE_MAX_BUFFER)}`,
+      timedOut(result) ? retry
+        : overBuffer(result) ? "check with gh auth status that the token may write commit statuses for this repository; gh's reply to the same write does not get smaller"
+          : "check that gh is authenticated and the token may write commit statuses for this repository");
   }
 }
 
@@ -317,6 +353,11 @@ export function gateCommand(cwd: string, args: readonly string[]): number {
       ...(result.record === undefined ? {} : { record: result.record }),
       ...(result.open.length === 0 ? {} : { open: result.open }),
     });
+    // The retry a timed-out call is answered with names the subject this run gated, so it gates the same one: `--head`
+    // is the resolved full OID (validated above, so it is echoed only as the SHA it is), and `--pr` is passed through
+    // when the run was given one, `none` included.
+    const retry = ["retry arev gate --post", `--head ${result.head}`, ...(prFlag === undefined ? [] : [`--pr ${prFlag}`]),
+      "once github.com is reachable from this machine"].join(" ");
     // A commit status belongs to the commit, not to the PR: on a head more than one thread reviewed, a success posted
     // from one PR's pass shows on every other PR's checks, which is a status the gate did not pass there. The plain gate
     // still answers for the thread it was asked about; only the post refuses, and it refuses before any GitHub call.
@@ -339,7 +380,7 @@ export function gateCommand(cwd: string, args: readonly string[]): number {
     let repository: string | undefined;
     if (parsed.flags["--post"] !== undefined && result.ok && result.record !== undefined) {
       repository = statusRepository(cwd);
-      const pulls = openPrsAt(cwd, repository, result.head);
+      const pulls = openPrsAt(cwd, repository, result.head, retry);
       const others = pulls.filter(pull => pull.number !== result.pr);
       if (others.length > 0) {
         const named = others.map(pull => `PR ${pull.number}`).join(", ");
@@ -364,7 +405,7 @@ export function gateCommand(cwd: string, args: readonly string[]): number {
         else for (const line of [`gate: fails at ${result.head}`, ...result.open.map(condition => `  ${condition}`)]) console.log(line);
         return EXIT.fail;
       }
-      postStatus(result.head, result.record, repository!, cwd);
+      postStatus(result.head, result.record, repository!, cwd, retry);
       appendEvent(cwd, { v: 1, type: "post", at: new Date().toISOString(), head: result.head, record: result.record, status: "success" });
     }
     if (parsed.flags["--json"] !== undefined) {

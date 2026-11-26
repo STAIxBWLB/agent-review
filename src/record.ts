@@ -14,12 +14,12 @@ import { EXIT, errorLine } from "@staix/cli-output";
 import { parseReviewAnchor, reviewAnchorErrorMessage, type ReviewAnchor } from "./anchor.ts";
 import { blocksApproval, findingTally, findingsForHead, positionalFindingId, type ReviewFinding, type ReviewFindingSet, type ReviewFindingTally } from "./findings.ts";
 import { sanitize } from "./frame.ts";
-import { Refusal, appendEvent, readLedger, recordId, reviewProjectId, secretShaped, stringsIn, type LedgerEvent, type PacketBlock, type RecordFinding, type ReviewRecordV1 } from "./ledger.ts";
+import { MAX_REPORT_BYTES, Refusal, appendEvent, readLedger, recordId, reviewProjectId, secretShaped, stringsIn, type LedgerEvent, type PacketBlock, type RecordFinding, type ReviewRecordV1 } from "./ledger.ts";
 import { buildPacket, type PacketRequest } from "./packet.ts";
 import { PacketUsageError } from "./packet-cli.ts";
 import { DEFAULT_ADVISORY_CAP, MAX_ADVISORY_CAP } from "./review-md.ts";
 
-const MAX_REPORT_BYTES = 1024 * 1024, MAX_FINDINGS = MAX_ADVISORY_CAP, MAX_FINDING_BYTES = 64 * 1024;
+const MAX_FINDINGS = MAX_ADVISORY_CAP, MAX_FINDING_BYTES = 64 * 1024;
 const MAX_ID = 96, MAX_PATH = 512, MAX_TEXT = 2048, MAX_REF = 512, MAX_NAME = 128, MAX_FAMILY = 64, MAX_EVIDENCE = 16;
 const TERMS = ["bugs", "security", "compliance"] as const, SEVERITIES = ["blocking", "advisory"] as const;
 const DISPOSITIONS = ["open", "fixed", "false_positive", "accepted"] as const, ORIGINS = ["introduced", "pre_existing", "indeterminate"] as const;
@@ -31,6 +31,8 @@ function refuse(message: string, next: string): never {
 }
 
 const FULL_OID = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
+/** A commit id as a caller may type it on the command line: hexadecimal, full or abbreviated. */
+const COMMITISH = /^(?:[a-f0-9]{4,64})$/;
 /** A packet id is the sha256 of the packet's canonical JSON: a report's claim on it is checked before it is looked up. */
 const PACKET_ID = /^[a-f0-9]{64}$/;
 /** A review thread is a PR number, in the shape `arev packet --pr` takes it. */
@@ -153,7 +155,7 @@ export function parseReviewRecord(raw: unknown, options: RecordOptions): ReviewR
   const declaredImplementer = optionalText(reviewerRow, "implementer", MAX_NAME, "reviewer.implementer");
   const flaggedImplementer = options.implementer === undefined ? undefined : cliText(options.implementer, MAX_NAME, "--implementer");
   if (declaredImplementer !== undefined && flaggedImplementer !== undefined && declaredImplementer !== flaggedImplementer) {
-    refuse(`--implementer ${flaggedImplementer} disagrees with the report's reviewer.implementer ${echoName(declaredImplementer)}`,
+    refuse(`--implementer ${shown(flaggedImplementer)} disagrees with the report's reviewer.implementer ${echoName(declaredImplementer)}`,
       "drop one of them; --implementer overrides only when the report states none");
   }
   if (typeof reviewerRow.sameFamilyFallback !== "boolean") refuse("reviewer.sameFamilyFallback must be true or false", "set it in the report: true when the reviewer is the implementer's family and the gate may allow it");
@@ -334,29 +336,67 @@ function threadsAtHead(events: readonly LedgerEvent[], head: string): (number | 
 }
 
 /**
- * The thread of one head: `--pr` when the caller named it, else the only thread that head carries. A head SHA two PRs
- * share - one branch opened against two bases - has a packet and a record for each, and no default read is right there,
- * so it is refused by name with the candidates rather than answered with whichever event was written last.
+ * The threads a head is *reviewed* in: only those with a record there. A packet with no report yet is a review nobody
+ * filed, so it must not make a head ambiguous - `arev packet --pr 8` at a head already reviewed without a PR would
+ * otherwise hide that review behind a refusal.
  */
-function threadAtHead(events: readonly LedgerEvent[], head: string, pr?: number): number | undefined {
-  const threads = threadsAtHead(events, head);
-  if (pr !== undefined) {
-    if (!threads.includes(pr)) {
-      const numbers = threads.filter((thread): thread is number => thread !== undefined);
-      throw new Refusal(`no packet or record at head ${head} belongs to PR ${pr}`,
-        threads.length === 0 ? `run arev packet --pr ${pr} for that head, then write its review there`
-          : numbers.length === 0 ? "this head's review names no PR; drop --pr"
-            : `pass --pr ${numbers.join(" or --pr ")} for this head`);
+function recordedThreadsAtHead(events: readonly LedgerEvent[], head: string): (number | undefined)[] {
+  const threads: (number | undefined)[] = [];
+  for (const event of events) {
+    if (event.type !== "record" || event.record.packet.subject.head !== head) continue;
+    const thread = threadOf(event.record.packet.subject);
+    if (!threads.includes(thread)) threads.push(thread);
+  }
+  return threads;
+}
+
+/**
+ * The review thread a caller names: a PR number, or `none` for the thread with no PR - the exact-head review a packet
+ * built without `--pr` produces. `undefined` means undecided, never "the thread with no PR".
+ */
+type ThreadSelector = number | "none";
+
+/** The spellings to pass, in the ledger's own order, so a refusal's next step is a command a person can copy. */
+const prFlags = (threads: readonly (number | undefined)[]): string =>
+  threads.map(thread => thread === undefined ? "--pr none" : `--pr ${thread}`).join(" or ");
+
+/**
+ * The thread of one head: the selector a caller named, else the one thread that head is reviewed in. A head SHA two PRs
+ * share - one branch opened against two bases - has a record for each, and no default read is right there, so it is
+ * refused by name with the candidates rather than answered with whichever event was written last. A head with no record
+ * at all still names the thread of its packet, so `arev show` can report a packet nobody has reviewed yet.
+ */
+function threadAtHead(events: readonly LedgerEvent[], head: string, selector?: ThreadSelector): number | undefined {
+  const present = threadsAtHead(events, head);
+  if (selector === "none") {
+    if (!present.includes(undefined)) {
+      throw new Refusal(`no packet or record at head ${shown(head)} has no PR`,
+        present.length === 0 ? "run arev packet for that head first" : `pass ${prFlags(present)} for this head`);
     }
-    return pr;
+    return undefined;
   }
-  if (threads.length > 1) {
-    const numbers = threads.filter((thread): thread is number => thread !== undefined);
-    throw new Refusal(`head ${head} is reviewed in more than one thread (${threads.map(thread => thread === undefined ? "no PR" : `PR ${thread}`).join(", ")}), so arev cannot tell which review you mean`,
-      numbers.length === threads.length ? `pass --pr ${numbers.join(" or --pr ")} to choose the review thread`
-        : "pass --pr <n> for the PR you mean; a head reviewed once with --pr and once without cannot be told apart");
+  if (selector !== undefined) {
+    if (!present.includes(selector)) {
+      const numbers = present.filter((thread): thread is number => thread !== undefined);
+      throw new Refusal(`no packet or record at head ${shown(head)} belongs to PR ${selector}`,
+        present.length === 0 ? `run arev packet --pr ${selector} for that head, then write its review there`
+          : numbers.length === 0 ? "this head's review names no PR; drop --pr"
+            : `pass ${prFlags(present)} for this head`);
+    }
+    return selector;
   }
-  return threads[0];
+  const recorded = recordedThreadsAtHead(events, head);
+  if (recorded.length > 1) {
+    throw new Refusal(`head ${shown(head)} is reviewed in more than one thread (${recorded.map(thread => thread === undefined ? "no PR" : `PR ${thread}`).join(", ")}), so arev cannot tell which review you mean`,
+      `pass ${prFlags(recorded)} to choose the review thread`);
+  }
+  if (recorded.length === 1) return recorded[0];
+  // Unreviewed, and only packets: more than one thread there is still two things to mean, so it is refused the same way.
+  if (present.length > 1) {
+    throw new Refusal(`head ${shown(head)} has packets for more than one thread (${present.map(thread => thread === undefined ? "no PR" : `PR ${thread}`).join(", ")}), so arev cannot tell which review you mean`,
+      `pass ${prFlags(present)} to choose the review thread`);
+  }
+  return present[0];
 }
 
 /**
@@ -368,18 +408,21 @@ function threadAtHead(events: readonly LedgerEvent[], head: string, pr?: number)
  * head it was recorded at, carrying the severity and term of the latest report of it, so settling a blocking finding once
  * settles it for later heads of the same PR too. A resolve naming an id no report of the thread carried is ignored.
  */
-export function ledgerEventsView(events: readonly LedgerEvent[], head?: string, pr?: number): ReviewView {
+export function ledgerEventsView(events: readonly LedgerEvent[], head?: string, pr?: ThreadSelector): ReviewView {
   // `--pr N` without `--head` reads that PR's newest review: a caller that knows the thread need not name a head, and a
-  // head two PRs share cannot answer for both.
-  const newest = (type: LedgerEvent["type"], thread?: number) => [...events].reverse().find(event =>
-    event.type === type && (thread === undefined || threadOf(subjectOf(event)) === thread));
-  const lastRecord = newest("record", pr), lastPacket = newest("packet", pr);
+  // head two PRs share cannot answer for both. `--pr none` is a thread too - the one with no PR - so it is `null` here
+  // rather than `undefined`, which means "no thread named, take any".
+  const selected = pr === "none" ? null : pr;
+  const threadOfEvent = (event: LedgerEvent): number | undefined => threadOf(subjectOf(event));
+  const newest = (type: LedgerEvent["type"]) => [...events].reverse().find(event =>
+    event.type === type && (selected === undefined || threadOfEvent(event) === (selected ?? undefined)));
+  const lastRecord = newest("record"), lastPacket = newest("packet");
   const target = head
     ?? (lastRecord?.type === "record" ? lastRecord.record.packet.subject.head : undefined)
     ?? (lastPacket?.type === "packet" ? lastPacket.packet.subject.head : undefined);
-  // The thread is the target head's own: `--pr` when the caller named it, else the only one that head carries, refused by
-  // name when a head carries two. Every selection below is scoped to it.
-  const thread = target === undefined ? pr : threadAtHead(events, target, pr);
+  // The thread is the target head's own: the selector when the caller named one, else the only thread that head is
+  // reviewed in, refused by name when a head carries two. Every selection below is scoped to it.
+  const thread = target === undefined ? selected ?? undefined : threadAtHead(events, target, pr);
   const atTarget = (event: LedgerEvent): boolean => {
     const subject = subjectOf(event);
     return subject !== undefined && subject.head === target && threadOf(subject) === thread;
@@ -592,7 +635,7 @@ export function recordCommand(cwd: string, args: readonly string[]): number {
   }
 }
 
-/** `arev resolve <finding-id> --as fixed|false_positive|accepted [--evidence REF]... [--rationale TEXT] [--head SHA] [--pr N] [--json]`. */
+/** `arev resolve <finding-id> --as fixed|false_positive|accepted [--evidence REF]... [--rationale TEXT] [--head SHA] [--pr N|none] [--json]`. */
 export function resolveCommand(cwd: string, args: readonly string[]): number {
   const parsed = parseArgs(args, { value: ["--as", "--evidence", "--rationale", "--head", "--pr"], boolean: ["--json"] });
   if (!parsed) return usageError("resolve takes one finding id and --as fixed|false_positive|accepted, with --evidence, --rationale, --head or --pr");
@@ -601,8 +644,10 @@ export function resolveCommand(cwd: string, args: readonly string[]): number {
   const as = parsed.flags["--as"]?.at(-1);
   if (as !== "fixed" && as !== "false_positive" && as !== "accepted") return usageError("resolve needs --as fixed, --as false_positive or --as accepted");
   const prFlag = parsed.flags["--pr"]?.at(-1);
-  if (prFlag !== undefined && !PR_NUMBER.test(prFlag)) return usageError("Invalid PR number. Pass a positive integer to --pr.");
-  const pr = prFlag === undefined ? undefined : Number(prFlag);
+  if (prFlag !== undefined && prFlag !== "none" && !PR_NUMBER.test(prFlag)) return usageError("Invalid PR number. Pass a positive integer to --pr, or none for a review with no PR.");
+  const pr: ThreadSelector | undefined = prFlag === undefined ? undefined : prFlag === "none" ? "none" : Number(prFlag);
+  const headFlag = parsed.flags["--head"]?.at(-1);
+  if (headFlag !== undefined && !COMMITISH.test(headFlag)) return usageError("--head must be a commit SHA: 4 to 64 hexadecimal characters");
   try {
     const evidence = (parsed.flags["--evidence"] ?? []).map((ref, index) => cliText(ref, MAX_REF, `--evidence[${index}]`));
     const rationale = parsed.flags["--rationale"]?.at(-1);
@@ -615,10 +660,11 @@ export function resolveCommand(cwd: string, args: readonly string[]): number {
     }
     const events = readLedger(cwd);
     // `--pr N` resolves inside that thread, and without `--head` it reads that PR's newest record rather than the ledger's
-    // newest: two PRs can share a head, and the newest record there belongs to whichever was recorded last.
+    // newest: two PRs can share a head, and the newest record there belongs to whichever was recorded last. `--pr none`
+    // is the thread with no PR, so it reads the newest record that names none.
     const newestRecord = [...events].reverse().find(event => event.type === "record"
-      && (pr === undefined || threadOf(event.record.packet.subject) === pr));
-    const head = parsed.flags["--head"]?.at(-1) ?? (newestRecord?.type === "record" ? newestRecord.record.packet.subject.head : undefined);
+      && (pr === undefined || threadOf(event.record.packet.subject) === (pr === "none" ? undefined : pr)));
+    const head = headFlag ?? (newestRecord?.type === "record" ? newestRecord.record.packet.subject.head : undefined);
     if (!head) throw new Refusal("the ledger has no head to resolve against", "pass --head <sha> or record a review first");
     // The thread is the head's own: `--pr` when given, else the only thread that head carries, refused when it carries
     // more than one. The resolve states it on the event, and it refuses an id that thread never reported, so one PR's
@@ -648,20 +694,23 @@ export function resolveCommand(cwd: string, args: readonly string[]): number {
   }
 }
 
-/** `arev show [--head SHA] [--pr N] [--json]`. */
+/** `arev show [--head SHA] [--pr N|none] [--json]`. */
 export function showCommand(cwd: string, args: readonly string[]): number {
   const parsed = parseArgs(args, { value: ["--head", "--pr"], boolean: ["--json"] });
-  if (!parsed) return usageError("show takes --head <sha>, --pr <n> and --json");
+  if (!parsed) return usageError("show takes --head <sha>, --pr <n|none> and --json");
   if (parsed.positionals.length > 0) return usageError(`show takes no arguments after its flags (got ${parsed.positionals.length})`);
   const prFlag = parsed.flags["--pr"]?.at(-1);
-  if (prFlag !== undefined && !PR_NUMBER.test(prFlag)) return usageError("Invalid PR number. Pass a positive integer to --pr.");
+  if (prFlag !== undefined && prFlag !== "none" && !PR_NUMBER.test(prFlag)) return usageError("Invalid PR number. Pass a positive integer to --pr, or none for a review with no PR.");
+  const pr: ThreadSelector | undefined = prFlag === undefined ? undefined : prFlag === "none" ? "none" : Number(prFlag);
+  const headFlag = parsed.flags["--head"]?.at(-1);
+  if (headFlag !== undefined && !COMMITISH.test(headFlag)) return usageError("--head must be a commit SHA: 4 to 64 hexadecimal characters");
   try {
     const events = readLedger(cwd);
     if (events.length === 0) {
       console.log(`no review ledger for ${reviewProjectId(cwd)} yet; next: arev packet --pr N --out DIR`);
       return EXIT.ok;
     }
-    const view = ledgerEventsView(events, parsed.flags["--head"]?.at(-1), prFlag === undefined ? undefined : Number(prFlag));
+    const view = ledgerEventsView(events, headFlag, pr);
     if (parsed.flags["--json"] !== undefined) {
       console.log(JSON.stringify(view, null, 2));
       return EXIT.ok;

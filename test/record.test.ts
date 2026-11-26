@@ -289,6 +289,43 @@ test("a head two PRs share is refused without --pr, and each thread reads only i
   expect(() => ledgerEventsView(events, HEAD, 9)).toThrow(`no packet or record at head ${HEAD} belongs to PR 9`);
 });
 
+test("a packet at a head reviewed without a PR does not make it ambiguous, and --pr none names that review", () => {
+  // A range review with no PR, then `arev packet --pr 8` for the same head. One review exists there, so the default read
+  // is that review: a packet with no report is a review nobody filed, and refusing it would hide a real one.
+  const events: LedgerEvent[] = [
+    { v: 1, type: "packet", at: "t0", packet: packetFor(HEAD, null) },
+    { v: 1, type: "record", at: "t1", id: "record-none", record: recordAt(HEAD, [finding({ id: "bugs:none-only" })], "changes_requested", { ok: true }, null) },
+    { v: 1, type: "packet", at: "t2", packet: { ...packetFor(HEAD, 8), id: "8".repeat(64) } },
+  ];
+  const none = ledgerEventsView(events, HEAD);
+  expect(none).toMatchObject({ record: "record-none" });
+  expect(none.pr).toBeUndefined();
+  expect(none.findings.map(entry => entry.id)).toEqual(["bugs:none-only"]);
+  // Naming the thread explicitly says the same thing, which is what a caller does once a second review exists here.
+  expect(ledgerEventsView(events, HEAD, "none")).toMatchObject({ record: "record-none" });
+  // The packet-only thread stays selectable, and reads as a packet nobody has reviewed yet: the view omits `record`
+  // rather than carrying an undefined one, so the absence is read from the property, not from a matched object.
+  const unreviewed = ledgerEventsView(events, HEAD, 8);
+  expect(unreviewed).toMatchObject({ pr: 8, packet: "8".repeat(64) });
+  expect(unreviewed.record).toBeUndefined();
+  expect(unreviewed.findings).toEqual([]);
+  expect(() => ledgerEventsView(events, HEAD, 9)).toThrow(`no packet or record at head ${HEAD} belongs to PR 9`);
+
+  // With a record in each thread the head is ambiguous again, and the next step names `none` beside the PR number.
+  const both: LedgerEvent[] = [...events,
+    { v: 1, type: "record", at: "t3", id: "record-8", record: recordAt(HEAD, [], "approved", { ok: true }, 8) }];
+  expect(() => ledgerEventsView(both, HEAD)).toThrow(`head ${HEAD} is reviewed in more than one thread (no PR, PR 8)`);
+  const next = (): string | undefined => {
+    try { ledgerEventsView(both, HEAD); } catch (error) { return error instanceof Refusal ? error.next : undefined; }
+  };
+  expect(next()).toBe("pass --pr none or --pr 8 to choose the review thread");
+  expect(ledgerEventsView(both, HEAD, "none")).toMatchObject({ record: "record-none" });
+  expect(ledgerEventsView(both, HEAD, 8)).toMatchObject({ pr: 8, record: "record-8" });
+
+  // `--pr none` at a head whose only change names a PR is refused, naming that PR rather than answering an empty review.
+  expect(() => ledgerEventsView([events[2]!], HEAD, "none")).toThrow(`no packet or record at head ${HEAD} has no PR`);
+});
+
 test("without a PR a finding's lifecycle is that exact head, and nothing carries between heads", () => {
   const events: LedgerEvent[] = [
     { v: 1, type: "packet", at: "t0", packet: packetFor(HEAD, null) },
@@ -599,6 +636,28 @@ test("a secret-shaped report is refused before it is parsed, and its value reach
   expect(missing.code).toBe(1);
   expect(missing.stderr).toContain("cannot read the report <withheld>");
   expect(missing.stderr).not.toContain(secretId);
+
+  // The `--implementer` mismatch names the flag value, so that value goes through the same guard: it comes from the
+  // command line, where no report screen has seen it. The report claims the packet the ledger holds for its head, so the
+  // mismatch is the first refusal it reaches.
+  const stated = write("stated.json", {
+    ...reportFor(HEAD),
+    packet: { id: packet.id, subject: packet.subject },
+    reviewer: { id: "claude", modelFamily: "anthropic", started: "self", implementer: "codex", sameFamilyFallback: false },
+    coverage: { reviewed: packet.units.map((unit: { path: string }) => unit.path), skipped: [] },
+  });
+  const mismatch = run(repo, home, "record", stated, "--implementer", secretId);
+  expect(mismatch.code).toBe(1);
+  expect(mismatch.stderr).toContain("disagrees with the report's reviewer.implementer codex");
+  expect(mismatch.stderr).toContain("<withheld>");
+  expect(mismatch.stderr).not.toContain(secretId);
+  // `--head` reaches a refusal only as a commit id, so a value that is not one is refused as usage and never printed.
+  for (const [command, extra] of [["show", []], ["resolve", ["bugs:one", "--as", "fixed"]]] as const) {
+    const refused = run(repo, home, command, ...extra, "--head", secretId);
+    expect(refused.code, command).toBe(2);
+    expect(refused.stderr, command).toContain("--head must be a commit SHA: 4 to 64 hexadecimal characters");
+    expect(refused.stderr, command).not.toContain(secretId);
+  }
 
   // A value the screen does not catch is still named by its type, never echoed, and the head must be a full OID.
   const plainHead = run(repo, home, "record", write("plain-head.json", reportFor(HEAD, { packet: { id: PACKET, subject: { head: "not-a-full-sha" } } })));

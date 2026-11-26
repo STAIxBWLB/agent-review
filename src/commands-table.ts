@@ -7,9 +7,9 @@ export const commands = [
   { name: "record", aliases: [], description: "Validate a review report against the packet for its head and append it to the ledger",
     syntax: "record <report.json> [--implementer NAME] [--light] [--json]" },
   { name: "resolve", aliases: [], description: "Settle a recorded finding as fixed, false_positive or accepted",
-    syntax: "resolve <finding-id> --as fixed|false_positive|accepted [--evidence REF]... [--rationale TEXT] [--head SHA] [--pr N] [--json]" },
+    syntax: "resolve <finding-id> --as fixed|false_positive|accepted [--evidence REF]... [--rationale TEXT] [--head SHA] [--pr N|none] [--json]" },
   { name: "show", aliases: [], description: "Show the recorded review for a head",
-    syntax: "show [--head SHA] [--pr N] [--json]" },
+    syntax: "show [--head SHA] [--pr N|none] [--json]" },
   { name: "--help", aliases: ["-h"], description: "Show usage" },
   { name: "--version", aliases: ["-v"], description: "Show version" },
 ] as const;

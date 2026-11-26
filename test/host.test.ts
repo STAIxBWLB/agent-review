@@ -80,6 +80,18 @@ test("the model comes from the host's own config file, top level only", () => {
     expect(modelOf("codex", home)).toBe("gpt-5-codex");
     writeFileSync(join(home, ".codex/config.toml"), 'model = "gpt-5-codex"');
     expect(modelOf("codex", home)).toBe("gpt-5-codex");
+    // A model-looking line inside multiline text is not the model: the body of a multiline string, basic or literal, is
+    // text, and the real key after it is what attests.
+    writeFileSync(join(home, ".codex/config.toml"), 'description = """\nmodel = "not-the-model"\n"""\nmodel = "gpt-5-codex"\n');
+    expect(modelOf("codex", home)).toBe("gpt-5-codex");
+    writeFileSync(join(home, ".kimi-code/config.toml"), "notes = '''\ndefault_model = 'not-it'\n'''\ndefault_model = 'kimi-k2'\n");
+    expect(modelOf("kimi", home)).toBe("kimi-k2");
+    // With no real key at all, a model named only inside that text reads unknown, the way a table's does.
+    writeFileSync(join(home, ".codex/config.toml"), 'description = """\nmodel = "not-the-model"\n"""\n');
+    expect(modelOf("codex", home)).toBe("unknown");
+    // A config over the 64 KiB bound is not parsed at all, even with its model key at the end.
+    writeFileSync(join(home, ".codex/config.toml"), `${"# filler\n".repeat(8000)}model = "gpt-5-codex"\n`);
+    expect(modelOf("codex", home)).toBe("unknown");
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
@@ -89,12 +101,16 @@ test("a config value that is not a plain model name reads as unknown", () => {
   const home = temp("arev-host-unsafe-");
   try {
     mkdirSync(join(home, ".codex"), { recursive: true });
-    // The last two are escapes TOML does not define, or defines into a character no model name may carry.
+    // The last two are what TOML makes of an escape it does not define (`\q` is a parse error) and of one it does
+    // (`\u0000` decodes to NUL, which no model name may carry).
     for (const value of ["", "gpt-\u001b[31mbad", "sk-abcdefghijklmnopqrstuvwx", "m".repeat(129),
       "gpt\\q5", "gpt\\u00005"]) {
       writeFileSync(join(home, ".codex/config.toml"), `model = "${value}"\n`);
       expect(modelOf("codex", home)).toBe("unknown");
     }
+    // A key whose value is not a string is not a model name either.
+    writeFileSync(join(home, ".codex/config.toml"), "model = 5\n");
+    expect(modelOf("codex", home)).toBe("unknown");
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

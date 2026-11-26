@@ -121,7 +121,10 @@ function run(env: Record<string, string>, ...args: string[]) {
   try {
     const result = Bun.spawnSync(
       [process.execPath, resolve(import.meta.dir, "../bin/arev.js"), ...args],
-      { cwd, env: { ...process.env, AGENTHUB_HOME: join(cwd, "agenthub"), ...env } },
+      // The host config homes are the caller's own shell state, and arev reads the model out of them. A case that wants
+      // a relocated home passes one; every other case pins them empty, so what this machine exports cannot answer instead.
+      { cwd, env: { ...process.env, AGENTHUB_HOME: join(cwd, "agenthub"),
+        CLAUDE_CONFIG_DIR: "", CODEX_HOME: "", KIMI_CODE_HOME: "", ...env } },
     );
     return { code: result.exitCode, stdout: result.stdout.toString(), stderr: result.stderr.toString() };
   } finally {
@@ -250,5 +253,49 @@ test("arev host reports no host and the next step when none can run", () => {
   } finally {
     rmSync(home, { recursive: true, force: true });
     rmSync(bin, { recursive: true, force: true });
+  }
+});
+
+// Issue #42: a config home relocated with the host's own variable is the file that host reads, so it is the file the model
+// comes from - reading the default home instead attested a model the reviewer never ran with.
+test("the model comes from the relocated config home when the host variable is set", () => {
+  const home = temp("arev-host-relocated-"), relocated = temp("arev-host-relocated-codex-");
+  const kimi = temp("arev-host-relocated-kimi-");
+  try {
+    mkdirSync(join(home, ".codex"), { recursive: true });
+    writeFileSync(join(home, ".codex/config.toml"), 'model = "default-home"\n');
+    mkdirSync(join(home, ".kimi-code"), { recursive: true });
+    writeFileSync(join(home, ".kimi-code/config.toml"), 'default_model = "default-kimi"\n');
+    writeFileSync(join(relocated, "config.toml"), 'model = "relocated-codex"\n');
+    writeFileSync(join(kimi, "config.toml"), 'default_model = "relocated-kimi"\n');
+    expect(modelOf("codex", home, { CODEX_HOME: relocated })).toBe("relocated-codex");
+    expect(modelOf("kimi", home, { KIMI_CODE_HOME: kimi })).toBe("relocated-kimi");
+    // One host's variable does not relocate another host's config.
+    expect(modelOf("kimi", home, { CODEX_HOME: relocated })).toBe("default-kimi");
+    // An empty value is not a relocation, and a relocated home with no config there is unknown rather than the default.
+    expect(modelOf("codex", home, { CODEX_HOME: "" })).toBe("default-home");
+    expect(modelOf("codex", home, { CODEX_HOME: join(relocated, "missing") })).toBe("unknown");
+  } finally {
+    for (const directory of [home, relocated, kimi]) rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("arev host answers with the model from CODEX_HOME", () => {
+  const home = temp("arev-host-codexhome-"), relocated = temp("arev-host-codexhome-relocated-");
+  const bin = temp("arev-host-codexhome-bin-");
+  try {
+    mkdirSync(join(home, ".codex"), { recursive: true });
+    writeFileSync(join(home, ".codex/config.toml"), 'model = "default-home"\n');
+    writeFileSync(join(relocated, "config.toml"), 'model = "relocated-codex"\n');
+    writeFileSync(join(bin, "codex"), "#!/bin/sh\n", { mode: 0o755 });
+    const env = { HOME: home, PATH: bin };
+    const answer = run({ ...env, CODEX_HOME: relocated }, "host", "--pr", "448", "--implementer", "claude", "--json");
+    expect(answer.code).toBe(0);
+    expect(JSON.parse(answer.stdout)).toEqual({ host: "codex", reason: "rotation", considered: [], model: "relocated-codex" });
+    // An empty value is the default home again, which is what the host itself would read.
+    const fallback = run({ ...env, CODEX_HOME: "" }, "host", "--pr", "448", "--implementer", "claude", "--json");
+    expect(JSON.parse(fallback.stdout)).toMatchObject({ model: "default-home" });
+  } finally {
+    for (const directory of [home, relocated, bin]) rmSync(directory, { recursive: true, force: true });
   }
 });

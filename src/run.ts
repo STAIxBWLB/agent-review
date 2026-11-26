@@ -4,7 +4,7 @@ import { homedir, tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { EXIT } from "@staix/cli-output";
-import { chooseHost, hostExecutable, HOST_ORDER, modelOf } from "./host.ts";
+import { chooseHost, hostConfigVariable, hostExecutable, HOST_ORDER, modelOf } from "./host.ts";
 import { importReviewFile } from "./import.ts";
 import { Refusal, secretShaped, shown, stringsIn } from "./ledger.ts";
 import { RUN_REPORT_FILE, RUN_STATE_FILE, RUN_TOOL_NAMES } from "./mcp.ts";
@@ -79,9 +79,32 @@ function reviewerPrompt(out: string, checkout: string): string {
   ].join("\n");
 }
 
-function reviewerEnv(pathEnv: string): NodeJS.ProcessEnv {
+/**
+ * The config home of the selected host, when the caller set it, resolved against the caller's cwd so a relative value
+ * still names one directory. A host keeps its login and its model there, and a host started without it reads the default
+ * home - which is the wrong account when the person's login lives elsewhere.
+ *
+ * Only that host's variable is read: another host's home cannot fail a run that never starts that host. A home that
+ * resolves inside the source worktree is refused instead of passed, because the reviewed head commits that tree and a
+ * host reading its startup configuration from there would start under a configuration the review content supplied.
+ */
+function hostConfigHomes(cwd: string, root: string, host: string): NodeJS.ProcessEnv {
+  const key = hostConfigVariable(host);
+  if (key === undefined) return {};
+  const value = process.env[key];
+  if (value === undefined || value === "") return {};
+  const path = resolve(cwd, value);
+  if (insideWorktree(root, path)) {
+    throw new Refusal(`The ${key} directory is inside the source worktree`,
+      `point ${key} outside the reviewed worktree, or unset it`);
+  }
+  return { [key]: path };
+}
+
+function reviewerEnv(pathEnv: string, homes: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { PATH: pathEnv };
   for (const key of ENV_KEYS) env[key] = process.env[key];
+  for (const [key, value] of Object.entries(homes)) env[key] = value;
   // Git run by the reviewer inside the checkout must not run anything the reviewed head committed. A relative
   // core.hooksPath in the source config (Husky's `.husky/_`) resolves against the checkout, so the reviewer's own
   // `git status` refreshes the index and fires a committed post-index-change. Environment config is read after every
@@ -95,9 +118,9 @@ function reviewerEnv(pathEnv: string): NodeJS.ProcessEnv {
   return env;
 }
 
-function kimiMcpFlag(executable: string, cwd: string, pathEnv: string): string | undefined {
+function kimiMcpFlag(executable: string, cwd: string, pathEnv: string, homes: NodeJS.ProcessEnv): string | undefined {
   const result = spawnSync(executable, ["--help"], {
-    cwd, env: reviewerEnv(pathEnv), encoding: "utf8", timeout: 2_000,
+    cwd, env: reviewerEnv(pathEnv, homes), encoding: "utf8", timeout: 2_000,
     maxBuffer: 64 * 1024, killSignal: "SIGKILL",
   });
   if (result.status !== 0) return undefined;
@@ -127,14 +150,17 @@ function hostArgs(host: string, model: string, checkout: string, launch: string,
     return ["exec", "-s", "read-only", "--ephemeral", "--skip-git-repo-check", "-C", launch, "--add-dir", checkout,
       ...(model === "unknown" ? [] : ["-m", model]), "-o", join(out, RESPONSE_FILE), ...mcp, "-"];
   }
-  if (host === "kimi") return ["--plan", "--skills-dir", launch, "--add-dir", checkout, "--add-dir", out, "--output-format", "text", ...mcp, "-p", prompt];
+  // Kimi refuses --plan together with the -p this run always passes (`error: Cannot combine --prompt with --plan`), and
+  // the OCR flow this replaces ran it without one: the detached worktree and the clean-checkout check are the guard.
+  if (host === "kimi") return ["--skills-dir", launch, "--add-dir", checkout, "--add-dir", out, "--output-format", "text", ...mcp, "-p", prompt];
   return ["-p", "--permission-mode", "plan", "--setting-sources", "user", "--add-dir", checkout, "--add-dir", out, ...mcp];
 }
 
 function runReviewer(
-  executable: string, host: string, args: string[], launch: string, out: string, prompt: string, timeout: number, pathEnv: string,
+  executable: string, host: string, args: string[], launch: string, out: string, prompt: string, timeout: number,
+  pathEnv: string, homes: NodeJS.ProcessEnv,
 ) {
-  const env = reviewerEnv(pathEnv);
+  const env = reviewerEnv(pathEnv, homes);
   const stdout = openSync(join(out, STDOUT_FILE), "wx", 0o600);
   let stderr: number;
   try { stderr = openSync(join(out, STDERR_FILE), "wx", 0o600); }
@@ -274,6 +300,7 @@ export async function runCommand(cwd: string, args: readonly string[]): Promise<
   if (host === undefined || executable === undefined) {
     throw new Refusal("No selected reviewer executable is available", "put claude, codex or kimi on PATH, or select an available --host");
   }
+  const homes = hostConfigHomes(cwd, root, host);
 
   const out = options.out === undefined ? mkdtempSync(join(tmpdir(), "arev-run-output-")) : resolve(cwd, options.out);
   if (insideWorktree(root, out)) {
@@ -299,7 +326,7 @@ export async function runCommand(cwd: string, args: readonly string[]): Promise<
   let kimiFlag: string | undefined;
   if (host === "kimi") {
     const probe = mkdtempSync(join(tmpdir(), "arev-review-probe-"));
-    try { kimiFlag = kimiMcpFlag(executable, probe, pathEnv); }
+    try { kimiFlag = kimiMcpFlag(executable, probe, pathEnv, homes); }
     finally { rmSync(probe, { recursive: true, force: true }); }
   }
   const attachMcp = host !== "kimi" || kimiFlag !== undefined;
@@ -310,7 +337,7 @@ export async function runCommand(cwd: string, args: readonly string[]): Promise<
 
   const bundle = buildPacket(root, requestFor(root, options.pr));
   const { head } = bundle.packet.subject;
-  const model = modelOf(host, process.env.HOME ?? homedir());
+  const model = modelOf(host, process.env.HOME ?? homedir(), homes);
   const run: RunAttestation = {
     packetId: bundle.packet.id, host, model, implementer: options.implementer,
     sameFamilyFallback: host === options.implementer,
@@ -347,7 +374,8 @@ export async function runCommand(cwd: string, args: readonly string[]): Promise<
     }
     const prompt = reviewerPrompt(out, checkout);
     const mcp = arev === undefined ? [] : mcpArgs(host, arev, out, launch, kimiFlag);
-    outcome = await runReviewer(executable, host, hostArgs(host, model, checkout, launch, out, prompt, mcp), launch, out, prompt, options.timeout, pathEnv);
+    outcome = await runReviewer(executable, host, hostArgs(host, model, checkout, launch, out, prompt, mcp), launch, out, prompt,
+      options.timeout, pathEnv, homes);
   } finally {
     try { redactions = screenReviewerFiles(out); }
     finally {

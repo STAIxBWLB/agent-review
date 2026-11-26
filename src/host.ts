@@ -34,6 +34,23 @@ const IDENTITY = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const MAX_CONFIG_BYTES = 64 * 1024, MAX_MODEL_BYTES = 128;
 const BLOCKED = "blocked: no review host can run";
 /**
+ * Where each host keeps what it starts with: the variable that relocates its config home, and - for the hosts whose home
+ * carries a model file - the directory under that home and the top-level key naming the model (spec #24 AC2). Claude has
+ * no entry in `HOST_CONFIG` because its home holds no model to attest, but its home still relocates.
+ */
+const CONFIG_HOME_VARIABLES: Record<string, string | undefined> = {
+  claude: "CLAUDE_CONFIG_DIR", codex: "CODEX_HOME", kimi: "KIMI_CODE_HOME",
+};
+const HOST_CONFIG: Record<string, { directory: string; file: string; key: string } | undefined> = {
+  codex: { directory: ".codex", file: "config.toml", key: "model" },
+  kimi: { directory: ".kimi-code", file: "config.toml", key: "default_model" },
+};
+
+/** The variable that relocates a host's own config home, or undefined for an id arev does not know. */
+export function hostConfigVariable(host: string): string | undefined {
+  return CONFIG_HOME_VARIABLES[host];
+}
+/**
  * The only flag value a refusal echoes: an identity in that charset that also matches no secret pattern. A flag value is
  * the caller's untrusted text and stderr is output, so anything else is named as withheld - and composing both screens
  * here is deliberate, because the secret screen alone still passes control characters through.
@@ -106,14 +123,20 @@ export function availableHosts(unavailable: ReadonlySet<string>, pathEnv: string
  * Only that one top-level key's value leaves this function: a `model` inside a table is not the model the host runs, and
  * a value that is not a string, is empty, over 128 bytes, carries control characters or is secret-shaped is not a model
  * name, so it reads as `unknown` rather than reaching output or, through `arev run`, the ledger.
+ *
+ * A host started under a relocated config home reads its model from there, so the variable that relocates the home
+ * (`CODEX_HOME`, `KIMI_CODE_HOME`) decides which file this reads. `env` is the environment the caller was started with,
+ * passed rather than read so a test states it; an empty value is not a relocation, so the home directory stands.
  */
-export function modelOf(host: string, home: string): string {
-  const config = ({ codex: { file: ".codex/config.toml", key: "model" },
-    kimi: { file: ".kimi-code/config.toml", key: "default_model" } } as Record<string, { file: string; key: string } | undefined>)[host];
+export function modelOf(host: string, home: string, env: Readonly<Record<string, string | undefined>> = {}): string {
+  const config = HOST_CONFIG[host];
   if (!config) return "unknown";
+  const variable = hostConfigVariable(host);
+  const relocated = variable === undefined ? undefined : env[variable];
+  const directory = relocated === undefined || relocated === "" ? join(home, config.directory) : relocated;
   let text: string;
   try {
-    text = readFileSync(join(home, config.file), "utf8");
+    text = readFileSync(join(directory, config.file), "utf8");
   } catch {
     return "unknown";
   }
@@ -181,7 +204,7 @@ export function hostCommand(_cwd: string, args: readonly string[]): number {
 
   const available = availableHosts(unavailable, process.env.PATH ?? "", order);
   const choice = chooseHost(Number(pr), implementer, available, order);
-  const model = choice.host === undefined ? undefined : modelOf(choice.host, process.env.HOME ?? homedir());
+  const model = choice.host === undefined ? undefined : modelOf(choice.host, process.env.HOME ?? homedir(), process.env);
   // One instruction, two surfaces: `--json` carries it as `next` and the text branch prints it, so an agent reading the
   // JSON learns the same step as a person reading the lines (issue #32).
   const next = choice.host === undefined

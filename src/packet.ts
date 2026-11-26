@@ -138,6 +138,9 @@ function workspaceFilterOptions(cwd: string): string[] {
 }
 
 function checkedOutput(result: ReturnType<typeof reviewGit>, label: string): string {
+  if (result.status === 129 && result.stderr.includes("attr-source")) {
+    throw new Error("This Git does not support --attr-source. Upgrade Git before building a packet.");
+  }
   if (result.status !== 0) throw new Error(`Cannot read ${label}. Verify the Git subject and required objects, then retry.`);
   return result.stdout;
 }

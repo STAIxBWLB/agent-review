@@ -2,8 +2,8 @@ import { expect, test } from "bun:test";
 import { readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { buildPacket, coverageGap, repositoryPath, type ReviewPacket } from "../src/packet.ts";
-import { fixture } from "./packet-fixture.ts";
+import { coverageGap, repositoryPath, type ReviewPacket } from "../src/packet.ts";
+import { fixture, isolatedPacket } from "./packet-fixture.ts";
 
 function portedFixture() {
   const repo = fixture();
@@ -55,7 +55,7 @@ function assertParity(packet: ReviewPacket, gitPaths: string[]) {
 test("ported range inventory keeps rename scope, base rules and denied paths out of the brief", () => {
   const { dir, head, base, git, write } = portedFixture();
   const request = { kind: "range", base, head } as const;
-  const bundle = buildPacket(dir, request);
+  const bundle = isolatedPacket(dir, request);
   const { packet } = bundle;
   assertParity(packet, git("diff", "-M", "-C", "--find-copies-harder", "--name-only", "-z", base, head).split("\0").filter(Boolean));
   expect(packet.units.map(file => file.path).sort()).toEqual(
@@ -83,26 +83,26 @@ test("ported range inventory keeps rename scope, base rules and denied paths out
   expect(packet.id).toMatch(/^[a-f0-9]{64}$/);
   git("checkout", "-q", "main");
   write("src/a.ts", "export const a = 999;\n");
-  expect(buildPacket(dir, request)).toEqual(bundle);
-  expect(() => buildPacket(dir, { kind: "range", base, head: "not-a-commit" })).toThrow("unavailable");
-  expect(() => buildPacket(dir, { kind: "range", base, head: base })).toThrow("no changes");
+  expect(isolatedPacket(dir, request)).toEqual(bundle);
+  expect(() => isolatedPacket(dir, { kind: "range", base, head: "not-a-commit" })).toThrow("unavailable");
+  expect(() => isolatedPacket(dir, { kind: "range", base, head: base })).toThrow("no changes");
 });
 
 test("commit, workspace and file subjects use their own Git changed-name scope", () => {
   const { dir, base, head, git, write } = portedFixture();
   const committed = git("diff", "-M", "-C", "--find-copies-harder", "--name-only", "-z", base, head).split("\0").filter(Boolean);
-  assertParity(buildPacket(dir, { kind: "commit", commit: head }).packet, committed);
+  assertParity(isolatedPacket(dir, { kind: "commit", commit: head }).packet, committed);
   git("reset", "--soft", base);
   write("untracked.txt", "untracked text\n");
-  const workspace = buildPacket(dir, { kind: "workspace" });
+  const workspace = isolatedPacket(dir, { kind: "workspace" });
   const tracked = git("diff", "-M", "-C", "--find-copies-harder", "--name-only", "-z", "HEAD").split("\0").filter(Boolean);
   const untracked = git("ls-files", "--others", "--exclude-standard", "-z").split("\0").filter(Boolean);
   assertParity(workspace.packet, [...tracked, ...untracked]);
   expect(workspace.diff).toContain("+untracked text");
-  const publicSide = buildPacket(dir, { kind: "files", paths: ["looks-public.txt"] });
+  const publicSide = isolatedPacket(dir, { kind: "files", paths: ["looks-public.txt"] });
   expect(publicSide.packet.excluded).toEqual([{ path: "looks-public.txt", reason: "denied" }]);
   expect(publicSide.diff).toBe("");
-  const scoped = buildPacket(dir, { kind: "files", paths: ["untracked.txt", "deleted.txt"] });
+  const scoped = isolatedPacket(dir, { kind: "files", paths: ["untracked.txt", "deleted.txt"] });
   assertParity(scoped.packet, ["untracked.txt", "deleted.txt"]);
 });
 
@@ -135,7 +135,7 @@ test("reviewing a root commit uses the empty base tree", () => {
   write("file.txt", "initial content\n");
   git("add", ".");
   git("commit", "-qm", "root");
-  const bundle = buildPacket(dir, { kind: "commit", commit: "HEAD" });
+  const bundle = isolatedPacket(dir, { kind: "commit", commit: "HEAD" });
   expect(bundle.packet.units).toEqual([{ path: "file.txt", status: "A", insertions: 1, deletions: 0 }]);
   expect(bundle.rulesMissing.map(rule => rule.source)).toEqual(["REVIEW.md"]);
 });
@@ -150,7 +150,7 @@ test("workspace inventory does not run repository-defined checkout filters", () 
   git("config", "filter.marker.required", "true");
   write("file.txt", "after\n");
   write("untracked.txt", "untracked fixture\n");
-  const bundle = buildPacket(dir, { kind: "workspace" });
+  const bundle = isolatedPacket(dir, { kind: "workspace" });
   expect(bundle.diff).toContain("+after");
   expect(bundle.diff).toContain("+untracked fixture");
   expect(git("ls-files", "--others", "--exclude-standard")).not.toContain("filter-executed");
@@ -167,7 +167,7 @@ test("a copy patch excludes a separately modified generated source", () => {
   write("copy.js", content);
   git("add", ".");
   git("commit", "-qm", "head");
-  const bundle = buildPacket(dir, { kind: "commit", commit: "HEAD" });
+  const bundle = isolatedPacket(dir, { kind: "commit", commit: "HEAD" });
   expect(bundle.packet.units).toContainEqual({ path: "copy.js", status: "C", insertions: 0, deletions: 0 });
   expect(bundle.diff).toContain("copy to copy.js");
   expect(bundle.diff).not.toContain("only in generated source");
@@ -185,13 +185,15 @@ test("a worktree alias resolves absolute paths even when the selected file is ab
   }
 });
 
-test("workspace inventory honors the global ignore file and local precedence", () => {
+test("workspace inventory honors an included global ignore file and local precedence", () => {
   const configDir = fixture().dir;
   const config = join(configDir, "config");
   const ignore = join(configDir, "global-ignore");
   writeFileSync(ignore, "globally-ignored.txt\n");
+  const included = join(configDir, "included-config");
   const { git, write, cli } = fixture({ GIT_CONFIG_GLOBAL: config });
-  git("config", "--global", "core.excludesFile", ignore);
+  git("config", "--file", included, "core.excludesFile", ignore);
+  git("config", "--global", "include.path", "included-config");
   git("commit", "--allow-empty", "-qm", "base");
   write("globally-ignored.txt", "IGNORED_FIXTURE_CONTENT\n");
   write("public.txt", "reviewed change\n");
@@ -221,7 +223,7 @@ test("a deleted source can become a rename and a copy in one packet", () => {
   write("second.txt", source + "second variation\n");
   git("add", ".");
   git("commit", "-qm", "head");
-  const bundle = buildPacket(dir, { kind: "commit", commit: "HEAD" });
+  const bundle = isolatedPacket(dir, { kind: "commit", commit: "HEAD" });
   expect(bundle.packet.units.map(({ status }) => status).sort()).toEqual(["C", "R"]);
   assertParity(bundle.packet, ["first.txt", "second.txt"]);
   expect(bundle.diff).toContain("second variation");
@@ -237,6 +239,22 @@ test("a shallow boundary commit refuses an incomplete review base", () => {
   git("commit", "-qm", "head");
   const shallower = fixture();
   shallower.git("clone", "--depth=1", pathToFileURL(dir).href, "clone");
-  expect(() => buildPacket(join(shallower.dir, "clone"), { kind: "commit", commit: "HEAD" }))
+  expect(() => isolatedPacket(join(shallower.dir, "clone"), { kind: "commit", commit: "HEAD" }))
     .toThrow("Fetch the commit history");
+});
+
+test("workspace inventory honors the effective ignore file from system Git config", () => {
+  const configDir = fixture().dir;
+  const system = join(configDir, "system-config");
+  const ignore = join(configDir, "system-ignore");
+  writeFileSync(ignore, "system-ignored.txt\n");
+  const { git, write, cli } = fixture({ GIT_CONFIG_SYSTEM: system, GIT_CONFIG_NOSYSTEM: "0" });
+  git("config", "--file", system, "core.excludesFile", ignore);
+  git("commit", "--allow-empty", "-qm", "base");
+  write("system-ignored.txt", "ignored system fixture content\n");
+  write("public.txt", "reviewed change\n");
+  const result = cli("packet", "--workspace", "--json");
+  expect(result.status).toBe(0);
+  assertParity(JSON.parse(result.stdout), git("ls-files", "--others", "--exclude-standard", "-z").split("\0").filter(Boolean));
+  expect(result.stdout).not.toContain("system-ignored.txt");
 });

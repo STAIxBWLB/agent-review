@@ -1,6 +1,5 @@
 import { expect, test } from "bun:test";
-import { buildPacket } from "../src/packet.ts";
-import { fixture } from "./packet-fixture.ts";
+import { fixture, isolatedPacket } from "./packet-fixture.ts";
 
 test("refuses absolute and traversal rule attributes from the base tree", () => {
   for (const value of ["/private/rules.md", "rules/../REVIEW.md", "C:/private/rules.md"]) {
@@ -9,7 +8,7 @@ test("refuses absolute and traversal rule attributes from the base tree", () => 
     git("add", ".");
     git("commit", "-qm", "base");
     write("file.txt", "content\n");
-    expect(() => buildPacket(dir, { kind: "workspace" })).toThrow("repository-relative path");
+    expect(() => isolatedPacket(dir, { kind: "workspace" })).toThrow("repository-relative path");
   }
 });
 
@@ -19,7 +18,7 @@ test("reports missing REVIEW.md and does not take an added rule from the head", 
   write("REVIEW.md", "HEAD_ONLY\n");
   git("add", "REVIEW.md");
   git("commit", "-qm", "head");
-  const packet = buildPacket(dir, { kind: "commit", commit: "HEAD" });
+  const packet = isolatedPacket(dir, { kind: "commit", commit: "HEAD" });
   expect(packet.packet.rules).toEqual([]);
   expect(packet.rulesMissing).toEqual([{ source: "REVIEW.md", reason: expect.stringContaining("merge base") }]);
   expect(packet.rules).not.toContain("HEAD_ONLY");
@@ -57,12 +56,12 @@ test("oversized rule display is bounded while its digest represents the entire b
   git("add", ".");
   git("commit", "-qm", "base");
   write("file.txt", "reviewable content");
-  const first = buildPacket(dir, { kind: "workspace" });
+  const first = isolatedPacket(dir, { kind: "workspace" });
   expect(first.rules).toContain("[cut at 32000 bytes]");
   expect(first.rules).not.toContain("first tail");
   write("REVIEW.md", "x".repeat(32_000) + "second tail");
   git("commit", "-qam", "new base");
-  const second = buildPacket(dir, { kind: "workspace" });
+  const second = isolatedPacket(dir, { kind: "workspace" });
   expect(second.rules).toBe(first.rules);
   expect(second.packet.rules[0]?.sha256).not.toBe(first.packet.rules[0]?.sha256);
 });

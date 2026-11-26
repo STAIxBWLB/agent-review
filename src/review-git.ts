@@ -38,18 +38,20 @@ export function mergeBaseOid(cwd: string, base: string, head: string): string {
   return result.stdout.trim();
 }
 
-/** Preserve the user's global ignore file without importing global config into review Git commands. */
+/** Resolve only the effective ignore file, without loading user config for the review commands. */
 export function globalIgnoreOptions(cwd: string): string[] {
-  const local = reviewGit(cwd, ["config", "--get", "core.excludesFile"]);
-  if (local.status === 0) return [];
-  if (local.status !== 1) throw new Error("Cannot read the repository's Git ignore setting. Check git config and retry.");
   const options = gitOptions();
-  const result = memoryGitSync(gitArgs(cwd, ["config", "--global", "--type=path", "--null", "--get", "core.excludesFile"]), {
+  const result = memoryGitSync(gitArgs(cwd, ["config", "--includes", "--type=path", "--null", "--get", "core.excludesFile"]), {
     ...options,
-    env: { ...options.env, GIT_CONFIG_GLOBAL: process.env.GIT_CONFIG_GLOBAL },
+    env: {
+      ...options.env,
+      GIT_CONFIG_GLOBAL: process.env.GIT_CONFIG_GLOBAL,
+      GIT_CONFIG_NOSYSTEM: process.env.GIT_CONFIG_NOSYSTEM,
+      GIT_CONFIG_SYSTEM: process.env.GIT_CONFIG_SYSTEM,
+    },
     encoding: "utf8",
   });
   if (result.status === 1) return [];
-  if (result.status !== 0) throw new Error("Cannot read the global Git ignore setting. Check git config --global and retry.");
+  if (result.status !== 0) throw new Error("Cannot read the effective Git ignore setting. Check git config --includes and retry.");
   return ["-c", `core.excludesFile=${result.stdout.replace(/\0$/, "")}`];
 }

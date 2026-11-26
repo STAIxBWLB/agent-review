@@ -16,6 +16,7 @@ import { blocksApproval, findingTally, findingsForHead, positionalFindingId, typ
 import { sanitize } from "./frame.ts";
 import { Refusal, appendEvent, readLedger, recordId, reviewProjectId, secretShaped, type LedgerEvent, type PacketBlock, type RecordFinding, type ReviewRecordV1 } from "./ledger.ts";
 import { buildPacket, type PacketRequest } from "./packet.ts";
+import { PacketUsageError } from "./packet-cli.ts";
 import { DEFAULT_ADVISORY_CAP, MAX_ADVISORY_CAP } from "./review-md.ts";
 
 const MAX_REPORT_BYTES = 1024 * 1024, MAX_FINDINGS = MAX_ADVISORY_CAP, MAX_FINDING_BYTES = 64 * 1024;
@@ -369,10 +370,13 @@ export function ledgerEventsView(events: readonly LedgerEvent[], head?: string):
 const interactive = (): boolean => Boolean(process.stdin.isTTY && process.stdout.isTTY);
 const stderrTty = (): boolean => Boolean(process.stderr.isTTY);
 
-function usageError(message: string): number {
-  for (const line of errorLine("arev", message, "", { tty: stderrTty(), next: "arev --help" })) console.error(line);
-  return EXIT.usage;
-}
+/**
+ * A malformed invocation, thrown rather than printed: `src/cli.ts` answers a `PacketUsageError` with `EXIT.usage` and
+ * the command's own help, so record, resolve and show refuse a bad invocation the way packet already does.
+ */
+const usageError = (message: string): never => {
+  throw new PacketUsageError(message);
+};
 
 function failure(error: unknown): number {
   if (!(error instanceof Refusal)) throw error;

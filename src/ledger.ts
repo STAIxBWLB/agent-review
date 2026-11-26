@@ -150,6 +150,17 @@ export function reviewOrigin(cwd: string): string | undefined {
   return origin ? normalizeOrigin(origin.trim()) : undefined;
 }
 
+/**
+ * `owner/repo` of the GitHub repository origin names, or undefined when origin names no GitHub repository. Both GitHub
+ * calls that name a repository read it here: `arev packet --pr` reads a pull request and `arev gate --post` writes a
+ * status, and gh's own resolution (`GH_REPO`, the working directory) may name another repository - a fork's PR N is not
+ * the PR the ledger keyed and reviewed.
+ */
+export function githubRepository(cwd: string): string | undefined {
+  const [host, owner, repo, extra] = (reviewOrigin(cwd) ?? "").split("/");
+  return host === "github.com" && owner && repo && extra === undefined ? `${owner}/${repo}` : undefined;
+}
+
 /** The project's ledger key. */
 export function reviewProjectId(cwd: string): string {
   const normalized = reviewOrigin(cwd);

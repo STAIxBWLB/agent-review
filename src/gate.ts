@@ -6,7 +6,7 @@
  */
 import { spawnSync } from "node:child_process";
 import { EXIT, errorLine } from "@staix/cli-output";
-import { Refusal, appendEvent, readLedger, reviewOrigin, type LedgerEvent, type ReviewRecordV1 } from "./ledger.ts";
+import { Refusal, appendEvent, githubRepository, readLedger, type LedgerEvent, type ReviewRecordV1 } from "./ledger.ts";
 import { PR_NUMBER, ledgerEventsView, threadsAtHead } from "./record.ts";
 import { parseReviewMd } from "./review-md.ts";
 import { commitOid, mergeBaseOid, reviewGit } from "./review-git.ts";
@@ -131,16 +131,17 @@ export function gateReport(cwd: string, options: { head?: string; pr?: number | 
 }
 
 /**
- * The repository a status is posted to: the origin the ledger is keyed to. gh resolves `{owner}/{repo}` itself, from
- * `GH_REPO` or the working directory, and a status sent there names a repository this review did not happen in.
+ * The repository a status is posted to: the origin the ledger is keyed to, parsed once in `src/ledger.ts` so
+ * `arev packet --pr` reads its PR from the same repository. gh resolves `{owner}/{repo}` itself, from `GH_REPO` or the
+ * working directory, and a status sent there names a repository this review did not happen in.
  */
 function statusRepository(cwd: string): string {
-  const [host, owner, repo, extra] = (reviewOrigin(cwd) ?? "").split("/");
-  if (host !== "github.com" || !owner || !repo || extra !== undefined) {
+  const repository = githubRepository(cwd);
+  if (repository === undefined) {
     throw new Refusal("a status is posted to the GitHub repository origin names, and this repository's origin does not name one",
       "set origin to the GitHub repository URL (gh repo view --json url prints it)");
   }
-  return `${owner}/${repo}`;
+  return repository;
 }
 
 /** A pull request at a head, as the pulls read reports it: the number, and the base it currently merges into. */

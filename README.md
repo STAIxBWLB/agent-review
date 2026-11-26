@@ -20,6 +20,9 @@
 
 Run `arev packet --help` for subject and output options. Packet and rule
 commands require Git with support for `--attr-source` and `check-attr --source`.
+`arev packet --pr N` reads the pull request from the repository `origin` names
+on `github.com`, never from the repository `gh` resolves for itself (`GH_REPO`,
+the working directory), and refuses an origin that names no GitHub repository.
 The standalone `arev rules` command compares against the default branch on `origin`.
 
 ### `arev gate`

@@ -1,0 +1,231 @@
+/**
+ * `arev mcp`: the six review tools of AC9 over newline JSON-RPC on stdin and stdout, through `@staix/mcp-stdio`.
+ *
+ * A handler returns data and never prints. The protocol owns stdout, so a command wrapper that writes there would
+ * corrupt the stream: every tool calls the same function its command calls and hands back the result. `arev_resolve`
+ * offers `fixed` and `false_positive` only, because `accepted` is the person's decision at a terminal and a server
+ * never has one; `arev_gate` takes no `--post`, so the one GitHub write stays CLI-only (AC5, AC9).
+ */
+import { EXIT } from "@staix/cli-output";
+import { serve, type Handler, type Tool } from "@staix/mcp-stdio";
+import { version } from "../package.json";
+import { gateReport } from "./gate.ts";
+import { Refusal, readLedger } from "./ledger.ts";
+import { buildPacket, type PacketRequest } from "./packet.ts";
+import { appendPacketEvent, packetSettings } from "./packet-cli.ts";
+import { ledgerEventsView, recordReview, resolveFinding } from "./record.ts";
+import { commitOid, mergeBaseOid, reviewGit } from "./review-git.ts";
+import { readRules } from "./rules.ts";
+
+const text = (value: unknown): string | undefined =>
+  typeof value === "string" && value.trim() !== "" ? value : undefined;
+
+/** A refusal is the only way a handler reports a caller mistake; the message is already screened of report text. */
+const fail = (message: string, next: string): never => {
+  throw new Refusal(message, next);
+};
+
+function pathsArgument(value: unknown): string[] | undefined {
+  if (!Array.isArray(value) || value.length === 0
+    || !value.every(item => typeof item === "string" && item.trim() !== "")) return undefined;
+  return value as string[];
+}
+
+/**
+ * The merge base `arev rules` reads: the origin default branch against the repository's HEAD. `arev rules` and
+ * `arev gate` each carry this lookup with their own refusal, so this copy leaves both of them alone.
+ */
+function defaultBase(cwd: string): string {
+  const defaultRef = ["origin/HEAD", "origin/main", "origin/master"].find(ref =>
+    reviewGit(cwd, ["rev-parse", "--verify", "-q", `${ref}^{commit}`]).status === 0);
+  if (!defaultRef) return fail("no origin default branch is available", "fetch origin and run git remote set-head origin --auto");
+  return mergeBaseOid(cwd, commitOid(cwd, defaultRef), commitOid(cwd, "HEAD"));
+}
+
+/** The `arev packet` subject a call asks for. No refusal echoes an argument: each names the argument instead. */
+function packetRequest(args: Record<string, unknown>): PacketRequest {
+  const subject = text(args.subject);
+  if (subject === "pr") {
+    const number = text(args.number);
+    if (number === undefined) return fail("arev_packet needs number for a pr subject", "pass number: the pull request number");
+    return { kind: "pr", number };
+  }
+  if (subject === "range") {
+    const base = text(args.base), head = text(args.head);
+    if (base === undefined || head === undefined) return fail("arev_packet needs base and head for a range subject", "pass base and head: a ref or a full commit SHA");
+    return { kind: "range", base, head };
+  }
+  if (subject === "commit") {
+    const commit = text(args.commit);
+    if (commit === undefined) return fail("arev_packet needs commit for a commit subject", "pass commit: the commit SHA or ref");
+    return { kind: "commit", commit };
+  }
+  if (subject === "workspace") return { kind: "workspace" };
+  if (subject === "files") {
+    const paths = pathsArgument(args.paths);
+    if (paths === undefined) return fail("arev_packet needs paths for a files subject", "pass paths: one or more repository-relative paths");
+    return { kind: "files", paths };
+  }
+  return fail("arev_packet needs subject pr, range, commit, workspace or files", "pass subject: one of pr, range, commit, workspace, files");
+}
+
+/**
+ * The tool table and its handlers, bound to the repository `cwd`. Handlers are exported separately from `MCP_TOOLS` so
+ * a test can drive a tool directly and assert that nothing was printed.
+ */
+export function mcpHandlers(cwd: string): Record<string, Handler> {
+  return {
+    arev_packet: args => {
+      const bundle = buildPacket(cwd, packetRequest(args));
+      // `arev record` checks a report against the packet the ledger holds, so the tool writes it exactly as the command
+      // does - the same cap from the same REVIEW.md - and only then hands the packet back.
+      appendPacketEvent(cwd, bundle, packetSettings(cwd, bundle));
+      return { packet: bundle.packet, brief: bundle.brief, rulesMissing: bundle.rulesMissing };
+    },
+    arev_rules: args => {
+      const paths = pathsArgument(args.paths);
+      if (paths === undefined) return fail("arev_rules needs paths: one or more repository-relative paths", "pass paths: the files whose rules you need");
+      const base = text(args.base) ?? defaultBase(cwd);
+      const rules = readRules(cwd, base, paths.map(path => ({ path, sides: [path] })));
+      return { base, ...rules };
+    },
+    arev_record: args => {
+      const report = args.report;
+      if (!report || typeof report !== "object" || Array.isArray(report)) {
+        return fail("arev_record needs report: the report body as an object", "pass report: the JSON you wrote for this packet");
+      }
+      const implementer = text(args.implementer);
+      return recordReview(cwd, report, { label: "the arev_record report", person: false,
+        ...(implementer === undefined ? {} : { implementer }), ...(args.light === true ? { light: true } : {}) });
+    },
+    arev_resolve: args => {
+      const finding = text(args.finding);
+      if (finding === undefined) return fail("arev_resolve needs finding: the recorded finding id", "pass finding: an id from arev_show");
+      const as = args.as;
+      if (as !== "fixed" && as !== "false_positive") {
+        return fail("arev_resolve settles a finding as fixed or false_positive only",
+          "accepted is the person's decision: ask them to run arev resolve <id> --as accepted at their terminal");
+      }
+      const evidence = pathsArgument(args.evidence) ?? [];
+      const rationale = text(args.rationale), head = text(args.head);
+      return resolveFinding(cwd, finding, { as, person: false, evidence,
+        ...(rationale === undefined ? {} : { rationale }), ...(head === undefined ? {} : { head }) });
+    },
+    arev_show: args => {
+      const events = readLedger(cwd);
+      if (events.length === 0) return { events: 0 };
+      return { events: events.length, view: ledgerEventsView(events, text(args.head)) };
+    },
+    arev_gate: args => {
+      const head = text(args.head);
+      return gateReport(cwd, head === undefined ? {} : { head });
+    },
+  };
+}
+
+const REPORT_SCHEMA = {
+  type: "object",
+  description: "The report body you wrote for this packet, as JSON.",
+} as const;
+
+export const MCP_TOOLS: readonly Tool[] = [
+  {
+    name: "arev_packet",
+    description: "Build the review packet for one subject: its units, excluded paths and framed review brief. Use arev packet --out DIR in the CLI when the diff is too large for one response.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        subject: { type: "string", enum: ["pr", "range", "commit", "workspace", "files"] },
+        number: { type: "string", description: "Pull request number, for subject pr." },
+        base: { type: "string", description: "Base ref or full commit SHA, for subject range." },
+        head: { type: "string", description: "Head ref or full commit SHA, for subject range." },
+        commit: { type: "string", description: "Commit SHA or ref, for subject commit." },
+        paths: { type: "array", items: { type: "string" }, maxItems: 500, description: "Repository-relative paths, for subject files." },
+      },
+      required: ["subject"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "arev_rules",
+    description: "Read the rule files that apply to paths, at the merge base of the origin default branch against HEAD, so a change cannot rewrite the rules it is reviewed under.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        paths: { type: "array", items: { type: "string" }, maxItems: 500, description: "Repository-relative paths." },
+        base: { type: "string", description: "Full merge base SHA to read instead of the computed one." },
+      },
+      required: ["paths"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "arev_record",
+    description: "Validate a report against the packet in the ledger for its head and append it: the record id, verdict and finding tally come back. A refused report returns the reason and the next step.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        report: REPORT_SCHEMA,
+        implementer: { type: "string", description: "Who wrote the reviewed change, when the report does not say." },
+        light: { type: "boolean", description: "State that no REVIEW.md was available for this review." },
+      },
+      required: ["report"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "arev_resolve",
+    description: "Settle one recorded finding as fixed or false_positive, with the evidence or rationale the disposition needs. accepted is not offered here: it is the person's decision at a terminal.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        finding: { type: "string", description: "The recorded finding id, as arev_show reports it." },
+        as: { type: "string", enum: ["fixed", "false_positive"] },
+        evidence: { type: "array", items: { type: "string" }, maxItems: 16, description: "path:line or command output, required for false_positive." },
+        rationale: { type: "string", description: "What was settled and why, at most 2048 bytes." },
+        head: { type: "string", description: "Full head SHA to resolve against; defaults to the newest record's." },
+      },
+      required: ["finding", "as"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "arev_show",
+    description: "Show the recorded review for a head: findings with their lifecycle, the counts, and the blocking ids that keep arev_gate failing.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        head: { type: "string", description: "Full head SHA; defaults to the newest record's head." },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "arev_gate",
+    description: "Answer whether this exact head is reviewed, naming each open condition. Reads the ledger and git only, and posts no status: arev gate --post is CLI-only.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        head: { type: "string", description: "Full head SHA; defaults to the repository's HEAD." },
+      },
+      additionalProperties: false,
+    },
+  },
+];
+
+const INSTRUCTIONS = "arev is deterministic review tooling. Build a packet, read its brief, record the report you wrote, settle findings, then gate the head. accepted findings and arev gate --post are CLI-only.";
+
+/** `arev mcp`: serve until stdin closes. `bin/arev.js` sets an exit code and leaves the loop alive on stdin. */
+export function mcpCommand(cwd: string, args: readonly string[]): number {
+  if (args.length > 0) {
+    console.error(`arev: mcp takes no arguments (got ${args.length})`);
+    return EXIT.usage;
+  }
+  void serve({ name: "arev", version, tools: MCP_TOOLS, handlers: mcpHandlers(cwd), instructions: INSTRUCTIONS,
+    failureText: error => error instanceof Refusal ? `${error.message} Next: ${error.next}` : undefined })
+    .catch(error => {
+      console.error(`arev mcp: ${error instanceof Error ? error.message : "the server stopped"}`);
+      process.exitCode = EXIT.fail;
+    });
+  return EXIT.ok;
+}

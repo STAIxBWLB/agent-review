@@ -94,28 +94,30 @@ const MAX_EVENT_BYTES = 256 * 1024;
 /**
  * A packet event is larger than any other by construction: one unit per changed file plus, per rule, the paths that
  * rule applied to. The 500-file ceiling (`MAX_FILES` in `src/packet.ts`) with 160-byte paths and three rules covering
- * them measures about 360 KB. `arev record` refuses a report over `MAX_REPORT_BYTES`, so that is the bound its own
- * definition states, and it lives here because the record event carries the report's findings and coverage inside it.
+ * them measures about 360 KB. A record embeds the packet it was validated against, so this bounds that block too.
  */
 const MAX_PACKET_EVENT_BYTES = 1024 * 1024;
+/** The report bound: `arev record` refuses a report file over this many bytes, measured before the file is parsed. */
 export const MAX_REPORT_BYTES = 1024 * 1024;
 /**
- * The stored shape of a report that fits the report bound is larger than the file it was read from: every text goes
- * through `sanitize` (`src/frame.ts`), which prefixes `> ` to a line that looks like an untrusted header. The cheapest
- * such line is `[agent-hub`, so the worst ratio is 12/10; `frame()`'s per-line `>` is a display transform in
- * `src/rules.ts` and `src/packet.ts` and never reaches the ledger. A fifth of the bound covers that ratio.
+ * A record's stored line carries no cap of its own, because it is built from two bounded inputs and `sanitize`
+ * (`src/frame.ts`) inflates the larger of them by more than any fixed ratio: it prefixes `> ` to every line of a run
+ * that ends in a header-looking line, and its `\s*` lookahead crosses line breaks, so one blank line goes in and three
+ * bytes come out. A cap below that worst case refused a report that fits (issue #15); a cap at it is the same growth
+ * guess with a bigger number. So the bound is read where each input is: the packet block below, the report in
+ * `src/record.ts` before it is parsed, and each text the report carries after framing where that text is validated.
  */
-const STORED_REPORT_BYTES = MAX_REPORT_BYTES + Math.ceil(MAX_REPORT_BYTES / 5);
-/**
- * A record event embeds the packet it was validated against beside the report's own findings and coverage, so its bound
- * is both halves: a packet that fits the packet bound and a report that fits the report bound, stored.
- * The other events keep the smaller bound.
- */
-const MAX_RECORD_EVENT_BYTES = MAX_PACKET_EVENT_BYTES + STORED_REPORT_BYTES;
-/** The record bound, exported so a case can pin the refusal's own number instead of repeating it. */
-export const RECORD_EVENT_BOUND = MAX_RECORD_EVENT_BYTES;
-const eventCap = (type: LedgerEvent["type"]): number =>
-  type === "packet" ? MAX_PACKET_EVENT_BYTES : type === "record" ? MAX_RECORD_EVENT_BYTES : MAX_EVENT_BYTES;
+const eventCap = (type: LedgerEvent["type"]): number | undefined =>
+  type === "record" ? undefined : type === "packet" ? MAX_PACKET_EVENT_BYTES : MAX_EVENT_BYTES;
+
+/** The packet a record embeds is held to its own event's bound: a packet that can be written can be recorded. */
+function checkRecordPacket(record: ReviewRecordV1): void {
+  const packet = Buffer.byteLength(JSON.stringify(record.packet));
+  if (packet > MAX_PACKET_EVENT_BYTES) {
+    throw new Refusal(`the packet in this record event is ${packet} bytes, over the ${MAX_PACKET_EVENT_BYTES} bytes a packet event may be; shorten it`,
+      "build the packet with arev packet and record the report it wrote");
+  }
+}
 /**
  * Ledger reads go through `reviewGit`, so they describe the same checkout the packet does: an inherited `GIT_DIR` or
  * `GIT_WORK_TREE` would key the ledger to one repository while `arev packet` built a packet for another.
@@ -268,7 +270,8 @@ export function* stringsIn(value: unknown): Generator<string> {
 export function appendEvent(cwd: string, event: LedgerEvent, options: { home?: string } = {}): void {
   const line = JSON.stringify(event);
   const cap = eventCap(event.type);
-  if (Buffer.byteLength(line) > cap) throw new Refusal(`the ${event.type} event exceeds ${cap} bytes; shorten its text`, "arev show");
+  if (cap !== undefined && Buffer.byteLength(line) > cap) throw new Refusal(`the ${event.type} event exceeds ${cap} bytes; shorten its text`, "arev show");
+  if (event.type === "record") checkRecordPacket(event.record);
   // A tab or newline inside a string becomes the two characters `\t` / `\n` in the line, so an assignment the pattern
   // needs whitespace for (`token<TAB>: <value>`) stops matching there. Every string is screened as it was written, and
   // the line as well: serialization also joins a key to its value.

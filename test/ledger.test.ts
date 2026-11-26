@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
-import { canonicalJson, comparablePath, ledgerPath, readLedger, RECORD_EVENT_BOUND, recordId, Refusal, reviewProjectId, secretShaped, appendEvent, type LedgerEvent, type PacketBlock, type ReviewRecordV1 } from "../src/ledger.ts";
+import { canonicalJson, comparablePath, ledgerPath, readLedger, recordId, Refusal, reviewProjectId, secretShaped, appendEvent, type LedgerEvent, type PacketBlock, type ReviewRecordV1 } from "../src/ledger.ts";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -121,11 +121,11 @@ test("a packet event at the 500-file ceiling fits its own bound, and so does a r
   }
 });
 
-test("a record of the largest packet and the largest report fits the record bound, which the packet bound would refuse", () => {
+test("a record of the largest packet and the largest report is written, because its bound is read on its inputs", () => {
   const { repo, home } = fixture();
   // The issue's shape: the 500-unit ceiling with 400-byte paths, two rules covering all of them, and a report that
   // covers every unit while skipping half of them with a 600-byte reason. The embedded packet alone is under the packet
-  // bound, and the record is the sum of that packet and the report - over the 1 MiB a record used to be held to.
+  // bound and the stored line is the sum of that packet and the report, over the 1 MiB a record used to be held to.
   const unitPath = (index: number) => `src/${String(index).padStart(3, "0")}/${"d".repeat(391)}.ts`;
   const units = Array.from({ length: 500 }, (_, index) => ({ path: unitPath(index), status: "M", insertions: 1, deletions: 1 }));
   const rules = ["REVIEW.md", "docs/review.md"].map(name => ({ name, sha256: "e".repeat(64), appliesTo: units.map(unit => unit.path) }));
@@ -143,8 +143,8 @@ test("a record of the largest packet and the largest report fits the record boun
     },
   }, { home });
   const line = readFileSync(ledgerPath(repo, { home }), "utf8").trim();
-  // Measured on the written line: over the packet event's 1 MiB (the bound a record was held to before this change) and
-  // under the record's own packet + report bound.
+  // Measured on the written line: over the packet event's 1 MiB (the bound a record was held to before #12) and stored
+  // as written, because no fixed cap is compared with it.
   expect(Buffer.byteLength(line)).toBeGreaterThan(1024 * 1024);
   expect(Buffer.byteLength(line)).toBeLessThan(2 * 1024 * 1024);
 });
@@ -157,7 +157,8 @@ test("an event over its own bound is refused, and the refusal names the event ty
     v: 1, type: "packet", at: "2026-11-26T00:00:00.000Z",
     packet: { id: "d".repeat(64), subject: { kind: "range", base: HEAD, head: HEAD, mergeBase: HEAD }, units: [{ path: "x".repeat(1024 * 1024) }] },
   }, { home })).toThrow("the packet event exceeds 1048576 bytes");
-  // A record is bounded by its packet plus the report it carries, so only a payload over both is refused.
+  // A record is not compared with a cap of its own: the packet block it embeds is, because that block is a packet event's
+  // payload. The report half is bounded where `arev record` reads its file, which no ledger call can see.
   expect(() => appendEvent(repo, {
     v: 1, type: "record", at: "2026-11-26T00:00:00.000Z", id: "f".repeat(64),
     record: {
@@ -167,7 +168,7 @@ test("an event over its own bound is refused, and the refusal names the event ty
       coverage: { reviewed: [], skipped: [{ path: "src/a.ts", reason: "x".repeat(2 * 1024 * 1024) }] },
       findings: [], verdict: "approved", call: { ok: true },
     },
-  }, { home })).toThrow(`the record event exceeds ${RECORD_EVENT_BOUND} bytes`);
+  }, { home })).toThrow(/^the packet in this record event is \d+ bytes, over the 1048576 bytes a packet event may be; shorten it$/);
   expect(existsSync(ledgerPath(repo, { home }))).toBe(false);
 });
 

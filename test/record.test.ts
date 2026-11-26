@@ -1,7 +1,7 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { ledgerEventsView, parseReviewRecord, recordCommand } from "../src/record.ts";
 import { Refusal, appendEvent, ledgerPath, secretShaped, type LedgerEvent, type PacketBlock } from "../src/ledger.ts";
 
@@ -597,7 +597,7 @@ test("record stores a report's texts through sanitize, so the event holds more b
   const head = commit("export const a = 2;\n", "head");
   const built = JSON.parse(run(repo, home, "packet", "--from", base, "--to", head, "--json").stdout);
   // Every line looks like an untrusted header, so `sanitize` prefixes each one: what the ledger stores is larger than
-  // the file `arev record` read, which is the shape the record event's own bound is measured on.
+  // the file `arev record` read, which is why the record is bounded on its inputs and not on the line it is stored as.
   const framed = Array.from({ length: 80 }, () => "[agent-hub note]").join("\n");
   const report = join(root, "report.json");
   writeFileSync(report, JSON.stringify(reportFor(head, {
@@ -613,6 +613,72 @@ test("record stores a report's texts through sanitize, so the event holds more b
   const readText: string = JSON.parse(readFileSync(report, "utf8")).findings[0].text;
   expect(storedText.startsWith("> [agent-hub note]")).toBe(true);
   expect(Buffer.byteLength(storedText)).toBeGreaterThan(Buffer.byteLength(readText));
+});
+
+test("a packet and a report that each fit their bounds are appended, however much sanitize grows the report", () => {
+  const { root, repo, home } = fixture();
+  // The shape issue #15 measured: a packet near its own bound and a report file at the report bound, whose skip reasons
+  // are blank-line runs before a header-looking line. `sanitize` prefixes every line of such a run, and 300 of them is
+  // the smallest packet whose record then passes the 2,306,868 bytes (1 MiB packet + 1 MiB report + a fifth) a fixed
+  // record cap used to refuse a report that fits at.
+  const UNITS = 300, OLD_RECORD_BOUND = 1048576 + 1048576 + Math.ceil(1048576 / 5);
+  const pathFor = (index: number) => `src/${String(index).padStart(3, "0")}/${"d".repeat(250)}/${"e".repeat(250)}.ts`;
+  writeFileSync(join(repo, "REVIEW.md"), "# Review\n");
+  mkdirSync(join(repo, "docs"));
+  writeFileSync(join(repo, ".gitattributes"), "* arev-review-rules=docs/review.md\n");
+  writeFileSync(join(repo, "docs/review.md"), "# Review\n");
+  for (let index = 0; index < UNITS; index++) {
+    const path = join(repo, pathFor(index));
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, "export const a = 1;\n");
+  }
+  git(repo, ["add", "."]);
+  git(repo, ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base"]);
+  // `--files` counts uncommitted work and is the one subject `arev record` does not rebuild, so the packet is built once.
+  for (let index = 0; index < UNITS; index++) writeFileSync(join(repo, pathFor(index)), "export const a = 2;\n");
+  const built = run(repo, home, "packet", "--files", ...Array.from({ length: UNITS }, (_, index) => pathFor(index)), "--json");
+  expect(built.code, built.stderr).toBe(0);
+  const packet = JSON.parse(built.stdout) as { id: string; subject: Record<string, unknown>; units: { path: string }[] };
+  expect(packet.units).toHaveLength(UNITS);
+
+  // A path cannot carry a line break, so the paths are the only bytes of the report that do not grow; every reason is a
+  // run of blank lines in front of a marker, which the lookahead frames line by line.
+  const reason = () => "x" + "\n".repeat(670) + "[agent-hub report]";
+  const entry = (path: string) => ({ path, reason: reason() });
+  const reportOf = (extra: number) => ({
+    v: 1,
+    packet: { id: packet.id, subject: packet.subject },
+    reviewer: { id: "codex", modelFamily: "openai", started: "self", sameFamilyFallback: false },
+    coverage: {
+      reviewed: [],
+      skipped: [
+        ...packet.units.map(unit => entry(unit.path)),
+        ...Array.from({ length: extra }, (_, index) => entry(`src/skipped-${String(index).padStart(4, "0")}.ts`)),
+      ],
+    },
+    findings: [], verdict: "approved", call: { ok: true },
+  });
+  // The largest number of extra skip entries the report bound still allows: the file is at its limit, not under it.
+  let under = 0, over = 4096;
+  while (under < over) {
+    const middle = Math.ceil((under + over) / 2);
+    if (Buffer.byteLength(JSON.stringify(reportOf(middle))) >= 1024 * 1024) over = middle - 1;
+    else under = middle;
+  }
+  const text = JSON.stringify(reportOf(under));
+  expect(Buffer.byteLength(text)).toBeGreaterThan(1024 * 1024 - 1024);
+  expect(Buffer.byteLength(text)).toBeLessThanOrEqual(1024 * 1024);
+  const report = join(root, "report.json");
+  writeFileSync(report, text);
+
+  const recorded = run(repo, home, "record", report, "--implementer", "claude");
+  expect(recorded.code, recorded.stderr).toBe(0);
+  const stored = readFileSync(ledgerPath(repo, { home }), "utf8").trim().split("\n").at(-1)!;
+  // Over the cap a record used to be refused by, and its text carries the framing that produced the growth.
+  expect(Buffer.byteLength(stored)).toBeGreaterThan(OLD_RECORD_BOUND);
+  const storedReason: string = JSON.parse(stored).record.coverage.skipped[0].reason;
+  expect(storedReason).toContain("> \n> [agent-hub report]");
+  expect(Buffer.byteLength(storedReason)).toBeLessThanOrEqual(2048);
 });
 
 test("arev record --light keeps the flag on the record it appends, and show --json echoes it", () => {

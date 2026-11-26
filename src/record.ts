@@ -312,6 +312,18 @@ function rebuildRequest(subject: PacketBlock["subject"]): PacketRequest | undefi
 const threadOf = (subject: PacketBlock["subject"] | undefined): number | undefined => subject?.pr;
 
 /**
+ * The thread of one head: its own record's packet, or the newest packet event for that head when no record exists yet.
+ * `arev resolve` writes this on the event it appends, so a resolve names the thread it was made in rather than the one a
+ * replay happens to be reading.
+ */
+function threadAtHead(events: readonly LedgerEvent[], head: string): number | undefined {
+  const record = [...events].reverse().find(event => event.type === "record" && event.record.packet.subject.head === head);
+  if (record?.type === "record") return threadOf(record.record.packet.subject);
+  const packet = [...events].reverse().find(event => event.type === "packet" && event.packet.subject.head === head);
+  return threadOf(packet?.type === "packet" ? packet.packet.subject : undefined);
+}
+
+/**
  * Replay the ledger into the review of one head, scoped to that head's review thread: the records and resolves whose
  * packet carries the same `subject.pr`, or - for a head whose packet has none - only those recorded at that exact head.
  * The ledger is one file per project, so a resolve in one PR would otherwise settle the same finding id in another.
@@ -341,30 +353,25 @@ export function ledgerEventsView(events: readonly LedgerEvent[], head?: string):
   const recordIndex = recordEvent === undefined ? -1 : events.lastIndexOf(recordEvent);
 
   const sets: ReviewFindingSet[] = [];
-  const latest = new Map<string, RecordFinding>(), shown = new Map<string, RecordFinding>(), evidence = new Map<string, string[]>();
-  // A resolve's thread is the thread of the record it settles: the report at its head, which every resolver has before
-  // the resolve it writes. A resolve naming a head with no report of its own falls back to the newest report of its id
-  // in this thread, so `resolve --head` can name a head whose record is written later.
-  const headThread = new Map<string, number | undefined>(), reportedThread = new Map<string, number | undefined>();
+  const latest = new Map<string, RecordFinding>(), shownRecord = new Map<string, RecordFinding>(), evidence = new Map<string, string[]>();
   for (const [index, event] of events.entries()) {
     if (event.type === "record") {
       const subject = event.record.packet.subject;
-      headThread.set(subject.head, threadOf(subject));
       if (!inThread(subject)) continue;
       sets.push({ head: subject.head, items: event.record.findings.map(lifecycle) });
       for (const finding of event.record.findings) {
-        reportedThread.set(finding.id, threadOf(subject));
         latest.set(finding.id, finding);
         if (recordIndex !== -1 && index > recordIndex) continue;
-        shown.set(finding.id, finding);
+        shownRecord.set(finding.id, finding);
         if (finding.evidence?.length) evidence.set(finding.id, [...finding.evidence]);
         else evidence.delete(finding.id);
       }
     } else if (event.type === "resolve") {
       const reported = latest.get(event.finding);
       if (!reported) continue;
-      const settled = headThread.has(event.head) ? headThread.get(event.head) : reportedThread.get(event.finding);
-      if ((thread === undefined ? event.head !== target : settled !== thread)) continue;
+      // A resolve names the thread it was made in (`arev resolve` writes it from the head it settles), so a resolve in
+      // one PR is not replayed in another even when both report the same id. Without a thread the head is the identity.
+      if (thread === undefined ? event.head !== target : event.pr !== thread) continue;
       sets.push({
         head: event.head,
         items: [{
@@ -383,7 +390,7 @@ export function ledgerEventsView(events: readonly LedgerEvent[], head?: string):
     // The lifecycle merges a carried id across every record, so its path and anchor can describe a later head than the
     // one shown. Path, anchor and text all come from the last record at or before this head, like the evidence beside
     // them; only the disposition comes from the replay.
-    const source = shown.get(finding.id);
+    const source = shownRecord.get(finding.id);
     const base = { ...finding };
     delete base.path;
     delete base.anchor;
@@ -548,18 +555,29 @@ export function resolveCommand(cwd: string, args: readonly string[]): number {
       throw new Refusal("--as false_positive needs --evidence", `pass --evidence path:line (or the command output) that settles ${shown(id)}`);
     }
     const events = readLedger(cwd);
-    const known = events.some(event => event.type === "record" && event.record.findings.some(finding => finding.id === id));
-    if (!known) throw new Refusal(`no recorded finding has the id ${id}`, "run arev show to list the finding ids in the ledger");
     const newestRecord = [...events].reverse().find(event => event.type === "record");
     const head = parsed.flags["--head"]?.at(-1) ?? (newestRecord?.type === "record" ? newestRecord.record.packet.subject.head : undefined);
     if (!head) throw new Refusal("the ledger has no head to resolve against", "pass --head <sha> or record a review first");
+    // The thread is the head's own: its record's packet, else the newest packet for that head. The resolve states it on
+    // the event, and it refuses an id that thread never reported, so one PR's resolve cannot settle another PR's finding.
+    const thread = threadAtHead(events, head);
+    const reports = (event: LedgerEvent): boolean =>
+      event.type === "record" && event.record.findings.some(finding => finding.id === id)
+      && (thread === undefined ? event.record.packet.subject.head === head : threadOf(event.record.packet.subject) === thread);
+    if (!events.some(reports)) {
+      throw new Refusal(thread === undefined
+        ? `no record at ${head} reports the finding ${shown(id)}`
+        : `no record of PR ${thread} reports the finding ${shown(id)}`,
+        thread === undefined ? `pass --head of a head whose record reports it, or record that review first` : "run arev show to list the finding ids recorded for that PR");
+    }
     const event: LedgerEvent = {
       v: 1, type: "resolve", at: new Date().toISOString(), head, finding: id, as,
+      ...(thread === undefined ? {} : { pr: thread }),
       ...(evidence.length ? { evidence } : {}),
       ...(rationale === undefined ? {} : { rationale: cliText(rationale, MAX_TEXT, "--rationale") }),
     };
     appendEvent(cwd, event);
-    if (parsed.flags["--json"] !== undefined) console.log(JSON.stringify({ finding: id, as, head, evidence, ...(rationale === undefined ? {} : { rationale }) }, null, 2));
+    if (parsed.flags["--json"] !== undefined) console.log(JSON.stringify({ finding: id, as, head, ...(thread === undefined ? {} : { pr: thread }), evidence, ...(rationale === undefined ? {} : { rationale }) }, null, 2));
     else console.log(`resolved ${id} as ${as} at ${head}; next: arev show, then arev gate`);
     return EXIT.ok;
   } catch (error) {

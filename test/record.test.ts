@@ -206,7 +206,7 @@ test("the view carries an open blocking finding to a later head and a resolve se
   expect(view.findings.find(entry => entry.id === "bugs:missing-frame")?.text).toBe("raw reviewed content reached the packet");
   expect(ledgerEventsView(events).head).toBe(NEXT);
 
-  const settled = ledgerEventsView([...events, { v: 1, type: "resolve", at: "t4", head: NEXT, finding: "bugs:missing-frame", as: "fixed", evidence: ["src/a.ts:40"] }], NEXT);
+  const settled = ledgerEventsView([...events, { v: 1, type: "resolve", at: "t4", head: NEXT, pr: PR, finding: "bugs:missing-frame", as: "fixed", evidence: ["src/a.ts:40"] }], NEXT);
   expect(settled.openBlocking).toEqual([]);
   expect(settled.counts).toMatchObject({ fixed: 1, openImportant: 0 });
   expect(settled.findings.find(entry => entry.id === "bugs:missing-frame")?.evidence).toEqual(["src/a.ts:40"]);
@@ -230,7 +230,7 @@ test("a finding's lifecycle is scoped to its PR: one PR's resolve leaves another
     // The other PR reports the same id as an advisory, and it is the later record: a resolve expands its finding from the
     // latest report of the id, so this severity is what a replay that did not skip the other PR's record would show.
     { v: 1, type: "record", at: "t3", id: "record-2", record: recordAt(NEXT, [finding({ text: "the other PR's frame is missing", severity: "advisory" })], "changes_requested", { ok: true }, 8) },
-    { v: 1, type: "resolve", at: "t4", head: HEAD, finding: "bugs:missing-frame", as: "fixed", evidence: ["src/a.ts:40"] },
+    { v: 1, type: "resolve", at: "t4", head: HEAD, pr: PR, finding: "bugs:missing-frame", as: "fixed", evidence: ["src/a.ts:40"] },
   ];
   // PR 7's own head is settled, and it settles the blocking finding this PR reported, not the advisory one PR 8 did.
   const mine = ledgerEventsView(events, HEAD);
@@ -243,6 +243,16 @@ test("a finding's lifecycle is scoped to its PR: one PR's resolve leaves another
   expect(theirs.counts).toMatchObject({ important: 0, nit: 1, openNit: 1, fixed: 0 });
   expect(theirs.findings.find(entry => entry.id === "bugs:missing-frame")?.text).toBe("the other PR's frame is missing");
   expect(theirs.findings.find(entry => entry.id === "bugs:missing-frame")?.disposition).toBe("open");
+  // A resolve names its own thread on the event, so one that names another PR settles nothing here even though the head
+  // it sits at is this PR's: the match is `event.pr`, not the head. The pair is the same ledger with only that number
+  // changed, so the arm that settles and the arm that does not are read against each other.
+  const withoutOwnResolve = events.filter(event => event.type !== "resolve");
+  const atHead = (pr: number): LedgerEvent => ({ v: 1, type: "resolve", at: "t5", head: HEAD, pr, finding: "bugs:missing-frame", as: "fixed" });
+  const own = ledgerEventsView([...withoutOwnResolve, atHead(PR)], HEAD);
+  expect(own.counts).toMatchObject({ important: 1, fixed: 1, openImportant: 0 });
+  const crossed = ledgerEventsView([...withoutOwnResolve, atHead(8)], HEAD);
+  expect(crossed.counts).toMatchObject({ important: 1, fixed: 0, openImportant: 1 });
+  expect(crossed.openBlocking).toEqual(["bugs:missing-frame"]);
 });
 
 test("without a PR a finding's lifecycle is that exact head, and nothing carries between heads", () => {
@@ -262,10 +272,10 @@ test("a later resolve states its own evidence, so one without evidence clears th
   const events: LedgerEvent[] = [
     { v: 1, type: "packet", at: "t0", packet: packetFor(HEAD) },
     { v: 1, type: "record", at: "t1", id: "record-1", record: recordAt(HEAD, [finding()]) },
-    { v: 1, type: "resolve", at: "t2", head: HEAD, finding: "bugs:missing-frame", as: "fixed", evidence: ["src/a.ts:40"] },
+    { v: 1, type: "resolve", at: "t2", head: HEAD, pr: PR, finding: "bugs:missing-frame", as: "fixed", evidence: ["src/a.ts:40"] },
   ];
   expect(ledgerEventsView(events, HEAD).findings[0]?.evidence).toEqual(["src/a.ts:40"]);
-  const second = ledgerEventsView([...events, { v: 1, type: "resolve", at: "t3", head: HEAD, finding: "bugs:missing-frame", as: "fixed" }], HEAD);
+  const second = ledgerEventsView([...events, { v: 1, type: "resolve", at: "t3", head: HEAD, pr: PR, finding: "bugs:missing-frame", as: "fixed" }], HEAD);
   expect(second.findings[0]?.evidence).toBeUndefined();
   expect(second.findings[0]?.disposition).toBe("fixed");
 });
@@ -527,6 +537,19 @@ test("a secret-shaped report is refused before it is parsed, and its value reach
   expect(escaped.code).toBe(1);
   expect(escaped.stderr).toContain("matches a secret pattern");
   expect(escaped.stderr).not.toContain(secretId);
+
+  // The guard on a printed value: this one comes from the command line rather than the report, so no screen sees it, and
+  // the refusal still withholds it.
+  const withheld = run(repo, home, "resolve", secretId, "--as", "fixed", "--head", packetHead);
+  expect(withheld.code).toBe(1);
+  expect(withheld.stderr).toContain("<withheld>");
+  expect(withheld.stderr).not.toContain(secretId);
+  // Every place a refusal prints an id, this one included: it fires before the ledger is read, so no record is needed.
+  const unevidenced = run(repo, home, "resolve", secretId, "--as", "false_positive");
+  expect(unevidenced.code).toBe(1);
+  expect(unevidenced.stderr).toContain("--as false_positive needs --evidence");
+  expect(unevidenced.stderr).toContain("<withheld>");
+  expect(unevidenced.stderr).not.toContain(secretId);
 
   // A value the screen does not catch is still named by its type, never echoed, and the head must be a full OID.
   const plainHead = run(repo, home, "record", write("plain-head.json", reportFor(HEAD, { packet: { id: PACKET, subject: { head: "not-a-full-sha" } } })));

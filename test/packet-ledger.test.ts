@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { reviewProjectId } from "../src/ledger.ts";
@@ -151,6 +151,60 @@ test("arev packet --pr N names the PR in the packet's subject, and the report wr
   const shown = JSON.parse(cli("show", "--json").stdout);
   expect(shown.packet).toBe(packet.id);
   expect(shown.head).toBe(head);
+});
+
+test("a resolve names its own PR, so a head with a packet but no record settles only that PR", () => {
+  const bin = mkdtempSync(join(tmpdir(), "arev-gh-"));
+  const home = mkdtempSync(join(tmpdir(), "arev-home-"));
+  scratch.push(bin, home);
+  const { dir, git, write, base, head, cli } = reviewedFlow("# Review\n", { PATH: `${bin}:${process.env.PATH ?? ""}`, AGENTHUB_HOME: home });
+  // A fake `gh` sets only the refs: each call answers with the head this test is about to packet, so nothing leaves the
+  // machine and two PRs can be reviewed in one ledger.
+  const gh = (ref: string) => writeFileSync(join(bin, "gh"),
+    `#!/bin/sh\nprintf '{"baseRefOid":"${base}","headRefOid":"${ref}"}'\n`, { mode: 0o755 });
+  const commit = (body: string, message: string) => {
+    write("src/a.ts", body);
+    git("add", ".");
+    git("commit", "-qm", message);
+    return git("rev-parse", "HEAD").trim();
+  };
+  const second = commit("export const a = 3;\n", "second head"), third = commit("export const a = 4;\n", "third head");
+  const blocking = { id: "bugs:cross-pr", term: "bugs", severity: "blocking", disposition: "open", origin: "introduced", text: "the same defect is reported in both PRs" };
+
+  // PR 7 reports it at its first head, PR 8 reports it at its own head.
+  gh(head);
+  const firstPacket = JSON.parse(cli("packet", "--pr", "7", "--json").stdout) as BuiltPacket;
+  expect(cli("record", report(reportFor(firstPacket, { findings: [blocking], verdict: "changes_requested" }))).status).toBe(0);
+  gh(second);
+  const otherPacket = JSON.parse(cli("packet", "--pr", "8", "--json").stdout) as BuiltPacket;
+  // A second id only this PR reports, so the resolve below can be refused for the thread alone rather than for existence.
+  const otherOnly = { ...blocking, id: "bugs:other-only", text: "only the other PR reports this" };
+  expect(cli("record", report(reportFor(otherPacket, { findings: [blocking, otherOnly], verdict: "changes_requested" }))).status).toBe(0);
+
+  // PR 7 moves to a third head: a packet with no record of its own, which is where the resolve is made.
+  gh(third);
+  expect(cli("packet", "--pr", "7", "--json").status).toBe(0);
+  // An id this PR never reported is refused, so the resolve cannot reach past its own thread.
+  const unknown = cli("resolve", "bugs:nowhere", "--head", third, "--as", "fixed");
+  expect(unknown.status).toBe(1);
+  expect(unknown.stderr).toContain("no record of PR 7 reports the finding bugs:nowhere");
+  // An id the other PR alone reports is refused here too, so the check is this head\x27s thread, not the whole ledger.
+  const elsewhere = cli("resolve", "bugs:other-only", "--head", third, "--as", "fixed");
+  expect(elsewhere.status).toBe(1);
+  expect(elsewhere.stderr).toContain("no record of PR 7 reports the finding bugs:other-only");
+
+  const resolved = cli("resolve", "bugs:cross-pr", "--head", third, "--as", "fixed");
+  expect(resolved.stderr).toBe("");
+  expect(resolved.status).toBe(0);
+  // The event carries the thread it was made in, which is what a replay matches: the head alone would settle PR 7's id
+  // in PR 8 as well, because both report it.
+  const ledger = readFileSync(join(home, "review", ...reviewProjectId(dir).split("/"), "ledger.jsonl"), "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line));
+  expect(ledger.filter((event: { type: string }) => event.type === "resolve").at(-1)).toMatchObject({ finding: "bugs:cross-pr", head: third, pr: 7 });
+
+  expect(JSON.parse(cli("show", "--head", third, "--json").stdout).openBlocking).toEqual([]);
+  const other = JSON.parse(cli("show", "--head", second, "--json").stdout);
+  expect(other.openBlocking).toEqual(["bugs:cross-pr", "bugs:other-only"]);
+  expect(other.counts).toMatchObject({ openImportant: 2, fixed: 0 });
 });
 
 test("a report whose packet id is not the packet arev built for that head is refused", () => {

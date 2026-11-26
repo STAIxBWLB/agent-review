@@ -34,3 +34,16 @@ test("rejects unavailable commands and extra arguments", () => {
     expect(result.stderr).toContain("arev --help");
   }
 });
+
+test("a record, resolve or show argument error refuses as usage and names that command's help", () => {
+  for (const [args, message] of [
+    [["record"], "arev: record takes exactly one report file (got 0)"],
+    [["resolve"], "arev: resolve takes exactly one finding id (got 0)"],
+    [["show", "--bogus"], "arev: show takes --head <sha> and --json"],
+  ] as const) {
+    const result = run(...args);
+    expect(result.code).toBe(2);
+    expect(result.stderr).toContain(message);
+    expect(result.stderr).toContain(`→ arev ${args[0]} --help`);
+  }
+});

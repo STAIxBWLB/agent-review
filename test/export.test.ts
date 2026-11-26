@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { appendEvent } from "../src/ledger.ts";
+import { parseReviewFindings } from "../src/findings.ts";
 import { isolatedPacket } from "./packet-fixture.ts";
 import { exchangeFixture } from "./exchange-fixture.ts";
 
@@ -161,3 +162,50 @@ test("hub export gives a carried OCR finding its text as the rationale it has no
     rationale: "> Handle an empty result before caching it." });
   expect(Object.hasOwn(carried!, "text")).toBe(false);
 });
+
+// A record accepts a description up to 2048 bytes, and the hub accepts a rationale up to 2048 bytes, both counted in UTF-8
+// bytes. Framing spends 2 bytes on every line, so those two bounds are not the same input: these are the descriptions the
+// record takes whole and the hub would refuse whole, and the one that fits the hub's bound only after framing.
+for (const [label, description, cut] of [
+  ["one line at the record's bound", "a".repeat(2048), true],
+  ["ten lines just past it once framed", Array.from({ length: 10 }, () => "a".repeat(203)).join("\n"), true],
+  ["one multibyte line at the record's bound", `x${"한".repeat(682)}`, true],
+  ["one line framed to exactly the bound", "b".repeat(2046), false],
+] as const) {
+  test(`hub export keeps a carried ${label} inside the hub's rationale bound`, () => {
+    const { dir, home, cli, ingest, load, git, write, base, head } = exchangeFixture();
+    const savePacket = (head: string) => {
+      const { packet } = isolatedPacket(dir, { kind: "range", base, head, pr: 7 });
+      appendEvent(dir, { v: 1, type: "packet", at: "2026-11-26T00:00:00Z", packet }, { home });
+      return packet.id;
+    };
+    expect(Buffer.byteLength(description)).toBeLessThanOrEqual(2048);
+    const ocr = load("ocr");
+    const findings = ocr.findings as Record<string, unknown>[];
+    expect(ingest("ocr", { ...ocr, packet_id: savePacket(head),
+      findings: [{ ...findings[0], content: description, severity: "high", disposition: "open" }] }).status).toBe(0);
+
+    write("src/rules.ts", "later rule text\n");
+    git("commit", "-qam", "later head");
+    const later = git("rev-parse", "HEAD").trim();
+    const report = load("hub");
+    const hub = report.hub_review as Record<string, unknown>;
+    expect(ingest("hub", { ...report, head: later, packet_id: savePacket(later),
+      hub_review: { ...hub, verdict: "changes_requested", findings: [] } }).status).toBe(0);
+
+    const exported = cli("export", "--to", "hub", "--head", later, "--pr", "7");
+    expect(exported.status).toBe(0);
+    const exportedFindings = JSON.parse(exported.stdout).findings;
+    const [carried] = exportedFindings as { rationale: string }[];
+    expect(Buffer.byteLength(carried!.rationale)).toBeLessThanOrEqual(2048);
+    if (cut) expect(carried!.rationale.endsWith(" [...]")).toBe(true);
+    // This one fits the bound only as a framed line, so the whole description has to survive it.
+    else expect(carried!.rationale).toBe(`> ${description}`);
+    // The cut lands mid-line, so the check that it is a framed line is that the prefix survives it.
+    for (const line of carried!.rationale.split("\n")) expect(line.startsWith("> ")).toBe(true);
+    // A cut counted in bytes has to land on a character boundary, or the last character is half of itself.
+    expect(Buffer.from(carried!.rationale, "utf8").toString("utf8")).toBe(carried!.rationale);
+    // The bound is the hub's, so the export is round-tripped through the hub's own parser rather than measured alone.
+    expect(parseReviewFindings(exportedFindings, { person: false, maxNits: 5 })[0]?.rationale).toBe(carried!.rationale);
+  });
+}

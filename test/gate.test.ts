@@ -53,7 +53,16 @@ function fixture(review: string | null = "# Review\n- Every change is reviewed a
   const older = commit({ ...(review === null ? {} : { "REVIEW.md": review }), "src/a.ts": "export const a = 1;\n" }, "older");
   const base = commit({ "src/a.ts": "export const a = 2;\n" }, "base");
   const head = commit({ "src/a.ts": "export const a = 3;\n" }, "head");
+  // The gate reads its merge base the way `arev rules` does, from the origin default branch, so the fixture gives the
+  // remote one: `base` is upstream, which makes a packet built from `base` be at the current merge base.
+  gitOut(repo, ["update-ref", "refs/remotes/origin/main", base]);
+  gitOut(repo, ["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"]);
   return { repo, home, older, base, head };
+}
+
+/** Move the origin default branch, so a test can check a record against a base that has since moved. */
+function upstream(repo: string, sha: string): void {
+  gitOut(repo, ["update-ref", "refs/remotes/origin/main", sha]);
 }
 
 const PACKET = "d".repeat(64);
@@ -131,12 +140,22 @@ test("the gate passes a head whose review is complete", () => {
   const id = seed({ repo, home, subject, record: recordFor(subject) });
 
   const result = gateReport(repo, { head, home });
-  expect(result).toEqual({ head, base, record: id, verdict: "approved", ok: true, open: [] });
+  expect(result).toEqual({ head, base, mergeBase: base, record: id, verdict: "approved", ok: true, open: [] });
   // Same inputs, same answer: the gate reads the ledger and git only (AC4).
   expect(gateReport(repo, { head, home })).toEqual(result);
   // The head defaults to the repository's own HEAD.
   expect(gateReport(repo, { home })).toEqual(result);
   expect(() => gateReport(repo, { head: "abc1234", home })).toThrow("--head must be a full commit SHA");
+  // A `--head` that is not hexadecimal is named by its length, never echoed: the argument is the caller's text.
+  const refusal = (value: string) => {
+    try {
+      gateReport(repo, { head: value, home });
+      return "";
+    } catch (error) {
+      return (error as Error).message;
+    }
+  };
+  expect(refusal(`ghp_${"a".repeat(36)}`)).toBe("--head must be a full commit SHA (got 40 characters that are not a hexadecimal commit SHA)");
 });
 
 test("a head with no record fails, and a record for an older head never passes", () => {
@@ -146,12 +165,14 @@ test("a head with no record fails, and a record for an older head never passes",
   expect(empty.base).toBeUndefined();
   expect(empty.record).toBeUndefined();
 
-  // A record for the middle commit passes there and nowhere later: the gate never reads the newest record.
+  // A record for the middle commit passes there and nowhere later: the gate never reads the newest record. The remote's
+  // upstream is still `older`, so the record's own merge base is the current one for that head.
+  upstream(repo, older);
   const subject: Subject = { kind: "range", base: older, head: base, mergeBase: older };
   const id = seed({ repo, home, subject, record: recordFor(subject) });
 
   expect(gateReport(repo, { head, home })).toMatchObject({ head, ok: false, open: [`no record for head ${head}; run arev record with the report for this head`] });
-  expect(gateReport(repo, { head: base, home })).toEqual({ head: base, base: older, record: id, verdict: "approved", ok: true, open: [] });
+  expect(gateReport(repo, { head: base, home })).toEqual({ head: base, base: older, mergeBase: older, record: id, verdict: "approved", ok: true, open: [] });
 });
 
 test("an open blocking finding fails the gate by name until a disposition settles it", () => {
@@ -236,6 +257,62 @@ test("REVIEW.md must be at the merge base unless the record says --light", () =>
   const light = gated(true);
   expect(light).toMatchObject({ head, base, ok: true, open: [] });
   expect(light.record).toBe(light.id);
+});
+
+test("a record made against an old merge base fails and names both bases", () => {
+  const { repo, base, head, home } = fixture();
+  const subject: Subject = { kind: "range", base, head, mergeBase: base };
+  seed({ repo, home, subject, record: recordFor(subject) });
+  expect(gateReport(repo, { head, home }).ok).toBe(true);
+
+  // The branch now merges into `head` itself, so the record's base is no longer the current one: AC4 gates the base too.
+  upstream(repo, head);
+  const moved = gateReport(repo, { head, home });
+  expect(moved.ok).toBe(false);
+  expect(moved.open).toEqual([`record made against merge base ${base}; current merge base is ${head}; rerun arev packet`]);
+  // The record's own base is still reported, beside the one the gate checked against.
+  expect(moved).toMatchObject({ base, mergeBase: head });
+});
+
+test("a workspace or commit record fails even at the current merge base", () => {
+  const { repo, head } = fixture();
+  // The branch has moved and its own head is upstream, so the base condition is satisfied and only the kind is wrong.
+  upstream(repo, head);
+  const at = (kind: string): Subject => ({ kind, base: head, head, mergeBase: head });
+  const gated = (kind: string) => {
+    const home = temp("arev-hub-");
+    const subject = at(kind);
+    seed({ repo, home, subject, record: recordFor(subject) });
+    return gateReport(repo, { head, home });
+  };
+
+  // A workspace record reviewed uncommitted changes, and a commit record reviewed one commit: neither reviewed the branch.
+  expect(gated("workspace").open).toEqual(["record subject is workspace; record a range or PR review"]);
+  expect(gated("workspace").ok).toBe(false);
+  expect(gated("commit").open).toEqual(["record subject is commit; record a range or PR review"]);
+});
+
+test("every evaluation appends a gate event, and two runs agree", () => {
+  const { repo, older, base, head, home } = fixture();
+  const subject: Subject = { kind: "range", base, head, mergeBase: base };
+  const id = seed({ repo, home, subject, record: recordFor(subject) });
+
+  const first = run(repo, { AGENTHUB_HOME: home }, "gate", "--json");
+  const second = run(repo, { AGENTHUB_HOME: home }, "gate", "--json");
+  expect(first.code).toBe(0);
+  expect(second.code).toBe(0);
+  // The same ledger and git state give the same answer, and writing the gate event does not change the next one.
+  expect(second.stdout).toBe(first.stdout);
+  expect(JSON.parse(first.stdout)).toMatchObject({ head, ok: true, record: id });
+
+  const failed = run(repo, { AGENTHUB_HOME: home }, "gate", "--json", "--head", older);
+  expect(failed.code).toBe(1);
+
+  const gates = events(repo, home).filter((event): event is Extract<LedgerEvent, { type: "gate" }> => event.type === "gate");
+  expect(gates).toHaveLength(3);
+  expect(gates.slice(0, 2).map(({ head: at, base: from, ok, record, open }) => ({ at, from, ok, record, open })))
+    .toEqual([{ at: head, from: base, ok: true, record: id, open: undefined }, { at: head, from: base, ok: true, record: id, open: undefined }]);
+  expect(gates[2]).toMatchObject({ head: older, ok: false, open: [`no record for head ${older}; run arev record with the report for this head`] });
 });
 
 test("the gate takes no --light flag, and a bad [gate] setting refuses by name", () => {

@@ -47,6 +47,10 @@ test("packet, record, resolve and gate run with no hub and the default home", ()
   gitOut(repo, ["add", "."]);
   gitOut(repo, ["commit", "-qm", "head"]);
   const head = gitOut(repo, ["rev-parse", "HEAD"]);
+  // The gate computes its merge base from the origin default branch, the way `arev rules` does, so the fixture's remote
+  // has to exist as a ref: `base` is what this branch would merge into.
+  gitOut(repo, ["update-ref", "refs/remotes/origin/main", base]);
+  gitOut(repo, ["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"]);
 
   const env: Record<string, string | undefined> = { ...GIT_ENV, HOME: home };
   delete env.AGENTHUB_HOME;
@@ -102,5 +106,6 @@ test("packet, record, resolve and gate run with no hub and the default home", ()
   const ledger = join(home, ".agenthub", "review", "github.com/owner/repo", "ledger.jsonl");
   expect(existsSync(ledger)).toBe(true);
   const types = readFileSync(ledger, "utf8").split("\n").filter(Boolean).map(line => (JSON.parse(line) as { type: string }).type);
-  expect(types).toEqual(["packet", "record", "resolve"]);
+  // The two gate evaluations above ran before and after the resolve, so the ledger carries the spec's five kinds.
+  expect(types).toEqual(["packet", "record", "gate", "resolve", "gate"]);
 });

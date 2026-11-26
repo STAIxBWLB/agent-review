@@ -9,13 +9,16 @@ import { EXIT, errorLine } from "@staix/cli-output";
 import { Refusal, appendEvent, readLedger, type LedgerEvent, type ReviewRecordV1 } from "./ledger.ts";
 import { ledgerEventsView } from "./record.ts";
 import { parseReviewMd } from "./review-md.ts";
-import { commitOid } from "./review-git.ts";
+import { commitOid, mergeBaseOid, reviewGit } from "./review-git.ts";
 import { readRules } from "./rules.ts";
 
 /** One gate evaluation: what was gated, what the ledger says, and each condition still open. */
 export interface GateResult {
   head: string;
+  /** The record's own base: what its packet was built from. */
   base?: string;
+  /** The merge base the gate checked the record against: the origin default branch's, right now. */
+  mergeBase?: string;
   record?: string;
   verdict?: ReviewRecordV1["verdict"];
   ok: boolean;
@@ -23,7 +26,10 @@ export interface GateResult {
 }
 
 const FULL_OID = /^[a-f0-9]{40}$|^[a-f0-9]{64}$/;
+const HEX = /^[0-9a-f]{1,64}$/i;
 const STATUS_CONTEXT = "arev/gate";
+/** The subject kinds a gate can pass: a review of the branch, not of one commit or of uncommitted changes. */
+const BRANCH_KINDS = ["range", "pr"];
 
 /** The commit a rules file is read from: the record's merge base, else its base. */
 function ruleBase(record: ReviewRecordV1): string | undefined {
@@ -32,11 +38,30 @@ function ruleBase(record: ReviewRecordV1): string | undefined {
 }
 
 /**
+ * The merge base of the origin default branch and `head`, read exactly as `arev rules` reads its base: AC4's "current
+ * full head and base" is the base the branch would merge into now, not the one its packet was built against.
+ */
+function currentMergeBase(cwd: string, head: string): string {
+  const defaultRef = ["origin/HEAD", "origin/main", "origin/master"].find(ref =>
+    reviewGit(cwd, ["rev-parse", "--verify", "-q", `${ref}^{commit}`]).status === 0);
+  if (!defaultRef) {
+    throw new Refusal("No origin default branch is available. Fetch origin and set its default branch with git remote set-head origin --auto.",
+      "git remote set-head origin --auto");
+  }
+  return mergeBaseOid(cwd, commitOid(cwd, defaultRef), head);
+}
+
+/** A SHA echoed back only when it is one: any other `--head` value is named by its length, never repeated. */
+const shownHead = (value: string): string =>
+  HEX.test(value) ? ` (got ${value})` : ` (got ${value.length} characters that are not a hexadecimal commit SHA)`;
+
+/**
  * The gate's decision, with no output and no side effect. `head` defaults to the repository's current HEAD.
  */
 export function gateReport(cwd: string, options: { head?: string; home?: string } = {}): GateResult {
   const head = options.head ?? commitOid(cwd, "HEAD");
-  if (!FULL_OID.test(head)) throw new Refusal(`--head must be a full commit SHA (got ${head})`, "pass the full 40-character head SHA");
+  if (!FULL_OID.test(head)) throw new Refusal(`--head must be a full commit SHA${shownHead(head)}`, "pass the full 40-character head SHA");
+  const mergeBase = currentMergeBase(cwd, head);
   const events = readLedger(cwd, { home: options.home });
   const recordEvent = [...events].reverse().find((event): event is Extract<LedgerEvent, { type: "record" }> =>
     event.type === "record" && event.record.packet.subject.head === head);
@@ -51,6 +76,16 @@ export function gateReport(cwd: string, options: { head?: string; home?: string 
     const reviewer = record.reviewer;
     const implementer = reviewer.implementer;
     const selfReview = implementer !== undefined && implementer === reviewer.id;
+    // AC4 gates the head *and* the base: a record built against a base the branch no longer merges into reviewed a
+    // different change, and a workspace or commit record reviewed something that is not this branch.
+    const kind = record.packet.subject.kind;
+    if (kind === undefined || !BRANCH_KINDS.includes(kind)) {
+      open.push(`record subject is ${kind ?? "(unstated)"}; record a range or PR review`);
+    }
+    const recordedBase = record.packet.subject.mergeBase;
+    if (recordedBase !== mergeBase) {
+      open.push(`record made against merge base ${recordedBase ?? "(none)"}; current merge base is ${mergeBase}; rerun arev packet`);
+    }
     // One read of the base-tree rules: the [gate] settings and the REVIEW.md presence check both come from it (AC2).
     const rules = base === undefined ? undefined : readRules(cwd, base, []).rules;
     const allowed = parseReviewMd(rules ?? []).sameFamily === "allow";
@@ -73,6 +108,7 @@ export function gateReport(cwd: string, options: { head?: string; home?: string 
   return {
     head,
     ...(base === undefined ? {} : { base }),
+    mergeBase,
     ...(recordEvent ? { record: recordEvent.id, verdict: recordEvent.record.verdict } : {}),
     ok: open.length === 0 && recordEvent !== undefined,
     open,
@@ -140,6 +176,16 @@ export function gateCommand(cwd: string, args: readonly string[]): number {
   try {
     const result = gateReport(cwd, {
       ...(parsed.flags["--head"]?.at(-1) === undefined ? {} : { head: parsed.flags["--head"]!.at(-1)! }),
+    });
+    // The spec's ledger has a `gate` event, so each evaluation is recorded: it is written here, never inside the pure
+    // decision, and it sits before the `post` event because a pass posts after this line. The decision reads only
+    // record, resolve and packet events, so writing it changes no later answer.
+    appendEvent(cwd, {
+      v: 1, type: "gate", at: new Date().toISOString(), head: result.head,
+      ...(result.mergeBase === undefined ? {} : { base: result.mergeBase }),
+      ok: result.ok,
+      ...(result.record === undefined ? {} : { record: result.record }),
+      ...(result.open.length === 0 ? {} : { open: result.open }),
     });
     if (parsed.flags["--post"] !== undefined) {
       // No status is ever posted for a head the gate did not pass, and a failing gate posts nothing.

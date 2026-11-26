@@ -209,6 +209,7 @@ test("reviewer secrets are removed from stdout, stderr and the response artifact
   const canary = "ghp_" + "a".repeat(36);
   const result = cli("run", "--host", "codex", "--implementer", "qwen", "--out", out);
   expect(result.status).toBe(1);
+  expect(result.stderr).toContain(`inspect the redacted output in ${out}`);
   for (const name of ["reviewer.stdout", "reviewer.stderr", "reviewer-response.md"]) {
     expect(result.stderr).toContain(`${name}: 1 redacted line(s)`);
     expect(readFileSync(join(out, name), "utf8")).toContain("[redacted reviewer output]");

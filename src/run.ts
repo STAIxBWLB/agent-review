@@ -334,7 +334,7 @@ export async function runCommand(cwd: string, args: readonly string[]): Promise<
 
   if (redactions.length) {
     throw new Refusal(`Reviewer output was withheld (${redactions.join(", ")})`,
-      "inspect the redacted output and rerun with a reviewer that does not print sensitive values");
+      `inspect the redacted output in ${shown(out)} and rerun with a reviewer that does not print sensitive values`);
   }
 
   const stdout = join(out, STDOUT_FILE);

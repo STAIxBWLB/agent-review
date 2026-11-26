@@ -1,9 +1,10 @@
 import { afterEach, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { readLedger } from "../src/ledger.ts";
+import { RUN_TOOL_NAMES } from "../src/mcp.ts";
 import { fixture } from "./packet-fixture.ts";
 
 const scratch: string[] = [];
@@ -11,18 +12,44 @@ afterEach(() => {
   for (const path of scratch.splice(0)) rmSync(path, { recursive: true, force: true });
 });
 
-function reviewer(mode: "json" | "dirty" | "timeout" | "brief" | "invalid" | "secret" | "escaped-secret" | "mcp" | "mcp-dirty" | "mcp-failed", review = "# Review\n", host = "codex", separator = "") {
+// The first git the test process would run. On macOS /usr/bin/git is a stub that re-execs the developer-tools copy, and
+// paying that on every reviewer invocation cost about a second per case on the CI runner.
+function hostGit(): string {
+  const found = (process.env.PATH ?? "").split(delimiter).map(dir => join(dir, "git")).find(path => {
+    try { return statSync(path).isFile(); } catch { return false; }
+  });
+  return found ?? "/usr/bin/git";
+}
+
+function reviewer(mode: "json" | "dirty" | "timeout" | "brief" | "invalid" | "secret" | "escaped-secret" | "mcp" | "mcp-dirty" | "mcp-failed" | "hook", review = "# Review\n", host = "codex", separator = "") {
   const sandbox = mkdtempSync(join(tmpdir(), "arev-run-test-"));
   scratch.push(sandbox);
   const bin = join(sandbox, "bin"), userHome = join(sandbox, "home"), out = join(sandbox, "out");
+  // Artifacts the fake reviewer writes outside every directory the runner owns, so they outlive the checkout.
+  const hookMarker = join(sandbox, "hook-ran");
+  const envFile = join(sandbox, "reviewer-env.json");
+  const argvFile = join(sandbox, "reviewer-argv.json");
+  const probeCwdFile = join(sandbox, "probe-cwd");
+  const runCwdFile = join(sandbox, "reviewer-cwd");
   mkdirSync(bin);
   mkdirSync(join(userHome, ".codex"), { recursive: true });
   writeFileSync(join(userHome, ".codex", "config.toml"), 'model = "fixture-model"\n');
-  const repo = fixture({ HOME: userHome, PATH: `${bin}:${process.env.PATH ?? ""}`, OPENAI_API_KEY: "fixture-not-for-reviewer" });
+  // A case that removes an executable the fixture provides means the run has none, so PATH is the fixture bin plus the
+  // system directories git and sh live in - never the host PATH, which lets an installed one answer a case that has
+  // none. The host's own git is linked into the bin, because the macOS system copy is a stub that re-execs it.
+  symlinkSync(hostGit(), join(bin, "git"));
+  const repo = fixture({ HOME: userHome, PATH: `${bin}:/usr/bin:/bin`, OPENAI_API_KEY: "fixture-not-for-reviewer" });
   const { git, write } = repo;
   git("remote", "add", "origin", "https://github.com/owner/repo.git");
   write("REVIEW.md", review);
   write("file.txt", "before\n");
+  // The source config points a relative hook path at the checkout, and the head commits the hook: a reviewer that runs
+  // git there fires it. Only the hook case configures this, so no other case carries the hazard.
+  if (mode === "hook") {
+    git("config", "core.hooksPath", ".hooks");
+    write(".hooks/post-index-change", `#!/bin/sh\nprintf 'ran\\n' > ${JSON.stringify(hookMarker)}\n`);
+    chmodSync(join(repo.dir, ".hooks/post-index-change"), 0o755);
+  }
   git("add", ".");
   git("commit", "-qm", "base");
   const base = git("rev-parse", "HEAD").trim();
@@ -45,18 +72,32 @@ printf '%s\\n' '{"baseRefOid":"${base}","headRefOid":"${head}","title":"Review f
   writeFileSync(arev, `#!${process.execPath}\nif (process.env.AREV_FIXTURE_CHECKOUT_ENV || !process.cwd().endsWith("/launch")) process.exit(19);\nawait import(${JSON.stringify(cliEntry)});\n`, { mode: 0o755 });
   const executable = join(bin, host);
   writeFileSync(executable, `#!${process.execPath}
-    import { readFileSync, writeFileSync } from "node:fs";
+    import { readFileSync, utimesSync, writeFileSync } from "node:fs";
     const mode = ${JSON.stringify(mode)}, out = ${JSON.stringify(out)}, host = ${JSON.stringify(host)};
-    if (process.argv.includes("--help")) { console.log("fixture help: --plan"); process.exit(0); }
+    if (process.argv.includes("--help")) {
+      writeFileSync(${JSON.stringify(probeCwdFile)}, process.cwd());
+      console.log("fixture help: --plan");
+      process.exit(0);
+    }
     const checkout = process.argv[process.argv.indexOf("--add-dir") + 1];
     if (!checkout || checkout === process.cwd() || !process.cwd().endsWith("/launch") ||
         process.env.AREV_FIXTURE_CHECKOUT_ENV || !readFileSync(checkout + "/bunfig.toml", "utf8").includes("Reviewed configuration")) process.exit(18);
     const packet = JSON.parse(readFileSync(out + "/packet.json", "utf8"));
     if (process.env.OPENAI_API_KEY) process.exit(9);
+    // The reviewer's whole environment, as this process received it, so the test can read what was neutralized.
+    writeFileSync(${JSON.stringify(envFile)}, JSON.stringify(Object.fromEntries(Object.entries(process.env)
+      .filter(([key]) => key.startsWith("GIT_")).sort())));
+    writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(process.argv.slice(2)));
+    writeFileSync(${JSON.stringify(runCwdFile)}, process.cwd());
     if (host === "claude") {
       if (process.argv[process.argv.indexOf("--setting-sources") + 1] !== "user" ||
           process.argv[process.argv.indexOf("--permission-mode") + 1] !== "plan") process.exit(9);
     } else if (!process.argv.includes(host === "kimi" ? "--plan" : "read-only")) process.exit(9);
+    // What a reviewer does first: a stat change makes git rewrite the index entry, which is what fires post-index-change.
+    if (mode === "hook") {
+      utimesSync(checkout + "/file.txt", new Date(), new Date());
+      if (Bun.spawnSync(["git", "-C", checkout, "status", "--porcelain"]).exitCode !== 0) process.exit(17);
+    }
     if (mode === "timeout") { await Bun.sleep(60_000); process.exit(1); }
     if (mode === "dirty") writeFileSync(checkout + "/changed-by-reviewer.txt", "fixture edit");
     if (mode === "secret") {
@@ -130,7 +171,7 @@ printf '%s\\n' '{"baseRefOid":"${base}","headRefOid":"${head}","title":"Review f
     }
   `);
   chmodSync(executable, 0o755);
-  return { ...repo, out, head, arev };
+  return { ...repo, out, head, arev, sandbox, hookMarker, envFile, argvFile, probeCwdFile, runCwdFile };
 }
 
 test("run records the exact PR packet, attests the host, and gates", () => {
@@ -281,7 +322,7 @@ test("a staged report does not become a record when the MCP reviewer changes the
 });
 
 test("Kimi without a supported MCP config flag falls back to stdout without an arev executable", () => {
-  const { cli, dir, home, out, arev } = reviewer("json", "# Review\n", "kimi");
+  const { cli, dir, home, out, arev, probeCwdFile, runCwdFile } = reviewer("json", "# Review\n", "kimi");
   rmSync(arev);
   const result = cli("run", "--host", "kimi", "--implementer", "qwen", "--out", out);
   expect(result.status, result.stderr).toBe(0);
@@ -289,6 +330,17 @@ test("Kimi without a supported MCP config flag falls back to stdout without an a
   expect(readLedger(dir, { home }).at(-1)).toMatchObject({ type: "record",
     record: { reviewer: { started: "run", id: "kimi", implementer: "qwen" } },
   });
+  // The capability probe reads startup configuration from its cwd, so it gets a private directory of its own - never the
+  // caller's --out - and that directory is gone once the probe returns. macOS reports tmpdir() as /var while the child
+  // sees /private/var, so a plain string comparison here would pass whatever directory the probe was given.
+  const unprivate = (value: string): string => value.replace(/^\/private(?=\/var\/)/, "");
+  const probeCwd = readFileSync(probeCwdFile, "utf8");
+  expect(unprivate(probeCwd) === out || unprivate(probeCwd).startsWith(`${out}/`)).toBe(false);
+  expect(unprivate(probeCwd).startsWith(`${dir}/`) || unprivate(probeCwd) === dir).toBe(false);
+  expect(probeCwd.split("/").at(-1)!.startsWith("arev-review-probe-")).toBe(true);
+  expect(existsSync(probeCwd)).toBe(false);
+  // The reviewer itself still starts in the runner's own launch directory, not in --out either.
+  expect(readFileSync(runCwdFile, "utf8").endsWith("/launch")).toBe(true);
 });
 
 
@@ -310,4 +362,61 @@ test("Claude starts with user settings and reads the checkout as an added direct
   expect(readLedger(dir, { home }).at(-1)).toMatchObject({ type: "record",
     record: { reviewer: { id: "claude", started: "run" } },
   });
+});
+
+// Issue #39: the reviewer runs git inside the checkout, and the source config's relative core.hooksPath points there.
+// A stat change plus one `git status` is enough for git to rewrite the index and fire a post-index-change the head
+// committed, so this case proves the neutralized environment leaves the marker unwritten.
+test("reviewer git runs no hook the source config points at inside the checkout", () => {
+  const { cli, dir, home, out, hookMarker, envFile } = reviewer("hook");
+  const result = cli("run", "--host", "codex", "--implementer", "qwen", "--out", out);
+  expect(result.status, result.stderr).toBe(0);
+  expect(existsSync(hookMarker)).toBe(false);
+  expect(result.stderr).not.toContain("this review is void");
+  expect(readLedger(dir, { home }).map(event => event.type)).toEqual(["packet", "record"]);
+  // What the reviewer received, in full: no other GIT_ variable is inherited, and both settings arrive as env config.
+  expect(JSON.parse(readFileSync(envFile, "utf8"))).toEqual({
+    GIT_CONFIG_COUNT: "2", GIT_CONFIG_KEY_0: "core.hooksPath", GIT_CONFIG_VALUE_0: "/dev/null",
+    GIT_CONFIG_KEY_1: "core.fsmonitor", GIT_CONFIG_VALUE_1: "false", GIT_OPTIONAL_LOCKS: "0",
+  });
+});
+
+// Issue #39: the refusal used to fire after the bundle was written, so the retry the refusal asks for failed on the
+// files the previous attempt had left behind.
+test("a missing arev executable refuses before the bundle, so the retry keeps the same --out", () => {
+  const { cli, dir, home, out, arev } = reviewer("json");
+  const saved = readFileSync(arev);
+  rmSync(arev);
+  const refused = cli("run", "--host", "codex", "--implementer", "qwen", "--out", out);
+  expect(refused.status).toBe(1);
+  expect(refused.stderr).toContain("The arev executable is unavailable for reviewer MCP");
+  expect(readdirSync(out)).toEqual([]);
+  expect(readLedger(dir, { home })).toEqual([]);
+  writeFileSync(arev, saved, { mode: 0o755 });
+  const rerun = cli("run", "--host", "codex", "--implementer", "qwen", "--out", out);
+  expect(rerun.status, rerun.stderr).toBe(0);
+  expect(readLedger(dir, { home }).map(event => event.type)).toEqual(["packet", "record"]);
+});
+
+// Issue #39: claude takes the MCP server from a file behind --strict-mcp-config, so the allowed tool list is the whole
+// scope of what the reviewer may call.
+test("claude is handed the arev MCP config and only the four arev tools", () => {
+  const { cli, dir, home, out, argvFile } = reviewer("json", "# Review\n", "claude");
+  const result = cli("run", "--host", "claude", "--implementer", "qwen", "--out", out);
+  expect(result.status, result.stderr).toBe(0);
+  const argv = JSON.parse(readFileSync(argvFile, "utf8")) as string[];
+  const valueOf = (flag: string): string | undefined => {
+    const index = argv.indexOf(flag);
+    return index === -1 ? undefined : argv[index + 1];
+  };
+  expect(argv).toContain("--strict-mcp-config");
+  const config = valueOf("--mcp-config");
+  expect(config).toBe(join(out, ".arev-reviewer-mcp.json"));
+  const server = JSON.parse(readFileSync(config!, "utf8")).mcpServers.arev as { command: string; args: string[] };
+  expect(server.command).toBe("/bin/sh");
+  expect(server.args.at(-1)).toBe(out);
+  const allowed = valueOf("--allowedTools");
+  expect(allowed).toBe(RUN_TOOL_NAMES.map(tool => `mcp__arev__${tool}`).join(","));
+  // Spelled out as well, so widening the run's tool list cannot quietly widen what claude may call.
+  expect(allowed).toBe("mcp__arev__arev_packet,mcp__arev__arev_rules,mcp__arev__arev_show,mcp__arev__arev_record");
 });

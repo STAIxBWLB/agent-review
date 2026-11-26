@@ -82,6 +82,16 @@ function reviewerPrompt(out: string, checkout: string): string {
 function reviewerEnv(pathEnv: string): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { PATH: pathEnv };
   for (const key of ENV_KEYS) env[key] = process.env[key];
+  // Git run by the reviewer inside the checkout must not run anything the reviewed head committed. A relative
+  // core.hooksPath in the source config (Husky's `.husky/_`) resolves against the checkout, so the reviewer's own
+  // `git status` refreshes the index and fires a committed post-index-change. Environment config is read after every
+  // file git would otherwise consult, and optional locks off means that status does not write the index at all.
+  env.GIT_CONFIG_COUNT = "2";
+  env.GIT_CONFIG_KEY_0 = "core.hooksPath";
+  env.GIT_CONFIG_VALUE_0 = "/dev/null";
+  env.GIT_CONFIG_KEY_1 = "core.fsmonitor";
+  env.GIT_CONFIG_VALUE_1 = "false";
+  env.GIT_OPTIONAL_LOCKS = "0";
   return env;
 }
 
@@ -281,6 +291,22 @@ export async function runCommand(cwd: string, args: readonly string[]): Promise<
     throw new Refusal("The output directory already has reviewer output files", "choose a fresh --out directory");
   }
 
+  // The reviewer attaches arev over MCP unless its host offers no config flag to pass one. This is resolved before the
+  // bundle is written, because a run that cannot attach MCP refuses here: a retry into the same --out would otherwise
+  // trip over the packet files this command had already written. The probe still needs a cwd of its own - a host reads
+  // startup configuration from it, and --out belongs to the caller, so a private directory is used and removed at once.
+  let kimiFlag: string | undefined;
+  if (host === "kimi") {
+    const probe = mkdtempSync(join(tmpdir(), "arev-review-probe-"));
+    try { kimiFlag = kimiMcpFlag(executable, probe, pathEnv); }
+    finally { rmSync(probe, { recursive: true, force: true }); }
+  }
+  const attachMcp = host !== "kimi" || kimiFlag !== undefined;
+  const arev = attachMcp ? hostExecutable("arev", pathEnv, path => !insideWorktree(root, path)) : undefined;
+  if (attachMcp && arev === undefined) {
+    throw new Refusal("The arev executable is unavailable for reviewer MCP", "put the installed arev command on PATH outside the source worktree");
+  }
+
   const bundle = buildPacket(root, requestFor(root, options.pr));
   const { head } = bundle.packet.subject;
   const model = modelOf(host, process.env.HOME ?? homedir());
@@ -313,12 +339,6 @@ export async function runCommand(cwd: string, args: readonly string[]): Promise<
     // Keep host and Bun startup outside the reviewed checkout and the caller-owned output directory.
     const launch = join(temp, "launch");
     mkdirSync(launch, { mode: 0o700 });
-    const kimiFlag = host === "kimi" ? kimiMcpFlag(executable, launch, pathEnv) : undefined;
-    const attachMcp = host !== "kimi" || kimiFlag !== undefined;
-    const arev = attachMcp ? hostExecutable("arev", pathEnv, path => !insideWorktree(root, path)) : undefined;
-    if (attachMcp && arev === undefined) {
-      throw new Refusal("The arev executable is unavailable for reviewer MCP", "put the installed arev command on PATH outside the source worktree");
-    }
     if (arev !== undefined) {
       writeFileSync(join(out, RUN_STATE_FILE), JSON.stringify({
         packetId: bundle.packet.id, advisoryCap: settings.advisoryCap,

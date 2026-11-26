@@ -7,9 +7,12 @@
  * sibling family's rule (`<host dir>/skills`) rather than a documented path of its own. The upgrade path is to read the
  * table from that package once it ships, which deletes this file's per-host knowledge and its environment overrides.
  *
- * `--undo` restores the bytes the config file had before `--apply` wrote it, from a receipt kept outside both the
- * reviewed worktree and the host's own tree, and removes only the directories the install created.
+ * The receipt is what makes `--undo` safe: it keeps the bytes the config had before the write AND the bytes the write
+ * produced, so undo restores only a file still holding what arev wrote and refuses to discard anything a person changed
+ * afterwards. It is keyed by the config path, because `agy` is workspace-scoped and two workspaces are two
+ * registrations, removed one at a time.
  */
+import { createHash } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -74,20 +77,42 @@ function launch(): { command: string; args: string[] } {
   return { command: process.execPath, args: [join(dirname(import.meta.dir), "bin", "arev.js"), "mcp"] };
 }
 
-const RECEIPT = "arev-setup.json";
+interface ReceiptFile { name: string; sha: string }
 
 interface Receipt {
-  v: 1;
+  v: 2;
   host: string;
-  /** The config file as it was, or null when `--apply` created it. */
-  config: { path: string; before: string | null };
-  /** The skill directory the install wrote, and the files in it, so `--undo` can take them back out. */
-  skill: { dir: string; files: string[] };
+  /** The config file as it was, and as this install left it: undo restores only a file still holding `after`. */
+  config: { path: string; before: string | null; after: string };
+  /** The skill directory the install wrote, its files and their hashes, so undo takes back only what it installed. */
+  skill: { dir: string; files: ReceiptFile[] };
   /** Every directory the install created, outermost first, so `--undo` can remove exactly them. */
   created: string[];
 }
 
-const receiptPath = (host: string): string => join(reviewHome(), "setup", `${host}.json`);
+const sha256 = (bytes: string | Buffer): string => createHash("sha256").update(bytes).digest("hex");
+const digest = (value: string): string => sha256(value).slice(0, 16);
+
+/**
+ * One receipt per host and config file. The config path is in the key because a workspace-scoped host registers into
+ * the workspace: two repositories are two registrations, and one receipt for both would undo only the last one.
+ */
+const receiptPath = (host: string, config: string): string => join(reviewHome(), "setup", `${host}-${digest(resolve(config))}.json`);
+
+/**
+ * Run one filesystem step, turning an errno failure into a refusal that names the path and the next step. Node's own
+ * message carries the operation and path, and a raw `EACCES` escaping as an internal error names neither.
+ */
+function attempt<T>(action: () => T, path: string, doing: string): T {
+  try {
+    return action();
+  } catch (error) {
+    if (error instanceof Refusal) throw error;
+    const code = typeof error === "object" && error !== null && "code" in error ? String((error as { code?: unknown }).code) : "unknown error";
+    throw new Refusal(`cannot ${doing} ${path} (${code})`,
+      `check that path's permissions and that its parent is a directory, then run arev setup again`);
+  }
+}
 
 /** One line per change `--apply` would make, plus what it cannot promise. */
 export function setupPreview(host: SetupHostName, hosts: Record<SetupHostName, SetupHost>): string[] {
@@ -134,6 +159,13 @@ function withServer(text: string | null, host: SetupHost): string {
 }
 
 const readOrNull = (path: string): string | null => (existsSync(path) ? readFileSync(path, "utf8") : null);
+const fileSha = (path: string): string | undefined => {
+  try {
+    return sha256(readFileSync(path));
+  } catch {
+    return undefined;
+  }
+};
 
 /** Every directory between the nearest existing ancestor and `path` that does not exist yet, outermost first. */
 function missingDirectories(path: string): string[] {
@@ -143,6 +175,17 @@ function missingDirectories(path: string): string[] {
     missing.unshift(dir);
   }
   return missing;
+}
+
+/** Put the config back the way it was before a half-finished `--apply`, so nothing stays registered without a receipt. */
+function unwindConfig(target: SetupHost, before: string | null): void {
+  if (before === null) {
+    try {
+      unlinkSync(target.config);
+    } catch { /* Already gone: there is nothing left to take back. */ }
+    return;
+  }
+  attempt(() => writeFileSync(target.config, before), target.config, "restore");
 }
 
 export function setupCommand(cwd: string, args: readonly string[]): number {
@@ -160,26 +203,40 @@ export function setupCommand(cwd: string, args: readonly string[]): number {
       throw new Refusal(`setup does not know a host named ${host}`, `pass one of ${HOST_NAMES.join(", ")}`);
     }
     const name = host as SetupHostName, hosts = setupHosts(cwd), target = hosts[name];
+    const receipt = receiptPath(name, target.config);
 
     if (flags.includes("--undo")) {
-      const path = receiptPath(name);
-      const text = readOrNull(path);
-      if (text === null) throw new Refusal(`there is no arev setup receipt for ${name}`, `run arev setup ${name} --apply first, or edit ${target.config} by hand`);
-      const receipt = JSON.parse(text) as Receipt;
-      if (receipt.config.before === null) {
-        if (existsSync(receipt.config.path)) unlinkSync(receipt.config.path);
-      } else {
-        writeFileSync(receipt.config.path, receipt.config.before);
+      const stored = readOrNull(receipt);
+      if (stored === null) {
+        throw new Refusal(`there is no arev setup receipt for ${name} at ${target.config}`,
+          `run arev setup ${name} --apply first, or edit ${target.config} by hand`);
       }
-      // The directory can only be removed once the files in it are gone, so they go first.
-      for (const file of receipt.skill.files) {
-        try { unlinkSync(join(receipt.skill.dir, file)); } catch { /* Already gone: undo still completes. */ }
+      const saved = attempt(() => JSON.parse(stored) as Receipt, receipt, "read the arev setup receipt in");
+      const current = readOrNull(saved.config.path);
+      // Undo puts `before` back only over the bytes this install wrote: anything else is somebody's later work.
+      if (current !== saved.config.after && current !== saved.config.before) {
+        throw new Refusal(`${saved.config.path} changed since arev setup wrote it, so undo would discard those changes`,
+          `put arev's own version back first, or remove the ${SERVER} entry by hand, then run arev setup ${name} --undo`);
       }
-      for (const dir of [...receipt.created].reverse()) {
+      for (const file of saved.skill.files) {
+        const path = join(saved.skill.dir, file.name), sha = fileSha(path);
+        if (sha !== undefined && sha !== file.sha) {
+          throw new Refusal(`${path} changed since arev setup installed it, so undo would discard those changes`,
+            `put the installed skill back first, or delete ${saved.skill.dir} by hand, then run arev setup ${name} --undo`);
+        }
+      }
+      if (current === saved.config.after) {
+        if (saved.config.before === null) attempt(() => unlinkSync(saved.config.path), saved.config.path, "remove");
+        else attempt(() => writeFileSync(saved.config.path, saved.config.before ?? ""), saved.config.path, "restore");
+      }
+      for (const file of saved.skill.files) {
+        try { unlinkSync(join(saved.skill.dir, file.name)); } catch { /* Already gone: undo still completes. */ }
+      }
+      for (const dir of [...saved.created].reverse()) {
         try { rmdirSync(dir); } catch { /* A directory that gained other files is left alone. */ }
       }
-      unlinkSync(path);
-      console.log(`arev setup ${name}: undone; ${receipt.config.path} has its earlier bytes back`);
+      attempt(() => unlinkSync(receipt), receipt, "remove the arev setup receipt in");
+      console.log(`arev setup ${name}: undone; ${saved.config.path} has its earlier bytes back`);
       return EXIT.ok;
     }
 
@@ -191,25 +248,56 @@ export function setupCommand(cwd: string, args: readonly string[]): number {
     }
 
     const before = readOrNull(target.config);
+    // A receipt already here means an earlier apply. Re-applying would record the applied bytes as the original, and the
+    // later undo would restore the registration instead of removing it.
+    const existing = readOrNull(receipt);
+    if (existing !== null) {
+      const applied = attempt(() => JSON.parse(existing) as Receipt, receipt, "read the arev setup receipt in");
+      if (readOrNull(target.config) === applied.config.after) {
+        throw new Refusal(`${target.config} already registers ${SERVER} through arev setup`,
+          `run arev setup ${name} --undo to take it back out, or edit the entry by hand`);
+      }
+      throw new Refusal(`${target.config} changed since arev setup wrote it, so arev will not register over those changes`,
+        `edit the ${SERVER} entry in ${target.config} by hand, or put arev's own version back and run arev setup ${name} --undo`);
+    }
+    const after = withServer(before, target);
     const created = missingDirectories(dirname(target.config));
-    mkdirSync(dirname(target.config), { recursive: true });
-    writeFileSync(target.config, withServer(before, target));
+    attempt(() => {
+      mkdirSync(dirname(target.config), { recursive: true });
+      writeFileSync(target.config, after);
+    }, target.config, "write");
 
     const skillSource = join(dirname(import.meta.dir), "skills", SKILL);
     if (!existsSync(skillSource)) {
+      unwindConfig(target, before);
       throw new Refusal(`the ${SKILL} skill is missing from this install`, "reinstall the package so skills/arev-review ships with it");
     }
     const skillTarget = join(target.skills, SKILL);
     const skillCreated = missingDirectories(skillTarget);
-    mkdirSync(skillTarget, { recursive: true });
-    const skillFiles = readdirSync(skillSource);
-    for (const file of skillFiles) copyFileSync(join(skillSource, file), join(skillTarget, file));
+    let files: ReceiptFile[];
+    try {
+      const names = attempt(() => readdirSync(skillSource), skillSource, "read the skill directory in");
+      attempt(() => mkdirSync(skillTarget, { recursive: true }), skillTarget, "create");
+      for (const file of names) {
+        attempt(() => copyFileSync(join(skillSource, file), join(skillTarget, file)), join(skillTarget, file), "write");
+      }
+      files = names.map(file => ({
+        name: file,
+        sha: attempt(() => sha256(readFileSync(join(skillTarget, file))), join(skillTarget, file), "read"),
+      }));
+    } catch (error) {
+      // A registration without the skill it was registered for is a broken host, not a half-installed one: take the
+      // config back so nothing is left behind without a receipt.
+      unwindConfig(target, before);
+      throw error;
+    }
 
-    const receipt: Receipt = { v: 1, host: name, config: { path: target.config, before },
-      skill: { dir: skillTarget, files: skillFiles }, created: [...created, ...skillCreated] };
-    const receiptDirectory = dirname(receiptPath(name));
-    mkdirSync(receiptDirectory, { recursive: true });
-    writeFileSync(receiptPath(name), `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600 });
+    const saved: Receipt = { v: 2, host: name, config: { path: target.config, before, after },
+      skill: { dir: skillTarget, files }, created: [...created, ...skillCreated] };
+    attempt(() => {
+      mkdirSync(dirname(receipt), { recursive: true });
+      writeFileSync(receipt, `${JSON.stringify(saved, null, 2)}\n`, { mode: 0o600 });
+    }, receipt, "write the arev setup receipt to");
 
     console.log(`arev setup ${name}: applied; ${target.config} registers \`${SERVER}\`, skill in ${skillTarget}`);
     console.log(`arev setup ${name} --undo restores ${target.config} as it was`);

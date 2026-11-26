@@ -8,6 +8,8 @@
 
 - `arev packet`: Build a review packet
 - `arev rules`: Read the rules that apply to paths
+- `arev import`: Import a legacy review report
+- `arev export`: Export a recorded review
 - `arev status`: Show implementation status
 - `arev record`: Validate a review report against the packet for its head and append it to the ledger
 - `arev resolve`: Settle a recorded finding as fixed, false_positive or accepted
@@ -46,6 +48,25 @@ retargeted pull request is re-reviewed rather than posted green.
 GitHub lists open pull requests for this endpoint only while the commit is
 outside the default branch, so a head already on `main` has no open pull
 request for a status to leak onto.
+
+## Import and export
+
+Build a packet for the reviewed head before importing a report. Supply the
+review's full `head` and `base` commit IDs, reviewer ID and model family,
+`call.ok`, and reviewed or skipped paths. Coverage totals alone are insufficient.
+Supply `packet_id` from the reviewed packet if more than one PR shares its
+head and base.
+
+- `arev import --from ocr report.json` accepts OCR comment entries or findings
+  with `category`, `severity`, `path`, and optional `start_line` and `end_line`.
+  OCR reports may use `head_commit`, `base_commit`, and a `files` coverage list.
+- `arev import --from brief report.json` accepts P0–P3 findings in JSON. For a
+  Markdown brief, prepend a fenced JSON block with the review metadata and list
+  findings under a `Findings` heading as `P2. Title` or `P2: Title` entries.
+- A JSON brief can wrap original `hub_review` arguments under the
+  `hub_review` key. `arev export --to hub` reproduces those arguments and
+  reflects subsequent finding resolutions.
+- `arev export --to markdown` prints the recorded review and finding lifecycle.
 
 ## Development
 

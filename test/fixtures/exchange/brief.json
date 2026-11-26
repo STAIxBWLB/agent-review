@@ -1,0 +1,28 @@
+{
+  "reviewer": { "id": "brief-reviewer", "modelFamily": "fixture-family", "model": "fixture-model" },
+  "call": { "ok": true },
+  "reviewed_files": ["src/rules.ts"],
+  "skipped_files": [],
+  "findings": [
+    {
+      "id": "security:unscoped-rule-source",
+      "priority": "P1",
+      "category": "security",
+      "location": "src/rules.ts:3",
+      "description": "Read the rule from its scoped directory.",
+      "origin": "pre-existing",
+      "disposition": "false_positive",
+      "evidence": ["src/rules.ts:6"]
+    },
+    {
+      "id": "compliance:document-rule-order",
+      "priority": "P3",
+      "path": "src/rules.ts",
+      "line": 4,
+      "text": "Describe the rule precedence.",
+      "origin": "introduced",
+      "disposition": "open"
+    }
+  ],
+  "outside_scope": "No deployment behavior was reviewed."
+}

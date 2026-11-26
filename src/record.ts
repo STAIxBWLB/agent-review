@@ -338,6 +338,38 @@ function rebuildRequest(subject: PacketBlock["subject"]): PacketRequest | undefi
   return undefined;
 }
 
+/** Check the exact packet ID and rebuild the subject before reusing its review obligations. */
+export function requireCurrentPacket(cwd: string, head: string, packetId: string, events = readLedger(cwd)) {
+  if (!FULL_OID.test(head) || !PACKET_ID.test(packetId)) {
+    throw new Refusal("The review does not name a full head and packet ID", "use the head and id from packet.json");
+  }
+  const packetEvent = [...events].reverse().find(event => event.type === "packet" && event.packet.id === packetId);
+  if (!packetEvent || packetEvent.type !== "packet") {
+    throw new Refusal(`no packet ${packetId} is in the ledger`,
+      `run arev packet for the head this report reviews (arev packet --pr N --out DIR), then write the report from its packet.json`);
+  }
+  if (packetEvent.packet.subject.head !== head) {
+    throw new Refusal(`the packet ${packetId} is for head ${packetEvent.packet.subject.head}, not ${head}`,
+      `write the report from the packet.json arev wrote for ${head}, or fix packet.subject.head to the head that packet describes`);
+  }
+  const request = rebuildRequest(packetEvent.packet.subject);
+  if (request) {
+    let rebuilt: string;
+    try {
+      rebuilt = buildPacket(cwd, request).packet.id;
+    } catch (error) {
+      // A packet that cannot be rebuilt cannot be shown to match, and an unrun check is not a pass.
+      throw new Refusal(`arev cannot rebuild the packet for head ${head} to check the report against: ${shown(error instanceof Error ? error.message : "unknown error")}`,
+        `fetch the reviewed commits and retry, or rerun arev packet for ${head} and rewrite the report from its packet.json`);
+    }
+    if (rebuilt !== packetEvent.packet.id) {
+      throw new Refusal(`the packet changed since arev packet (${packetEvent.packet.id} was recorded, ${rebuilt} is what arev builds for head ${head} now)`,
+        "rerun arev packet and rewrite the report from the new packet.json; a workspace subject counts every uncommitted file, the report included, so keep the report outside the worktree");
+    }
+  }
+  return packetEvent;
+}
+
 /** The review thread a packet belongs to: its PR number, or `undefined` for a packet built without one. */
 const threadOf = (subject: PacketBlock["subject"] | undefined): number | undefined => subject?.pr;
 
@@ -626,30 +658,7 @@ export function recordCommand(cwd: string, args: readonly string[]): number {
       throw new Refusal(`the report ${shown(file)} has no packet id at packet.id`,
         "write the report from the packet.json arev wrote: arev packet --pr N --out DIR");
     }
-    const packetEvent = [...events].reverse().find(event => event.type === "packet" && event.packet.id === packetId);
-    if (!packetEvent || packetEvent.type !== "packet") {
-      throw new Refusal(`no packet ${packetId} is in the ledger`,
-        `run arev packet for the head this report reviews (arev packet --pr N --out DIR), then write the report from its packet.json`);
-    }
-    if (packetEvent.packet.subject.head !== head) {
-      throw new Refusal(`the packet ${packetId} is for head ${packetEvent.packet.subject.head}, not ${head}`,
-        `write the report from the packet.json arev wrote for ${head}, or fix packet.subject.head to the head that packet describes`);
-    }
-    const request = rebuildRequest(packetEvent.packet.subject);
-    if (request) {
-      let rebuilt: string;
-      try {
-        rebuilt = buildPacket(cwd, request).packet.id;
-      } catch (error) {
-        // A packet that cannot be rebuilt cannot be shown to match, and an unrun check is not a pass.
-        throw new Refusal(`arev cannot rebuild the packet for head ${head} to check the report against: ${shown(error instanceof Error ? error.message : "unknown error")}`,
-          `fetch the reviewed commits and retry, or rerun arev packet for ${head} and rewrite the report from its packet.json`);
-      }
-      if (rebuilt !== packetEvent.packet.id) {
-        throw new Refusal(`the packet changed since arev packet (${packetEvent.packet.id} was recorded, ${rebuilt} is what arev builds for head ${head} now)`,
-          "rerun arev packet and rewrite the report from the new packet.json; a workspace subject counts every uncommitted file, the report included, so keep the report outside the worktree");
-      }
-    }
+    const packetEvent = requireCurrentPacket(cwd, head, packetId, events);
     const cap = packetEvent.review?.advisory_cap ?? DEFAULT_ADVISORY_CAP;
     const implementer = parsed.flags["--implementer"]?.at(-1);
     const record = parseReviewRecord(raw, { packet: packetEvent.packet, maxAdvisories: cap,

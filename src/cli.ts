@@ -5,11 +5,15 @@ import { gateCommand } from "./gate.ts";
 import { Refusal } from "./ledger.ts";
 import { PacketUsageError, runPacket, runRules } from "./packet-cli.ts";
 import { recordCommand, resolveCommand, showCommand } from "./record.ts";
+import { importCommand } from "./import.ts";
+import { exportCommand } from "./export.ts";
 
 type Runner = (cwd: string, args: readonly string[]) => number | void;
 const RUN = {
   packet: runPacket,
   rules: runRules,
+  import: importCommand,
+  export: exportCommand,
   record: recordCommand,
   resolve: resolveCommand,
   show: showCommand,

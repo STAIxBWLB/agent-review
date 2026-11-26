@@ -6,7 +6,7 @@
  */
 import { spawnSync } from "node:child_process";
 import { EXIT, errorLine } from "@staix/cli-output";
-import { Refusal, appendEvent, readLedger, type LedgerEvent, type ReviewRecordV1 } from "./ledger.ts";
+import { Refusal, appendEvent, readLedger, reviewOrigin, type LedgerEvent, type ReviewRecordV1 } from "./ledger.ts";
 import { PR_NUMBER, ledgerEventsView, threadsAtHead } from "./record.ts";
 import { parseReviewMd } from "./review-md.ts";
 import { commitOid, mergeBaseOid, reviewGit } from "./review-git.ts";
@@ -20,6 +20,8 @@ export interface GateResult {
   /** The merge base the gate checked the record against: the origin default branch's, right now. */
   mergeBase?: string;
   record?: string;
+  /** The review thread the record belongs to, which is the PR a status posted here would speak for. */
+  pr?: number;
   verdict?: ReviewRecordV1["verdict"];
   ok: boolean;
   open: string[];
@@ -92,6 +94,11 @@ export function gateReport(cwd: string, options: { head?: string; pr?: number; h
     // One read of the base-tree rules: the [gate] settings and the REVIEW.md presence check both come from it (AC2).
     const rules = base === undefined ? undefined : readRules(cwd, base, []).rules;
     const allowed = parseReviewMd(rules ?? []).sameFamily === "allow";
+    // AC4 asks whether the reviewer is independent of the implementer, which needs the implementer named: a record
+    // without one cannot be checked, so the absence fails rather than passing.
+    if (implementer === undefined) {
+      open.push("the record names no implementer, so independence cannot be checked; run arev record <report> --implementer <peer>");
+    }
     // Spec AC4: pass iff the reviewer is not the implementer, or the fallback is declared and REVIEW.md allows it.
     if (selfReview && !(reviewer.sameFamilyFallback && allowed)) {
       open.push(`the reviewer ${reviewer.id} is the implementer; a self-review passes only with sameFamilyFallback and [gate] same_family = "allow"`);
@@ -112,23 +119,65 @@ export function gateReport(cwd: string, options: { head?: string; pr?: number; h
     head,
     ...(base === undefined ? {} : { base }),
     mergeBase,
-    ...(recordEvent ? { record: recordEvent.id, verdict: recordEvent.record.verdict } : {}),
+    ...(recordEvent ? {
+      record: recordEvent.id,
+      verdict: recordEvent.record.verdict,
+      ...(recordEvent.record.packet.subject.pr === undefined ? {} : { pr: recordEvent.record.packet.subject.pr }),
+    } : {}),
     ok: open.length === 0 && recordEvent !== undefined,
     open,
   };
 }
 
 /**
+ * The repository a status is posted to: the origin the ledger is keyed to. gh resolves `{owner}/{repo}` itself, from
+ * `GH_REPO` or the working directory, and a status sent there names a repository this review did not happen in.
+ */
+function statusRepository(cwd: string): string {
+  const [host, owner, repo, extra] = (reviewOrigin(cwd) ?? "").split("/");
+  if (host !== "github.com" || !owner || !repo || extra !== undefined) {
+    throw new Refusal("a status is posted to the GitHub repository origin names, and this repository's origin does not name one",
+      "set origin to the GitHub repository URL (gh repo view --json url prints it)");
+  }
+  return `${owner}/${repo}`;
+}
+
+/**
+ * The open pull requests GitHub says have this commit as their head: a metadata read, and the only gh call besides the
+ * status write (AC5). The ledger cannot answer this one - a PR arev never built a packet for is the case it misses.
+ */
+function openPrsAt(cwd: string, repository: string, head: string): number[] {
+  const result = spawnSync("gh", ["api", `repos/${repository}/commits/${head}/pulls`], { cwd, encoding: "utf8" });
+  if (result.status !== 0) {
+    const detail = (result.stderr || result.stdout || "").trim().split("\n").filter(Boolean)[0] ?? `gh exited ${result.status}`;
+    throw new Refusal(`cannot read the open pull requests at ${head}: ${detail}`,
+      "check that gh is authenticated and may read this repository's pull requests");
+  }
+  let pulls: unknown;
+  try { pulls = JSON.parse(result.stdout); } catch { pulls = undefined; }
+  if (!Array.isArray(pulls)) {
+    throw new Refusal(`the pull requests at ${head} came back in a shape arev does not read`,
+      "run gh auth status, and check that gh api prints JSON for this repository");
+  }
+  // The endpoint lists every pull request the commit appears in, which includes one that merely contains it: only a PR
+  // whose own head is this commit can inherit a status posted here.
+  return pulls.flatMap((pull: unknown) => {
+    const item = pull as { number?: unknown; state?: unknown; head?: { sha?: unknown } };
+    return item.state === "open" && item.head?.sha === head && typeof item.number === "number" ? [item.number] : [];
+  });
+}
+
+/**
  * Post the `arev/gate` success status for a head the gate just passed. The description names the record, so the status
  * on the commit says which review it stands for. Nothing here decides whether to post.
  */
-export function postStatus(head: string, record: string, cwd: string): void {
+export function postStatus(head: string, record: string, repository: string, cwd: string): void {
   const description = `${STATUS_CONTEXT}: record ${record}`;
   if (Buffer.byteLength(description) > 140) {
     throw new Refusal(`the status description would be ${Buffer.byteLength(description)} bytes; a commit status allows 140`,
       "shorten the record id or the context");
   }
-  const result = spawnSync("gh", ["api", "--method", "POST", `repos/{owner}/{repo}/statuses/${head}`,
+  const result = spawnSync("gh", ["api", "--method", "POST", `repos/${repository}/statuses/${head}`,
     "-f", "state=success", "-f", `context=${STATUS_CONTEXT}`, "-f", `description=${description}`], { cwd, encoding: "utf8" });
   if (result.status !== 0) {
     const detail = (result.stderr || result.stdout || "").trim().split("\n").filter(Boolean)[0] ?? `gh exited ${result.status}`;
@@ -195,6 +244,20 @@ export function gateCommand(cwd: string, args: readonly string[]): number {
           "push a distinct commit for each PR and post the gate from that PR's own head");
       }
     }
+    // The ledger only knows the pull requests arev built a packet for, and a status lives on the commit: the open PRs at
+    // this head are read from GitHub, and one that is not the thread this gate posts for would inherit the status. Both
+    // this read and the status write name the repository origin gives, never the one gh resolves for itself.
+    // ponytail: a pull request opened on this head after the status is posted still inherits it; a status is per commit.
+    let repository: string | undefined;
+    if (parsed.flags["--post"] !== undefined && result.ok && result.record !== undefined) {
+      repository = statusRepository(cwd);
+      const others = openPrsAt(cwd, repository, result.head).filter(number => number !== result.pr);
+      if (others.length > 0) {
+        const named = others.map(number => `PR ${number}`).join(", ");
+        throw new Refusal(`head ${result.head} heads open ${named} ${result.pr === undefined ? "and this review names no PR thread" : `besides PR ${result.pr}`}, and a commit status is per commit: a success posted here would satisfy their checks, though the gate did not pass for ${others.length === 1 ? "that PR" : "those PRs"}`,
+          "push a distinct commit for each PR and post the gate from that PR's own head");
+      }
+    }
     // The spec's ledger has a `gate` event, so each evaluation is recorded: it is written here, never inside the pure
     // decision, and it sits before the `post` event because a pass posts after this line. The decision reads only
     // record, resolve and packet events, so writing it changes no later answer.
@@ -212,7 +275,7 @@ export function gateCommand(cwd: string, args: readonly string[]): number {
         else for (const line of [`gate: fails at ${result.head}`, ...result.open.map(condition => `  ${condition}`)]) console.log(line);
         return EXIT.fail;
       }
-      postStatus(result.head, result.record, cwd);
+      postStatus(result.head, result.record, repository!, cwd);
       appendEvent(cwd, { v: 1, type: "post", at: new Date().toISOString(), head: result.head, record: result.record, status: "success" });
     }
     if (parsed.flags["--json"] !== undefined) {

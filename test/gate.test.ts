@@ -79,7 +79,7 @@ const packetFor = (subject: Subject): PacketBlock => ({
 const reportFor = (subject: Subject, changes: Record<string, unknown> = {}) => ({
   v: 1,
   packet: { id: PACKET, subject },
-  reviewer: { id: "claude", modelFamily: "anthropic", started: "self", sameFamilyFallback: false },
+  reviewer: { id: "claude", modelFamily: "anthropic", started: "self", implementer: "codex", sameFamilyFallback: false },
   coverage: { reviewed: ["src/a.ts"], skipped: [] },
   findings: [],
   verdict: "approved",
@@ -106,12 +106,21 @@ function seed(options: { repo: string; home: string; subject: Subject; record: R
   return id;
 }
 
-/** A `gh` that records its arguments instead of making a network call; `FAKE_GH_ERROR` makes it fail. */
+/**
+ * A `gh` that records its arguments instead of making a network call: the status write's to `argsPath`, the pull-request
+ * read's to `argsPath.read`. `FAKE_GH_PULLS` is the JSON the read returns, and `FAKE_GH_ERROR` makes the write fail.
+ */
 function fakeGh(argsPath: string): string {
   const bin = temp("arev-bin-");
   const path = join(bin, "gh");
   writeFileSync(path, [
     "#!/bin/sh",
+    'case "$2" in',
+    "  */pulls)",
+    `    for arg in "$@"; do printf '%s\\n' "$arg" >> ${JSON.stringify(argsPath)}.read; done`,
+    '    printf \'%s\' "${FAKE_GH_PULLS:-[]}"',
+    "    exit 0 ;;",
+    "esac",
     `: > ${JSON.stringify(argsPath)}`,
     `for arg in "$@"; do printf '%s\\n' "$arg" >> ${JSON.stringify(argsPath)}; done`,
     'if [ -n "$FAKE_GH_ERROR" ]; then printf "%s\\n" "$FAKE_GH_ERROR" >&2; exit 1; fi',
@@ -286,11 +295,16 @@ test("a head two PRs share refuses without --pr, and each PR gates on its own re
   });
 
   // Fail closed through the command too: no gate event, and never a status for a head the gate did not judge.
-  const refused = run(repo, { AGENTHUB_HOME: home }, "gate", "--head", head, "--post");
+  const refusedArgs = join(home, "gh-args.txt");
+  const refused = run(repo, { PATH: `${fakeGh(refusedArgs)}:${process.env.PATH ?? ""}`, AGENTHUB_HOME: home }, "gate", "--head", head, "--post");
   expect(refused.code).toBe(1);
   expect(refused.stdout).toBe("");
   expect(refused.stderr).toContain("is reviewed in more than one thread (PR 7, PR 8)");
   expect(refused.stderr).toContain("→ pass --pr 7 or --pr 8 to choose the review thread");
+  // With a `gh` on PATH that records every call, the stub proves none was made, so the case stays offline even if the
+  // guard stops refusing.
+  expect(existsSync(refusedArgs)).toBe(false);
+  expect(existsSync(`${refusedArgs}.read`)).toBe(false);
   expect(events(repo, home).filter(event => event.type === "gate" || event.type === "post")).toEqual([]);
 
   // The flag reaches the decision through the command, and names the record it settled on.
@@ -345,6 +359,75 @@ test("--post refuses a shared head even when the other thread has only built its
   expect(refused.stderr).toContain(`head ${head} has packets or records in more than one thread (PR 7, PR 8)`);
   expect(existsSync(args)).toBe(false);
   expect(events(repo, home).filter(event => event.type === "gate" || event.type === "post")).toEqual([]);
+});
+
+test("--post refuses a head an open PR heads where the ledger knows only one thread", () => {
+  const { repo, base, head, home } = fixture();
+  const subject: Subject = { kind: "range", base, head, mergeBase: base, pr: 7 };
+  seed({ repo, home, subject, record: recordFor(subject) });
+
+  // PR 8 heads the same commit and arev never built a packet for it, so the ledger cannot see it: only GitHub can. The
+  // closed PR and the open PR with another head are not threads this status can leak onto.
+  const args = join(home, "gh-args.txt");
+  const pulls = JSON.stringify([
+    { number: 7, state: "open", head: { sha: head } },
+    { number: 8, state: "open", head: { sha: head } },
+    { number: 6, state: "closed", head: { sha: head } },
+    { number: 5, state: "open", head: { sha: "a".repeat(40) } },
+  ]);
+  const refused = run(repo, { PATH: `${fakeGh(args)}:${process.env.PATH ?? ""}`, AGENTHUB_HOME: home, FAKE_GH_PULLS: pulls }, "gate", "--pr", "7", "--post");
+  expect(refused.code).toBe(1);
+  expect(refused.stderr).toContain(`head ${head} heads open PR 8 besides PR 7, and a commit status is per commit: a success posted here would satisfy their checks, though the gate did not pass for that PR`);
+  expect(refused.stderr).toContain("→ push a distinct commit for each PR and post the gate from that PR's own head");
+  // The metadata read happened; the status write never did, and no gate or post event was written.
+  expect(readFileSync(`${args}.read`, "utf8")).toContain(`repos/owner/repo/commits/${head}/pulls`);
+  expect(existsSync(args)).toBe(false);
+  expect(events(repo, home).filter(event => event.type === "gate" || event.type === "post")).toEqual([]);
+
+  // The same head with only its own PR open posts, so the guard is the other PR and not the read itself.
+  const only = run(repo, { PATH: `${fakeGh(args)}:${process.env.PATH ?? ""}`, AGENTHUB_HOME: home, FAKE_GH_PULLS: JSON.stringify([{ number: 7, state: "open", head: { sha: head } }]) }, "gate", "--pr", "7", "--post");
+  expect(only.stderr).toBe("");
+  expect(only.code).toBe(0);
+
+  // A review that names no PR thread is not that pull request's pass either, so it cannot turn it green.
+  const plain = fixture();
+  const unthreaded: Subject = { kind: "range", base: plain.base, head: plain.head, mergeBase: plain.base };
+  seed({ repo: plain.repo, home: plain.home, subject: unthreaded, record: recordFor(unthreaded) });
+  const plainArgs = join(plain.home, "gh-args.txt");
+  const unowned = run(plain.repo,
+    { PATH: `${fakeGh(plainArgs)}:${process.env.PATH ?? ""}`, AGENTHUB_HOME: plain.home, FAKE_GH_PULLS: JSON.stringify([{ number: 8, state: "open", head: { sha: plain.head } }]) },
+    "gate", "--post");
+  expect(unowned.code).toBe(1);
+  expect(unowned.stderr).toContain("and this review names no PR thread");
+  expect(existsSync(plainArgs)).toBe(false);
+});
+
+test("a status goes to the repository origin names, and a non-GitHub origin refuses the post", () => {
+  const { repo, base, head, home } = fixture();
+  gitOut(repo, ["remote", "set-url", "origin", "https://gitlab.com/owner/repo.git"]);
+  const subject: Subject = { kind: "range", base, head, mergeBase: base };
+  // The ledger the gate reads is keyed by origin, so the record is seeded under the origin this case gates from.
+  seed({ repo, home, subject, record: recordFor(subject) });
+  const args = join(home, "gh-args.txt");
+  const refused = run(repo, { PATH: `${fakeGh(args)}:${process.env.PATH ?? ""}`, AGENTHUB_HOME: home, GH_REPO: "owner/repo" }, "gate", "--post");
+  expect(refused.code).toBe(1);
+  expect(refused.stderr).toContain("a status is posted to the GitHub repository origin names, and this repository's origin does not name one");
+  expect(refused.stderr).toContain("→ set origin to the GitHub repository URL (gh repo view --json url prints it)");
+  // Even with gh able to resolve a repository for itself, neither call is made.
+  expect(existsSync(args)).toBe(false);
+  expect(existsSync(`${args}.read`)).toBe(false);
+});
+
+test("a record that names no implementer fails the gate, because independence cannot be checked", () => {
+  const { repo, base, head, home } = fixture();
+  const subject: Subject = { kind: "range", base, head, mergeBase: base };
+  seed({ repo, home, subject, record: recordFor(subject, {
+    reviewer: { id: "claude", modelFamily: "anthropic", started: "self", sameFamilyFallback: false },
+  }) });
+  const result = gateReport(repo, { head, home });
+  expect(result.ok).toBe(false);
+  // The absence is not a pass: a reviewer whose implementer is unknown cannot be shown to be someone else.
+  expect(result.open).toEqual(["the record names no implementer, so independence cannot be checked; run arev record <report> --implementer <peer>"]);
 });
 
 test("REVIEW.md must be at the merge base unless the record says --light", () => {
@@ -448,14 +531,18 @@ test("gate --post sets the arev/gate status on the full head and writes the post
   const id = seed({ repo, home, subject, record: recordFor(subject) });
   const args = join(home, "gh-args.txt");
 
-  const posted = run(repo, { PATH: `${fakeGh(args)}:${process.env.PATH ?? ""}`, AGENTHUB_HOME: home }, "gate", "--post", "--json");
+  const posted = run(repo, { PATH: `${fakeGh(args)}:${process.env.PATH ?? ""}`, AGENTHUB_HOME: home, GH_REPO: "someone/elsewhere" }, "gate", "--post", "--json");
   expect(posted.stderr).toBe("");
   expect(posted.code).toBe(0);
   expect(JSON.parse(posted.stdout)).toMatchObject({ head, ok: true, record: id });
 
+  // The pull requests at this head were read first, from the same repository the status goes to.
+  expect(readFileSync(`${args}.read`, "utf8")).toContain(`repos/owner/repo/commits/${head}/pulls`);
   const argv = readFileSync(args, "utf8").trim().split("\n");
   expect(argv.slice(0, 3)).toEqual(["api", "--method", "POST"]);
-  expect(argv[3]).toBe(`repos/{owner}/{repo}/statuses/${head}`);
+  // The target comes from origin, not from gh: `GH_REPO` names another repository in this environment, and the status
+  // still goes to the repository the ledger and the review are keyed to.
+  expect(argv[3]).toBe(`repos/owner/repo/statuses/${head}`);
   expect(argv).toContain("state=success");
   expect(argv).toContain("context=arev/gate");
   expect(argv).toContain(`description=arev/gate: record ${id}`);

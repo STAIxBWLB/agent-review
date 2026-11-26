@@ -140,11 +140,19 @@ function normalizeOrigin(url: string): string | undefined {
   return host === "github.com" ? `${host}/${parts[1].replace(/^~\/?/, "").toLowerCase()}` : `${host}/${parts[1]}`;
 }
 
-/** The project's ledger key. */
-export function reviewProjectId(cwd: string): string {
+/**
+ * Origin, normalized to the `host/owner/repo` the ledger's key is built from. It is the one repository name arev may
+ * act on: what gh resolves for itself (`GH_REPO`, the working directory) is not this.
+ */
+export function reviewOrigin(cwd: string): string | undefined {
   const origin = git(cwd, ["remote", "get-url", "origin"]);
   // Whitespace around a URL is not part of it, so the one value that is trimmed is this one; a path is never trimmed.
-  const normalized = origin ? normalizeOrigin(origin.trim()) : undefined;
+  return origin ? normalizeOrigin(origin.trim()) : undefined;
+}
+
+/** The project's ledger key. */
+export function reviewProjectId(cwd: string): string {
+  const normalized = reviewOrigin(cwd);
   if (normalized) return normalized;
   // Linked worktrees of one repository share `--git-common-dir`, and a key hashed from the worktree root gave each of
   // them its own ledger, so one repository reviewed from two worktrees had two halves of one history. A common dir named

@@ -1,4 +1,6 @@
 export const commands = [
+  { name: "host", aliases: [], description: "Choose the reviewer host for a pull request and the model it will use",
+    syntax: "host --pr N --implementer ID [--hosts LIST] [--unavailable ID...] [--json]" },
   { name: "packet", aliases: [], description: "Build a review packet",
     syntax: "packet [--pr N | --from A --to B | --commit C | --workspace | --files P...] [--profile code] [--json | --out DIR]" },
   { name: "rules", aliases: [], description: "Read the rules that apply to paths",

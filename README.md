@@ -6,6 +6,7 @@
 
 <!-- arev commands:start -->
 
+- `arev host`: Choose the reviewer host for a pull request and the model it will use
 - `arev packet`: Build a review packet
 - `arev rules`: Read the rules that apply to paths
 - `arev import`: Import a legacy review report
@@ -51,6 +52,25 @@ run gated.
 GitHub lists open pull requests for this endpoint only while the commit is
 outside the default branch, so a head already on `main` has no open pull
 request for a status to leak onto.
+
+### `arev host`
+
+Choose the reviewer for a pull request, and the model it will run.
+
+The rotation starts at the pull request number over `claude, codex, kimi`, and
+the implementer is skipped. A host whose CLI is not on `PATH`, or one named to
+`--unavailable`, is skipped too. The implementer is chosen only when it is the
+last one left, as `same-family fallback`, so a review never runs on the AI that
+wrote the change unless nothing else can run.
+
+The model is the `model` key of `~/.codex/config.toml`, the `default_model` key
+of `~/.kimi-code/config.toml`, and `unknown` for every other host. Only that
+key's value reaches the answer. A value that is not a plain name reads as
+`unknown` as well, and so does a config TOML itself does not accept; the command
+reads no repository and writes no ledger.
+
+`--json` prints `host`, `model`, `reason` and `considered`. When no host can run,
+it exits nonzero and names the next step.
 
 ## Import and export
 

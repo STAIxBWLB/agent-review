@@ -56,6 +56,19 @@ test("the ledger lives under AGENTHUB_HOME/review/<project-id>/ and never in the
   expect(() => ledgerPath(repo, { home: join(repo, "ledger-home") })).toThrow("AGENTHUB_HOME resolves inside the reviewed worktree");
 });
 
+test("a worktree whose path ends in a space is compared as it is, so a ledger inside it is still refused", () => {
+  const root = mkdtempSync(join(tmpdir(), "arev-ledger-space-"));
+  roots.push(root);
+  // `rev-parse --show-toplevel` prints this path with its trailing space; stripping the whole output would compare
+  // against a different, non-existent root and let the ledger sit inside the worktree it would then travel with.
+  const repo = join(root, "repo ");
+  mkdirSync(repo);
+  git(repo, ["init", "-q", "-b", "main"]);
+  expect(reviewProjectId(repo)).toMatch(/^repo @[a-f0-9]{8}$/);
+  expect(ledgerPath(repo, { home: join(root, "agenthub") })).toBe(join(root, "agenthub", "review", reviewProjectId(repo), "ledger.jsonl"));
+  expect(() => ledgerPath(repo, { home: join(repo, "ledger-home") })).toThrow("AGENTHUB_HOME resolves inside the reviewed worktree");
+});
+
 test("the project key and the worktree check follow the reviewed checkout, not an inherited GIT_DIR", () => {
   const { repo } = fixture();
   // A second repository, named by GIT_DIR/GIT_WORK_TREE as a submodule or a hook would: the ledger must still describe

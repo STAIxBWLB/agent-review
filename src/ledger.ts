@@ -90,7 +90,9 @@ const MAX_EVENT_BYTES = 256 * 1024;
  */
 const git = (cwd: string, args: string[]): string | undefined => {
   const result = reviewGit(cwd, args, { literalPathspecs: false });
-  return result.status === 0 ? result.stdout.trim() : undefined;
+  // Only the line ending git appends is stripped: `trim()` would also eat spaces that belong to the value, and
+  // `rev-parse --show-toplevel` prints the worktree root that the containment check compares against.
+  return result.status === 0 ? result.stdout.replace(/\r?\n$/, "") : undefined;
 };
 
 /** `host/owner/repo`, lowercased on GitHub; a non-default port stays part of the host. */
@@ -109,7 +111,8 @@ function normalizeOrigin(url: string): string | undefined {
 /** The project's ledger key. */
 export function reviewProjectId(cwd: string): string {
   const origin = git(cwd, ["remote", "get-url", "origin"]);
-  const normalized = origin ? normalizeOrigin(origin) : undefined;
+  // Whitespace around a URL is not part of it, so the one value that is trimmed is this one; a path is never trimmed.
+  const normalized = origin ? normalizeOrigin(origin.trim()) : undefined;
   if (normalized) return normalized;
   const top = git(cwd, ["rev-parse", "--show-toplevel"]);
   let root = cwd;

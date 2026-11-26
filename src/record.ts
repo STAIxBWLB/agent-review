@@ -31,6 +31,10 @@ function refuse(message: string, next: string): never {
 }
 
 const FULL_OID = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
+/** A packet id is the sha256 of the packet's canonical JSON: a report's claim on it is checked before it is looked up. */
+const PACKET_ID = /^[a-f0-9]{64}$/;
+/** A review thread is a PR number, in the shape `arev packet --pr` takes it. */
+const PR_NUMBER = /^[1-9][0-9]*$/;
 /** The JSON type of a report value: what a refusal says when it may not say the value itself. */
 const jsonType = (value: unknown): string =>
   value === null ? "null" : Array.isArray(value) ? "an array" : typeof value;
@@ -266,6 +270,8 @@ export function parseReviewRecord(raw: unknown, options: RecordOptions): ReviewR
 /** What `arev show` prints and `arev gate` reads (V1 T4). Evidence rides beside the lifecycle, which has no field for it. */
 export interface ReviewView {
   head?: string;
+  /** The review thread the view was scoped to, so a caller that passed `--pr N` reads which thread it got. */
+  pr?: number;
   base?: string;
   mergeBase?: string;
   packet?: string;
@@ -311,16 +317,46 @@ function rebuildRequest(subject: PacketBlock["subject"]): PacketRequest | undefi
 /** The review thread a packet belongs to: its PR number, or `undefined` for a packet built without one. */
 const threadOf = (subject: PacketBlock["subject"] | undefined): number | undefined => subject?.pr;
 
+/** The subject of an event that carries a packet, so a thread or a head can be read from either kind. */
+const subjectOf = (event: LedgerEvent): PacketBlock["subject"] | undefined =>
+  event.type === "record" ? event.record.packet.subject : event.type === "packet" ? event.packet.subject : undefined;
+
+/** Every review thread that has a record or a packet at one head, in the order the ledger wrote them. */
+function threadsAtHead(events: readonly LedgerEvent[], head: string): (number | undefined)[] {
+  const threads: (number | undefined)[] = [];
+  for (const event of events) {
+    const subject = subjectOf(event);
+    if (!subject || subject.head !== head) continue;
+    const thread = threadOf(subject);
+    if (!threads.includes(thread)) threads.push(thread);
+  }
+  return threads;
+}
+
 /**
- * The thread of one head: its own record's packet, or the newest packet event for that head when no record exists yet.
- * `arev resolve` writes this on the event it appends, so a resolve names the thread it was made in rather than the one a
- * replay happens to be reading.
+ * The thread of one head: `--pr` when the caller named it, else the only thread that head carries. A head SHA two PRs
+ * share - one branch opened against two bases - has a packet and a record for each, and no default read is right there,
+ * so it is refused by name with the candidates rather than answered with whichever event was written last.
  */
-function threadAtHead(events: readonly LedgerEvent[], head: string): number | undefined {
-  const record = [...events].reverse().find(event => event.type === "record" && event.record.packet.subject.head === head);
-  if (record?.type === "record") return threadOf(record.record.packet.subject);
-  const packet = [...events].reverse().find(event => event.type === "packet" && event.packet.subject.head === head);
-  return threadOf(packet?.type === "packet" ? packet.packet.subject : undefined);
+function threadAtHead(events: readonly LedgerEvent[], head: string, pr?: number): number | undefined {
+  const threads = threadsAtHead(events, head);
+  if (pr !== undefined) {
+    if (!threads.includes(pr)) {
+      const numbers = threads.filter((thread): thread is number => thread !== undefined);
+      throw new Refusal(`no packet or record at head ${head} belongs to PR ${pr}`,
+        threads.length === 0 ? `run arev packet --pr ${pr} for that head, then write its review there`
+          : numbers.length === 0 ? "this head's review names no PR; drop --pr"
+            : `pass --pr ${numbers.join(" or --pr ")} for this head`);
+    }
+    return pr;
+  }
+  if (threads.length > 1) {
+    const numbers = threads.filter((thread): thread is number => thread !== undefined);
+    throw new Refusal(`head ${head} is reviewed in more than one thread (${threads.map(thread => thread === undefined ? "no PR" : `PR ${thread}`).join(", ")}), so arev cannot tell which review you mean`,
+      numbers.length === threads.length ? `pass --pr ${numbers.join(" or --pr ")} to choose the review thread`
+        : "pass --pr <n> for the PR you mean; a head reviewed once with --pr and once without cannot be told apart");
+  }
+  return threads[0];
 }
 
 /**
@@ -332,20 +368,27 @@ function threadAtHead(events: readonly LedgerEvent[], head: string): number | un
  * head it was recorded at, carrying the severity and term of the latest report of it, so settling a blocking finding once
  * settles it for later heads of the same PR too. A resolve naming an id no report of the thread carried is ignored.
  */
-export function ledgerEventsView(events: readonly LedgerEvent[], head?: string): ReviewView {
-  const newest = (type: LedgerEvent["type"]) => [...events].reverse().find(event => event.type === type);
-  const lastRecord = newest("record"), lastPacket = newest("packet");
+export function ledgerEventsView(events: readonly LedgerEvent[], head?: string, pr?: number): ReviewView {
+  // `--pr N` without `--head` reads that PR's newest review: a caller that knows the thread need not name a head, and a
+  // head two PRs share cannot answer for both.
+  const newest = (type: LedgerEvent["type"], thread?: number) => [...events].reverse().find(event =>
+    event.type === type && (thread === undefined || threadOf(subjectOf(event)) === thread));
+  const lastRecord = newest("record", pr), lastPacket = newest("packet", pr);
   const target = head
     ?? (lastRecord?.type === "record" ? lastRecord.record.packet.subject.head : undefined)
     ?? (lastPacket?.type === "packet" ? lastPacket.packet.subject.head : undefined);
-  const packetEvent = target === undefined
-    ? (lastPacket?.type === "packet" ? lastPacket : undefined)
-    : [...events].reverse().find(event => event.type === "packet" && event.packet.subject.head === target);
-  const recordEvent = [...events].reverse().find(event => event.type === "record" && event.record.packet.subject.head === target);
+  // The thread is the target head's own: `--pr` when the caller named it, else the only one that head carries, refused by
+  // name when a head carries two. Every selection below is scoped to it.
+  const thread = target === undefined ? pr : threadAtHead(events, target, pr);
+  const atTarget = (event: LedgerEvent): boolean => {
+    const subject = subjectOf(event);
+    return subject !== undefined && subject.head === target && threadOf(subject) === thread;
+  };
+  const packetEvent = [...events].reverse().find(event => event.type === "packet" && atTarget(event));
+  const recordEvent = [...events].reverse().find(event => event.type === "record" && atTarget(event));
   // A record's own packet is the one its report was validated against, so it wins over the newest packet event for the
   // head: a later packet (a re-run, a new base) describes a review this head's record never saw.
   const recordedPacket = recordEvent?.type === "record" ? recordEvent.record.packet : undefined;
-  const thread = threadOf(recordedPacket?.subject ?? (packetEvent?.type === "packet" ? packetEvent.packet.subject : undefined));
   const inThread = (subject: PacketBlock["subject"]): boolean =>
     thread === undefined ? subject.head === target : threadOf(subject) === thread;
   // The text and evidence a view prints belong to the records it replays: a record for a later head describes a review
@@ -408,6 +451,7 @@ export function ledgerEventsView(events: readonly LedgerEvent[], head?: string):
   const packetId = recordedPacket?.id ?? (packetEvent?.type === "packet" ? packetEvent.packet.id : undefined);
   return {
     ...(target === undefined ? {} : { head: target }),
+    ...(thread === undefined ? {} : { pr: thread }),
     ...(typeof subject?.base === "string" ? { base: subject.base } : {}),
     ...(typeof subject?.mergeBase === "string" ? { mergeBase: subject.mergeBase } : {}),
     ...(packetId === undefined ? {} : { packet: packetId }),
@@ -471,36 +515,48 @@ export function recordCommand(cwd: string, args: readonly string[]): number {
     } catch {
       throw new Refusal(`cannot read the report ${file}`, "pass the path of the report JSON you wrote");
     }
-    if (Buffer.byteLength(source) > MAX_REPORT_BYTES) throw new Refusal(`the report ${file} exceeds ${MAX_REPORT_BYTES} bytes`, "shorten the report's text and retry");
+    if (Buffer.byteLength(source) > MAX_REPORT_BYTES) throw new Refusal(`the report ${shown(file)} exceeds ${MAX_REPORT_BYTES} bytes`, "shorten the report's text and retry");
     // A report is untrusted text and every refusal below can name a value out of it, so the file is screened before it is
     // parsed and before any of it reaches a message. The ledger screens each event again as it is written; this screen is
     // what keeps a secret-shaped value out of stderr, and it names no value at all.
     if (secretShaped(source)) {
-      throw new Refusal(`the report ${file} matches a secret pattern, so nothing from it was recorded or shown`,
+      throw new Refusal(`the report ${shown(file)} matches a secret pattern, so nothing from it was recorded or shown`,
         "remove the secret-shaped value from the report, then write it again");
     }
     let raw: unknown;
     try {
       raw = JSON.parse(source);
     } catch {
-      throw new Refusal(`${file} is not valid JSON`, "fix the report file and run arev record again");
+      throw new Refusal(`${shown(file)} is not valid JSON`, "fix the report file and run arev record again");
     }
     // The raw screen cannot see a JSON escape, which the parse has now decoded: `\u0041` spells `A`, so a report can carry
     // a secret-shaped value past it. Every string the parsed report holds is screened the same way, still naming no value.
     if ([...stringsIn(raw)].some(secretShaped)) {
-      throw new Refusal(`the report ${file} matches a secret pattern, so nothing from it was recorded or shown`,
+      throw new Refusal(`the report ${shown(file)} matches a secret pattern, so nothing from it was recorded or shown`,
         "remove the secret-shaped value from the report, then write it again");
     }
     const head = own(own(own(raw, "packet"), "subject"), "head");
     // The head is checked before it is ever echoed: it is report text, and the refusals below print it.
     if (typeof head !== "string" || !FULL_OID.test(head)) {
-      throw new Refusal(`the report ${file} has no full commit SHA at packet.subject.head`,
+      throw new Refusal(`the report ${shown(file)} has no full commit SHA at packet.subject.head`,
         "write the report from the packet.json arev wrote: arev packet --pr N --out DIR");
     }
     const events = readLedger(cwd);
-    const packetEvent = [...events].reverse().find(event => event.type === "packet" && event.packet.subject.head === head);
+    // The report names the packet it was written from, and that is the one it is checked against: one head SHA can carry
+    // a packet for each of two PRs opened against different bases, so the newest packet for the head is not the report's.
+    const packetId = own(own(raw, "packet"), "id");
+    if (typeof packetId !== "string" || !PACKET_ID.test(packetId)) {
+      throw new Refusal(`the report ${shown(file)} has no packet id at packet.id`,
+        "write the report from the packet.json arev wrote: arev packet --pr N --out DIR");
+    }
+    const packetEvent = [...events].reverse().find(event => event.type === "packet" && event.packet.id === packetId);
     if (!packetEvent || packetEvent.type !== "packet") {
-      throw new Refusal(`no packet for head ${head} is in the ledger`, `run arev packet for that head (arev packet --pr N --out DIR), then write the report from its packet.json`);
+      throw new Refusal(`no packet ${packetId} is in the ledger`,
+        `run arev packet for the head this report reviews (arev packet --pr N --out DIR), then write the report from its packet.json`);
+    }
+    if (packetEvent.packet.subject.head !== head) {
+      throw new Refusal(`the packet ${packetId} is for head ${packetEvent.packet.subject.head}, not ${head}`,
+        `write the report from the packet.json arev wrote for ${head}, or fix packet.subject.head to the head that packet describes`);
     }
     const request = rebuildRequest(packetEvent.packet.subject);
     if (request) {
@@ -509,7 +565,7 @@ export function recordCommand(cwd: string, args: readonly string[]): number {
         rebuilt = buildPacket(cwd, request).packet.id;
       } catch (error) {
         // A packet that cannot be rebuilt cannot be shown to match, and an unrun check is not a pass.
-        throw new Refusal(`arev cannot rebuild the packet for head ${head} to check the report against: ${error instanceof Error ? error.message : "unknown error"}`,
+        throw new Refusal(`arev cannot rebuild the packet for head ${head} to check the report against: ${shown(error instanceof Error ? error.message : "unknown error")}`,
           `fetch the reviewed commits and retry, or rerun arev packet for ${head} and rewrite the report from its packet.json`);
       }
       if (rebuilt !== packetEvent.packet.id) {
@@ -536,14 +592,17 @@ export function recordCommand(cwd: string, args: readonly string[]): number {
   }
 }
 
-/** `arev resolve <finding-id> --as fixed|false_positive|accepted [--evidence REF]... [--rationale TEXT] [--head SHA]`. */
+/** `arev resolve <finding-id> --as fixed|false_positive|accepted [--evidence REF]... [--rationale TEXT] [--head SHA] [--pr N] [--json]`. */
 export function resolveCommand(cwd: string, args: readonly string[]): number {
-  const parsed = parseArgs(args, { value: ["--as", "--evidence", "--rationale", "--head"], boolean: ["--json"] });
-  if (!parsed) return usageError("resolve takes one finding id and --as fixed|false_positive|accepted, with --evidence, --rationale or --head");
+  const parsed = parseArgs(args, { value: ["--as", "--evidence", "--rationale", "--head", "--pr"], boolean: ["--json"] });
+  if (!parsed) return usageError("resolve takes one finding id and --as fixed|false_positive|accepted, with --evidence, --rationale, --head or --pr");
   if (parsed.positionals.length !== 1) return usageError(`resolve takes exactly one finding id (got ${parsed.positionals.length})`);
   const id = parsed.positionals[0]!;
   const as = parsed.flags["--as"]?.at(-1);
   if (as !== "fixed" && as !== "false_positive" && as !== "accepted") return usageError("resolve needs --as fixed, --as false_positive or --as accepted");
+  const prFlag = parsed.flags["--pr"]?.at(-1);
+  if (prFlag !== undefined && !PR_NUMBER.test(prFlag)) return usageError("Invalid PR number. Pass a positive integer to --pr.");
+  const pr = prFlag === undefined ? undefined : Number(prFlag);
   try {
     const evidence = (parsed.flags["--evidence"] ?? []).map((ref, index) => cliText(ref, MAX_REF, `--evidence[${index}]`));
     const rationale = parsed.flags["--rationale"]?.at(-1);
@@ -555,18 +614,22 @@ export function resolveCommand(cwd: string, args: readonly string[]): number {
       throw new Refusal("--as false_positive needs --evidence", `pass --evidence path:line (or the command output) that settles ${shown(id)}`);
     }
     const events = readLedger(cwd);
-    const newestRecord = [...events].reverse().find(event => event.type === "record");
+    // `--pr N` resolves inside that thread, and without `--head` it reads that PR's newest record rather than the ledger's
+    // newest: two PRs can share a head, and the newest record there belongs to whichever was recorded last.
+    const newestRecord = [...events].reverse().find(event => event.type === "record"
+      && (pr === undefined || threadOf(event.record.packet.subject) === pr));
     const head = parsed.flags["--head"]?.at(-1) ?? (newestRecord?.type === "record" ? newestRecord.record.packet.subject.head : undefined);
     if (!head) throw new Refusal("the ledger has no head to resolve against", "pass --head <sha> or record a review first");
-    // The thread is the head's own: its record's packet, else the newest packet for that head. The resolve states it on
-    // the event, and it refuses an id that thread never reported, so one PR's resolve cannot settle another PR's finding.
-    const thread = threadAtHead(events, head);
+    // The thread is the head's own: `--pr` when given, else the only thread that head carries, refused when it carries
+    // more than one. The resolve states it on the event, and it refuses an id that thread never reported, so one PR's
+    // resolve cannot settle another PR's finding.
+    const thread = threadAtHead(events, head, pr);
     const reports = (event: LedgerEvent): boolean =>
       event.type === "record" && event.record.findings.some(finding => finding.id === id)
       && (thread === undefined ? event.record.packet.subject.head === head : threadOf(event.record.packet.subject) === thread);
     if (!events.some(reports)) {
       throw new Refusal(thread === undefined
-        ? `no record at ${head} reports the finding ${shown(id)}`
+        ? `no record at ${shown(head)} reports the finding ${shown(id)}`
         : `no record of PR ${thread} reports the finding ${shown(id)}`,
         thread === undefined ? `pass --head of a head whose record reports it, or record that review first` : "run arev show to list the finding ids recorded for that PR");
     }
@@ -585,23 +648,25 @@ export function resolveCommand(cwd: string, args: readonly string[]): number {
   }
 }
 
-/** `arev show [--head SHA] [--json]`. */
+/** `arev show [--head SHA] [--pr N] [--json]`. */
 export function showCommand(cwd: string, args: readonly string[]): number {
-  const parsed = parseArgs(args, { value: ["--head"], boolean: ["--json"] });
-  if (!parsed) return usageError("show takes --head <sha> and --json");
+  const parsed = parseArgs(args, { value: ["--head", "--pr"], boolean: ["--json"] });
+  if (!parsed) return usageError("show takes --head <sha>, --pr <n> and --json");
   if (parsed.positionals.length > 0) return usageError(`show takes no arguments after its flags (got ${parsed.positionals.length})`);
+  const prFlag = parsed.flags["--pr"]?.at(-1);
+  if (prFlag !== undefined && !PR_NUMBER.test(prFlag)) return usageError("Invalid PR number. Pass a positive integer to --pr.");
   try {
     const events = readLedger(cwd);
     if (events.length === 0) {
       console.log(`no review ledger for ${reviewProjectId(cwd)} yet; next: arev packet --pr N --out DIR`);
       return EXIT.ok;
     }
-    const view = ledgerEventsView(events, parsed.flags["--head"]?.at(-1));
+    const view = ledgerEventsView(events, parsed.flags["--head"]?.at(-1), prFlag === undefined ? undefined : Number(prFlag));
     if (parsed.flags["--json"] !== undefined) {
       console.log(JSON.stringify(view, null, 2));
       return EXIT.ok;
     }
-    console.log(`head ${view.head ?? "(none)"}${view.base ? ` base ${view.base}` : ""}${view.mergeBase ? ` merge-base ${view.mergeBase}` : ""}`);
+    console.log(`head ${view.head ?? "(none)"}${view.pr === undefined ? "" : ` pr ${view.pr}`}${view.base ? ` base ${view.base}` : ""}${view.mergeBase ? ` merge-base ${view.mergeBase}` : ""}`);
     console.log(`packet ${view.packet ?? "(none)"} record ${view.record ?? "(none)"}${view.verdict ? ` verdict ${view.verdict}` : ""}${view.call ? ` call ${view.call.ok ? "ok" : "failed"}` : ""}${view.light ? " light" : ""}`);
     const counts = view.counts;
     console.log(`findings: ${counts.important} blocking (${counts.openImportant} open), ${counts.nit} advisory (${counts.openNit} open), ${counts.fixed} fixed, ${counts.falsePositive} false_positive, ${counts.accepted} accepted`);

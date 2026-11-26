@@ -39,7 +39,9 @@ test("a record, resolve or show argument error refuses as usage and names that c
   for (const [args, message] of [
     [["record"], "arev: record takes exactly one report file (got 0)"],
     [["resolve"], "arev: resolve takes exactly one finding id (got 0)"],
-    [["show", "--bogus"], "arev: show takes --head <sha> and --json"],
+    [["show", "--bogus"], "arev: show takes --head <sha>, --pr <n> and --json"],
+    [["show", "--head", "0".repeat(40), "--pr", "0"], "arev: Invalid PR number. Pass a positive integer to --pr."],
+    [["resolve", "bugs:one", "--as", "fixed", "--pr", "seven"], "arev: Invalid PR number. Pass a positive integer to --pr."],
   ] as const) {
     const result = run(...args);
     expect(result.code).toBe(2);

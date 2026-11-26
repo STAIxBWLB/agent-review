@@ -255,6 +255,40 @@ test("a finding's lifecycle is scoped to its PR: one PR's resolve leaves another
   expect(crossed.openBlocking).toEqual(["bugs:missing-frame"]);
 });
 
+test("a head two PRs share is refused without --pr, and each thread reads only its own", () => {
+  // One branch opened against two bases: the same head SHA, a packet and a record for each PR.
+  const events: LedgerEvent[] = [
+    { v: 1, type: "packet", at: "t0", packet: packetFor(HEAD) },
+    { v: 1, type: "record", at: "t1", id: "record-7", record: recordAt(HEAD, [finding({ id: "bugs:seven-only" })]) },
+    { v: 1, type: "packet", at: "t2", packet: { ...packetFor(HEAD, 8), id: "8".repeat(64) } },
+    { v: 1, type: "record", at: "t3", id: "record-8",
+      record: recordAt(HEAD, [finding({ id: "bugs:eight-only", severity: "advisory" })], "changes_requested", { ok: true }, 8) },
+    // PR 7 records again at a later head, so the ledger's newest record is not PR 8's.
+    { v: 1, type: "record", at: "t4", id: "record-7-next", record: recordAt(NEXT, [finding({ id: "bugs:seven-only" })]) },
+  ];
+  // The default read would answer with whichever event was written last, so it is refused with the candidates instead:
+  // the cause names the threads, and the next step names the flag that chooses one.
+  expect(() => ledgerEventsView(events, HEAD)).toThrow(`head ${HEAD} is reviewed in more than one thread (PR 7, PR 8)`);
+  const threadOfRefusal = (): string | undefined => {
+    try { ledgerEventsView(events, HEAD); } catch (error) { return error instanceof Refusal ? error.next : undefined; }
+  };
+  expect(threadOfRefusal()).toBe("pass --pr 7 or --pr 8 to choose the review thread");
+
+  const seven = ledgerEventsView(events, HEAD, 7);
+  expect(seven).toMatchObject({ pr: 7, packet: PACKET, record: "record-7" });
+  expect(seven.findings.map(entry => entry.id)).toEqual(["bugs:seven-only"]);
+  expect(seven.counts).toMatchObject({ important: 1, nit: 0 });
+  const eight = ledgerEventsView(events, HEAD, 8);
+  expect(eight).toMatchObject({ pr: 8, record: "record-8" });
+  expect(eight.findings.map(entry => entry.id)).toEqual(["bugs:eight-only"]);
+  expect(eight.counts).toMatchObject({ important: 0, nit: 1 });
+  // `--pr` alone reads that PR's newest review: PR 8's last review is this head, though PR 7 recorded again at `NEXT`.
+  expect(ledgerEventsView(events, undefined, 8)).toMatchObject({ head: HEAD, pr: 8, record: "record-8" });
+  expect(ledgerEventsView(events).head).toBe(NEXT);
+  // A PR with nothing at this head is refused rather than answered with an empty review of it.
+  expect(() => ledgerEventsView(events, HEAD, 9)).toThrow(`no packet or record at head ${HEAD} belongs to PR 9`);
+});
+
 test("without a PR a finding's lifecycle is that exact head, and nothing carries between heads", () => {
   const events: LedgerEvent[] = [
     { v: 1, type: "packet", at: "t0", packet: packetFor(HEAD, null) },
@@ -394,13 +428,14 @@ test("arev record refuses a report that states accepted at a terminal too, namin
   expect(refused.stderr).toContain("states accepted");
 });
 
-test("arev record without a packet for the head names the packet command", () => {
+test("arev record without a packet for the report's id names the packet command", () => {
   const { root, repo, home } = fixture();
   const report = join(root, "report.json");
   writeFileSync(report, JSON.stringify(reportFor(HEAD)));
   const result = run(repo, home, "record", report);
   expect(result.code).toBe(1);
-  expect(result.stderr).toContain(`no packet for head ${HEAD} is in the ledger`);
+  // The report is looked up by the packet id it names, not by its head: a head can carry a packet for each of two PRs.
+  expect(result.stderr).toContain(`no packet ${PACKET} is in the ledger`);
   expect(result.stderr).toContain("arev packet");
 });
 
@@ -566,7 +601,8 @@ test("a secret-shaped report is refused before it is parsed, and its value reach
 
 test("the view takes its base and packet from the record, not from a later packet for the same head", () => {
   const laterBase = "f".repeat(40);
-  const laterPacket = { ...packetFor(HEAD), id: "1".repeat(64), subject: { kind: "range", base: laterBase, head: HEAD, mergeBase: laterBase } };
+  // The re-run names the same review thread, so the head carries one thread and the view answers without `--pr`.
+  const laterPacket = { ...packetFor(HEAD), id: "1".repeat(64), subject: { kind: "range", base: laterBase, head: HEAD, mergeBase: laterBase, pr: PR } };
   const packet: LedgerEvent = { v: 1, type: "packet", at: "t0", packet: packetFor(HEAD) };
   const record: LedgerEvent = { v: 1, type: "record", at: "t1", id: "record-1", record: recordAt(HEAD, [], "approved") };
   const repacket: LedgerEvent = { v: 1, type: "packet", at: "t2", packet: laterPacket };

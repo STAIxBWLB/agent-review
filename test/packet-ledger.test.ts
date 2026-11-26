@@ -207,14 +207,99 @@ test("a resolve names its own PR, so a head with a packet but no record settles 
   expect(other.counts).toMatchObject({ openImportant: 2, fixed: 0 });
 });
 
-test("a report whose packet id is not the packet arev built for that head is refused", () => {
+test("two PRs share one head, so each report records against its own packet and show and resolve need --pr", () => {
+  const bin = mkdtempSync(join(tmpdir(), "arev-gh-"));
+  const home = mkdtempSync(join(tmpdir(), "arev-home-"));
+  scratch.push(bin, home);
+  const { dir, git, write, base, head, cli } = reviewedFlow("# Review\n", { PATH: `${bin}:${process.env.PATH ?? ""}`, AGENTHUB_HOME: home });
+  // One branch opened against two bases: both PRs review this same head, so each has its own packet there. The fake `gh`
+  // answers with the head the next `arev packet` is about, so nothing leaves the machine.
+  const gh = (ref: string) => writeFileSync(join(bin, "gh"),
+    `#!/bin/sh\nprintf '{"baseRefOid":"${base}","headRefOid":"${ref}"}'\n`, { mode: 0o755 });
+  gh(head);
+  const seven = JSON.parse(cli("packet", "--pr", "7", "--json").stdout) as BuiltPacket;
+  const eight = JSON.parse(cli("packet", "--pr", "8", "--json").stdout) as BuiltPacket;
+  expect(seven.subject).toMatchObject({ pr: 7 });
+  expect(eight.subject).toMatchObject({ pr: 8 });
+  expect(seven.id).not.toBe(eight.id);
+
+  const sevenOnly = { id: "bugs:seven-only", term: "bugs", severity: "blocking", disposition: "open", origin: "introduced", text: "only PR 7 reports this" };
+  const eightOnly = { ...sevenOnly, id: "bugs:eight-only", text: "only PR 8 reports this" };
+  // PR 7's packet is the older event for this head, and PR 8's is the newest: a lookup by head would record PR 7's report
+  // against PR 8's packet, which its own packet id refuses.
+  expect(cli("record", report(reportFor(seven, { findings: [sevenOnly], verdict: "changes_requested" }))).stderr).toBe("");
+  expect(cli("record", report(reportFor(eight, { findings: [eightOnly], verdict: "changes_requested" }))).stderr).toBe("");
+  const ledger = readFileSync(join(home, "review", ...reviewProjectId(dir).split("/"), "ledger.jsonl"), "utf8")
+    .split("\n").filter(Boolean).map(line => JSON.parse(line));
+  expect(ledger.filter((event: { type: string }) => event.type === "record").map((event: { record: { packet: { id: string } } }) => event.record.packet.id))
+    .toEqual([seven.id, eight.id]);
+
+  // No default read is right for a shared head, so it is refused with the candidates rather than answered with the newest.
+  const ambiguous = cli("show", "--head", head, "--json");
+  expect(ambiguous.status).toBe(1);
+  expect(ambiguous.stderr).toContain(`head ${head} is reviewed in more than one thread (PR 7, PR 8)`);
+  expect(ambiguous.stderr).toContain("pass --pr 7 or --pr 8 to choose the review thread");
+  // With `--pr` each reads only its own thread, and a PR with nothing at the head is refused rather than shown empty.
+  const mine = JSON.parse(cli("show", "--head", head, "--pr", "7", "--json").stdout);
+  expect(mine).toMatchObject({ head, pr: 7, packet: seven.id });
+  expect(mine.openBlocking).toEqual(["bugs:seven-only"]);
+  const theirs = JSON.parse(cli("show", "--head", head, "--pr", "8", "--json").stdout);
+  expect(theirs).toMatchObject({ head, pr: 8, packet: eight.id });
+  expect(theirs.openBlocking).toEqual(["bugs:eight-only"]);
+  const nothing = cli("show", "--head", head, "--pr", "9", "--json");
+  expect(nothing.status).toBe(1);
+  expect(nothing.stderr).toContain(`no packet or record at head ${head} belongs to PR 9`);
+
+  // resolve follows the same rule: ambiguous without --pr, refused in the wrong thread, and settled in its own.
+  const noPr = cli("resolve", "bugs:seven-only", "--as", "fixed");
+  expect(noPr.status).toBe(1);
+  expect(noPr.stderr).toContain("is reviewed in more than one thread");
+  const wrongThread = cli("resolve", "bugs:seven-only", "--pr", "8", "--as", "fixed");
+  expect(wrongThread.status).toBe(1);
+  expect(wrongThread.stderr).toContain("no record of PR 8 reports the finding bugs:seven-only");
+  expect(cli("resolve", "bugs:seven-only", "--pr", "7", "--as", "fixed").status).toBe(0);
+  expect(JSON.parse(cli("show", "--head", head, "--pr", "7", "--json").stdout).openBlocking).toEqual([]);
+  expect(JSON.parse(cli("show", "--head", head, "--pr", "8", "--json").stdout).openBlocking).toEqual(["bugs:eight-only"]);
+
+  // Two more heads, PR 7 then PR 8, so `resolve --pr 7` without --head can be shown to read PR 7's own newest record
+  // rather than the ledger's newest, which by then is PR 8's.
+  const commit = (body: string, message: string) => {
+    write("src/a.ts", body);
+    git("add", ".");
+    git("commit", "-qm", message);
+    return git("rev-parse", "HEAD").trim();
+  };
+  const sevenNext = commit("export const a = 5;\n", "PR 7 second head");
+  gh(sevenNext);
+  const sevenSecond = JSON.parse(cli("packet", "--pr", "7", "--json").stdout) as BuiltPacket;
+  expect(cli("record", report(reportFor(sevenSecond, { findings: [sevenOnly], verdict: "changes_requested" }))).status).toBe(0);
+  const eightNext = commit("export const a = 6;\n", "PR 8 second head");
+  gh(eightNext);
+  const eightSecond = JSON.parse(cli("packet", "--pr", "8", "--json").stdout) as BuiltPacket;
+  expect(cli("record", report(reportFor(eightSecond, { findings: [eightOnly], verdict: "changes_requested" }))).status).toBe(0);
+  const backToSeven = cli("resolve", "bugs:seven-only", "--pr", "7", "--as", "fixed");
+  expect(backToSeven.stdout).toContain(`at ${sevenNext}`);
+  expect(JSON.parse(cli("show", "--head", sevenNext, "--json").stdout).openBlocking).toEqual([]);
+});
+
+test("a report whose packet id is not in the ledger is refused, and one whose head disagrees with its packet too", () => {
   const { base, head, cli } = reviewedFlow();
   const packet = JSON.parse(cli("packet", "--from", base, "--to", head, "--json").stdout) as BuiltPacket;
-  const refused = cli("record", report(reportFor(packet, { packet: { id: "0".repeat(64), subject: packet.subject } })));
+  // The report names the packet it was written from, so an id no packet event carries is refused by that id.
+  const unknown = cli("record", report(reportFor(packet, { packet: { id: "0".repeat(64), subject: packet.subject } })));
+  expect(unknown.status).toBe(1);
+  expect(unknown.stderr).toContain(`no packet ${"0".repeat(64)} is in the ledger`);
+  expect(unknown.stderr).toContain("arev packet --pr N --out DIR");
 
-  expect(refused.status).toBe(1);
-  expect(refused.stderr).toContain(`the report's packet id is not the packet for head ${head}`);
-  expect(refused.stderr).toContain("arev packet --pr N --out DIR");
+  // The head the report states is checked against the packet its id names, not the other way round.
+  const movedHead = cli("record", report(reportFor(packet, { packet: { id: packet.id, subject: { ...packet.subject, head: base } } })));
+  expect(movedHead.status).toBe(1);
+  expect(movedHead.stderr).toContain(`the packet ${packet.id} is for head ${head}, not ${base}`);
+
+  // A report with no packet id at all is refused before any lookup, rather than searched for by an undefined id.
+  const noId = cli("record", report(reportFor(packet, { packet: { subject: packet.subject } })));
+  expect(noId.status).toBe(1);
+  expect(noId.stderr).toContain("has no packet id at packet.id");
 });
 
 test("a refusal that reaches the command's catch prints its own next step, not the command's help", () => {

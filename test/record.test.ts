@@ -872,6 +872,19 @@ test("a secret-shaped report is refused before it is parsed, and its value reach
   expect(plainV.stderr).toContain("the report's v must be the number 1 (got string)");
 });
 
+test("a resolve names an id it will not echo, and still names a plain one", () => {
+  const { repo, home } = fixture();
+  // A secret-shaped id is withheld, but the refusal still names a plain id. Give the exact head so the
+  // thread-aware lookup can check for that finding even in an empty ledger.
+  const plain = run(repo, home, "resolve", "bugs:missing-frame", "--as", "fixed", "--head", HEAD);
+  expect(plain.code).toBe(1);
+  expect(plain.stderr).toContain("reports the finding bugs:missing-frame");
+  const secret = run(repo, home, "resolve", SECRET, "--as", "false_positive");
+  expect(secret.code).toBe(1);
+  expect(secret.stderr).not.toContain(SECRET);
+  expect(secret.stderr).toContain("that settles <withheld>");
+});
+
 test("the view takes its base and packet from the record, not from a later packet for the same head", () => {
   const laterBase = "f".repeat(40);
   // The re-run names the same review thread, so the head carries one thread and the view answers without `--pr`.

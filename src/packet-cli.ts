@@ -3,10 +3,20 @@ import { dirname, resolve, sep } from "node:path";
 import { parseArgs } from "node:util";
 import { EXIT, errorLine } from "@staix/cli-output";
 import { Refusal, appendEvent, comparablePath } from "./ledger.ts";
-import { buildPacket, repositoryPath, type PacketRequest } from "./packet.ts";
+import { buildPacket, repositoryPath, type PacketBundle, type PacketRequest } from "./packet.ts";
 import { parseReviewMd, type ReviewMdSettings } from "./review-md.ts";
 import { commitOid, mergeBaseOid, repositoryRoot, reviewGit } from "./review-git.ts";
 import { readRules, renderRules } from "./rules.ts";
+
+/** Read the settings for the authoritative tree the packet uses. */
+export function packetSettings(cwd: string, bundle: PacketBundle): ReviewMdSettings {
+  return parseReviewMd(readRules(repositoryRoot(cwd), bundle.packet.subject.mergeBase, []).rules);
+}
+
+export function appendPacketEvent(cwd: string, bundle: PacketBundle, settings: ReviewMdSettings): void {
+  appendEvent(cwd, { v: 1, type: "packet", at: new Date().toISOString(), packet: bundle.packet,
+    review: { advisory_cap: settings.advisoryCap } });
+}
 
 export class PacketUsageError extends Error {}
 
@@ -87,7 +97,7 @@ export function runPacket(cwd: string, args: readonly string[]): number | void {
   // so the report is checked against the REVIEW.md this packet was built under.
   let settings: ReviewMdSettings;
   try {
-    settings = parseReviewMd(readRules(root, bundle.packet.subject.mergeBase, []).rules);
+    settings = packetSettings(root, bundle);
   } catch (error) {
     // The next step is the REVIEW.md line to change, not this command's help, so the refusal is printed as it stands.
     if (!(error instanceof Refusal)) throw error;
@@ -135,7 +145,7 @@ export function runPacket(cwd: string, args: readonly string[]): number | void {
   // holds too - an event that cannot be written takes the bundle with it, because nobody could record a report for it
   // and a retry would find the exclusive files already there.
   try {
-    appendEvent(cwd, { v: 1, type: "packet", at: new Date().toISOString(), packet: bundle.packet, review: { advisory_cap: settings.advisoryCap } });
+    appendPacketEvent(cwd, bundle, settings);
   } catch (error) {
     discard();
     throw error;
@@ -153,15 +163,22 @@ export function runRules(cwd: string, args: readonly string[]): void {
   if (!paths.length || paths.some(path => path.startsWith("-")) || (check && paths.length !== 1)) {
     throw new PacketUsageError("Specify paths with arev rules <path...> or arev rules check <path>.");
   }
+  const { base, rules } = rulesForPaths(cwd, paths);
+  console.log(`Rules at merge base ${base}:\n\n${renderRules(rules, !check)}`);
+}
+
+/** Resolve paths and read the trusted base rules for the CLI and MCP. */
+export function rulesForPaths(cwd: string, paths: readonly string[]) {
   const root = repositoryRoot(cwd);
   const head = commitOid(root, "HEAD");
   const defaultRef = ["origin/HEAD", "origin/main", "origin/master"].find(ref =>
     reviewGit(root, ["rev-parse", "--verify", "-q", `${ref}^{commit}`]).status === 0);
   if (!defaultRef) {
-    throw new Error("No origin default branch is available. Fetch origin and set its default branch with git remote set-head origin --auto.");
+    throw new Refusal("No origin default branch is available.",
+      "Fetch origin and set its default branch with git remote set-head origin --auto.");
   }
   const base = mergeBaseOid(root, commitOid(root, defaultRef), head);
   const targets = [...new Set(paths.map(path => repositoryPath(cwd, root, path)))].map(path => ({ path, sides: [path] }));
   const rules = readRules(root, base, targets);
-  console.log(`Rules at merge base ${base}:\n\n${renderRules(rules, !check)}`);
+  return { base, rules };
 }

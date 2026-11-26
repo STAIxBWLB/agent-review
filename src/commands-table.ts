@@ -16,6 +16,9 @@ export const commands = [
     syntax: "show [--head SHA] [--pr N|none] [--json]" },
   { name: "gate", aliases: [], description: "Answer whether this exact head is reviewed, and post the status with --post",
     syntax: "gate [--head SHA] [--pr N|none] [--post] [--json]" },
+  { name: "mcp", aliases: [], description: "Serve the review tools over MCP on stdio", syntax: "mcp" },
+  { name: "setup", aliases: [], description: "Register arev mcp with a coding host and install the review skill",
+    syntax: "setup <host> [--apply | --undo]" },
   { name: "--help", aliases: ["-h"], description: "Show usage" },
   { name: "--version", aliases: ["-v"], description: "Show version" },
 ] as const;

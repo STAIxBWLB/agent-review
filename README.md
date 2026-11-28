@@ -87,11 +87,12 @@ wrote the change unless nothing else can run.
 (`--unavailable kimi,claude`). A bare second id is a positional and is refused,
 so the flag itself has to repeat.
 
-The model is the `model` key of `~/.codex/config.toml`, the `default_model` key
-of `~/.kimi-code/config.toml`, and `unknown` for every other host. Only that
-key's value reaches the answer. A value that is not a plain name reads as
-`unknown` as well, and so does a config TOML itself does not accept; the command
-reads no repository and writes no ledger.
+For Claude, `arev host` reads the top-level `model` in
+`~/.claude/settings.json` (`CLAUDE_CONFIG_DIR` overrides the directory).
+For Codex it reads `model` from `~/.codex/config.toml`, and for Kimi it reads
+`default_model` from `~/.kimi-code/config.toml`. Only the model value reaches
+the answer. A missing or invalid model or unreadable config yields `unknown`.
+The command reads no repository and writes no ledger.
 
 `--json` prints `host`, `model`, `reason`, `considered` and, when no host can
 run, `next` with the same instruction the lines carry. When no host can run it

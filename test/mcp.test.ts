@@ -4,9 +4,9 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { argumentError } from "@staix/mcp-stdio";
+import { argumentError, runTranscripts } from "@staix/mcp-stdio";
 import { Refusal, appendEvent, readLedger } from "../src/ledger.ts";
-import { MCP_TOOLS, mcpFailureText, mcpHandlers } from "../src/mcp.ts";
+import { MCP_TOOLS, RUN_STATE_FILE, mcpFailureText, mcpHandlers } from "../src/mcp.ts";
 import { buildPacket } from "../src/packet.ts";
 
 const cleanup: string[] = [];
@@ -202,6 +202,49 @@ test("the AC9 flow runs over the tools, validated as the protocol validates it",
   expect(gated.open).toEqual([]);
   expect(gated.ok).toBe(true);
   expect(gated.record).toBe(recorded.id);
+});
+
+test("the MCP server passes the shared protocol transcripts", async () => {
+  const { dir } = repo();
+  const results = await runTranscripts({
+    name: "arev", version: "fixture", tools: MCP_TOOLS, handlers: mcpHandlers(dir), failureText: mcpFailureText,
+  });
+  expect(results.filter(result => !result.passed)).toEqual([]);
+});
+
+test.each([
+  { mode: "plain", names: MCP_TOOLS.map(tool => tool.name) },
+  { mode: "run", names: ["arev_packet", "arev_rules", "arev_show", "arev_record"] },
+])("$mode stdio accepts Codex listing metadata and reports schema errors as tool results", ({ mode, names }) => {
+  const { dir } = repo();
+  const input = [
+    { jsonrpc: "2.0", id: 1, method: "initialize",
+      params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "fixture", version: "1" } } },
+    { jsonrpc: "2.0", method: "notifications/initialized" },
+    { jsonrpc: "2.0", id: 2, method: "tools/list", params: { _meta: { progressToken: 0 } } },
+    { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "arev_record", arguments: {} } },
+  ].map(message => JSON.stringify(message)).join("\n") + "\n";
+  const args: string[] = [];
+  if (mode === "run") {
+    const out = join(dir, "run");
+    mkdirSync(out);
+    const packetId = "a".repeat(64);
+    writeFileSync(join(out, RUN_STATE_FILE), JSON.stringify({ packetId, advisoryCap: 0 }));
+    writeFileSync(join(out, "packet.json"), JSON.stringify({ id: packetId, subject: { kind: "range" } }));
+    args.push("--run", out);
+  }
+  const run = spawnSync(process.execPath, [join(import.meta.dir, "../bin/arev.js"), "mcp", ...args],
+    { cwd: dir, input, encoding: "utf8", timeout: 15_000 });
+  expect(run.status).toBe(0);
+  expect(run.stderr).toBe("");
+  const replies = run.stdout.trim().split("\n").map(line => JSON.parse(line));
+  expect(replies.map(reply => reply.id)).toEqual([1, 2, 3]);
+  expect(replies[0].result.protocolVersion).toBe("2025-11-25");
+  expect(replies[1].result.tools.map((tool: { name: string }) => tool.name)).toEqual(names);
+  expect(replies[2].error).toBeUndefined();
+  expect(replies[2].result).toMatchObject({
+    isError: true, content: [{ type: "text", text: expect.stringContaining("report") }],
+  });
 });
 
 test("stdio packet, record and gate complete over actual JSON-RPC", () => {

@@ -6,7 +6,7 @@ import ts from "typescript";
 const dependencies = {
   "@staix/agent-mem": "^0.40.0",
   "@staix/cli-output": "0.1.3",
-  "@staix/mcp-stdio": "0.1.0",
+  "@staix/mcp-stdio": "0.3.0",
 };
 const packages = new Set(["@staix/agent-mem/platform", "@staix/cli-output", "@staix/mcp-stdio"]);
 // ponytail: this AST check catches accidental imports; review covers deliberate evasion via eval, new Function or Bun.plugin.

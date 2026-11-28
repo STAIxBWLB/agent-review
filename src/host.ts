@@ -11,7 +11,7 @@
  * - `--implementer` is any identity, not only a review host: an implementer can be a peer that is never a host (`qwen`),
  *   and the script's `choices=ORDER` would have refused to name it.
  */
-import { accessSync, constants, readFileSync, realpathSync, statSync } from "node:fs";
+import { accessSync, closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
@@ -34,14 +34,14 @@ const IDENTITY = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const MAX_CONFIG_BYTES = 64 * 1024, MAX_MODEL_BYTES = 128;
 const BLOCKED = "blocked: no review host can run";
 /**
- * Where each host keeps what it starts with: the variable that relocates its config home, and - for the hosts whose home
- * carries a model file - the directory under that home and the top-level key naming the model (spec #24 AC2). Claude has
- * no entry in `HOST_CONFIG` because its home holds no model to attest, but its home still relocates.
+ * The variables that relocate host configuration directories, and the files and top-level keys that supply models
+ * (spec #24 AC2 and #37 AC1).
  */
 const CONFIG_HOME_VARIABLES: Record<string, string | undefined> = {
   claude: "CLAUDE_CONFIG_DIR", codex: "CODEX_HOME", kimi: "KIMI_CODE_HOME",
 };
 const HOST_CONFIG: Record<string, { directory: string; file: string; key: string } | undefined> = {
+  claude: { directory: ".claude", file: "settings.json", key: "model" },
   codex: { directory: ".codex", file: "config.toml", key: "model" },
   kimi: { directory: ".kimi-code", file: "config.toml", key: "default_model" },
 };
@@ -112,21 +112,34 @@ export function availableHosts(unavailable: ReadonlySet<string>, pathEnv: string
   return new Set(order.filter(host => !unavailable.has(host) && onPath(host, pathEnv)));
 }
 
+/** Read Claude settings from a real config directory and a bounded regular file. */
+function readClaudeSettings(directory: string, file: string): Record<string, unknown> | undefined {
+  const configHome = resolve(directory);
+  if (!lstatSync(configHome).isDirectory()) return undefined;
+  const fd = openSync(join(configHome, file), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || stat.size > MAX_CONFIG_BYTES) return undefined;
+    const buffer = Buffer.alloc(MAX_CONFIG_BYTES + 1);
+    let bytes = 0;
+    while (bytes < buffer.length) {
+      const count = readSync(fd, buffer, bytes, buffer.length - bytes, null);
+      if (count === 0) break;
+      bytes += count;
+    }
+    if (bytes > MAX_CONFIG_BYTES) return undefined;
+    const document: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(buffer.subarray(0, bytes)));
+    if (document === null || typeof document !== "object" || Array.isArray(document)) return undefined;
+    return document as Record<string, unknown>;
+  } finally {
+    closeSync(fd);
+  }
+}
+
 /**
- * The model the host's own config names, or `unknown` (spec #24 AC2).
- *
- * The document is read by TOML's own parser, not line by line. A line reader cannot tell a key from the body of a
- * multiline string or a comment, and this config class is exactly where multiline text lives: a description holding a
- * line that looks like `model = "..."` was returned instead of the key that follows it. Parsing also settles quoted
- * keys, escapes and `#` comments without a rule of my own for each.
- *
- * Only that one top-level key's value leaves this function: a `model` inside a table is not the model the host runs, and
- * a value that is not a string, is empty, over 128 bytes, carries control characters or is secret-shaped is not a model
- * name, so it reads as `unknown` rather than reaching output or, through `arev run`, the ledger.
- *
- * A host started under a relocated config home reads its model from there, so the variable that relocates the home
- * (`CODEX_HOME`, `KIMI_CODE_HOME`) decides which file this reads. `env` is the environment the caller was started with,
- * passed rather than read so a test states it; an empty value is not a relocation, so the home directory stands.
+ * The model named by the host's config, or `unknown`. Use the top-level key from the parsed document so a model-like
+ * line inside a TOML comment or multiline string cannot supply the name. An empty relocation variable uses the
+ * default config directory under the caller's HOME.
  */
 export function modelOf(host: string, home: string, env: Readonly<Record<string, string | undefined>> = {}): string {
   const config = HOST_CONFIG[host];
@@ -134,24 +147,22 @@ export function modelOf(host: string, home: string, env: Readonly<Record<string,
   const variable = hostConfigVariable(host);
   const relocated = variable === undefined ? undefined : env[variable];
   const directory = relocated === undefined || relocated === "" ? join(home, config.directory) : relocated;
-  let text: string;
+  let document: Record<string, unknown> | undefined;
   try {
-    text = readFileSync(join(directory, config.file), "utf8");
+    if (host === "claude") {
+      document = readClaudeSettings(directory, config.file);
+    } else {
+      const text = readFileSync(join(directory, config.file), "utf8");
+      if (Buffer.byteLength(text) > MAX_CONFIG_BYTES) return "unknown";
+      document = Bun.TOML.parse(text) as Record<string, unknown>;
+    }
   } catch {
     return "unknown";
   }
-  if (Buffer.byteLength(text) > MAX_CONFIG_BYTES) return "unknown";
-  let document: Record<string, unknown>;
-  try {
-    // A TOML document is a table, so the parse result is a plain object of its top-level keys.
-    document = Bun.TOML.parse(text) as Record<string, unknown>;
-  } catch {
-    // Not TOML the parser accepts: an undefined escape, a broken table, a duplicate key. No model name to attest.
-    return "unknown";
-  }
-  const value = Object.hasOwn(document, config.key) ? document[config.key] : undefined;
+  const value = document && Object.hasOwn(document, config.key) ? document[config.key] : undefined;
   if (typeof value !== "string" || value.length === 0 || Buffer.byteLength(value) > MAX_MODEL_BYTES
-    || /[\p{Cc}\p{Cf}]/u.test(value) || secretShaped(value)) return "unknown";
+    || /[\p{Cc}\p{Cf}]/u.test(value) || secretShaped(value)
+    || (host === "claude" && !/^[A-Za-z0-9._:-]{1,128}$/.test(value))) return "unknown";
   return value;
 }
 

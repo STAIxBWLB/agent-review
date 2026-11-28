@@ -54,6 +54,17 @@ test("CLAUDE_CONFIG_DIR selects settings from the relocated config home", () => 
   expect(runHost(paths, relocated)).toMatchObject({ model });
 });
 
+function settingsOfSize(bytes: number): string {
+  const overhead = Buffer.byteLength(JSON.stringify({ model, padding: "" }));
+  return JSON.stringify({ model, padding: "a".repeat(bytes - overhead) });
+}
+
+test.each([80 * 1024, 1024 * 1024])("Claude host resolves the model from %i-byte settings", (bytes) => {
+  const paths = fixture();
+  writeFileSync(paths.settings, settingsOfSize(bytes));
+  expect(runHost(paths)).toMatchObject({ model });
+});
+
 test.each([
   { label: "malformed JSON", text: '{"model":' },
   { label: "non-string model", text: '{"model":4}' },
@@ -61,7 +72,7 @@ test.each([
   { label: "nested model", text: '{"env":{"model":"sonnet"}}' },
   { label: "invalid identifier", text: '{"model":"sonnet latest"}' },
   { label: "oversized identifier", text: JSON.stringify({ model: "a".repeat(129) }) },
-  { label: "oversized config", text: JSON.stringify({ model, padding: "a".repeat(1024 * 1024) }) },
+  { label: "oversized config", text: settingsOfSize(1024 * 1024 + 1) },
 ])("Claude host reports unknown for $label", ({ text }) => {
   const paths = fixture();
   writeFileSync(paths.settings, text);

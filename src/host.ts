@@ -32,6 +32,7 @@ export interface HostChoice {
 
 const IDENTITY = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const MAX_CONFIG_BYTES = 64 * 1024, MAX_MODEL_BYTES = 128;
+const MAX_CLAUDE_CONFIG_BYTES = 1024 * 1024;
 const BLOCKED = "blocked: no review host can run";
 /**
  * The variables that relocate host configuration directories, and the files and top-level keys that supply models
@@ -119,15 +120,15 @@ function readClaudeSettings(directory: string, file: string): Record<string, unk
   const fd = openSync(join(configHome, file), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const stat = fstatSync(fd);
-    if (!stat.isFile() || stat.size > MAX_CONFIG_BYTES) return undefined;
-    const buffer = Buffer.alloc(MAX_CONFIG_BYTES + 1);
+    if (!stat.isFile() || stat.size > MAX_CLAUDE_CONFIG_BYTES) return undefined;
+    const buffer = Buffer.alloc(MAX_CLAUDE_CONFIG_BYTES + 1);
     let bytes = 0;
     while (bytes < buffer.length) {
       const count = readSync(fd, buffer, bytes, buffer.length - bytes, null);
       if (count === 0) break;
       bytes += count;
     }
-    if (bytes > MAX_CONFIG_BYTES) return undefined;
+    if (bytes > MAX_CLAUDE_CONFIG_BYTES) return undefined;
     const document: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(buffer.subarray(0, bytes)));
     if (document === null || typeof document !== "object" || Array.isArray(document)) return undefined;
     return document as Record<string, unknown>;

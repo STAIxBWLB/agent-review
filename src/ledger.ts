@@ -40,10 +40,19 @@ export type LedgerEvent =
  * signature here would refuse the builder's own interfaces, and the extra fields travel in the record untouched
  * whatever this type says.
  */
+export interface RubricBinding {
+  sha256: string;
+  criteria: { id: string; scale: "binary" | "ordinal-1-5"; blocking?: boolean }[];
+}
+
+export interface RubricScore { id: string; score: boolean | number }
+
 export interface PacketBlock {
   id: string;
   profile?: string;
-  subject: { kind?: string; base?: string; head: string; mergeBase?: string; pr?: number };
+  subject: { kind?: string; base?: string; head: string; mergeBase?: string; pr?: number; commit?: string };
+  subjectHashes?: { path: string; role: "artifact" | "evidence" | "contract"; sha256: string }[];
+  rubric?: RubricBinding;
   units?: { path: string; status?: string; insertions?: number; deletions?: number }[];
   excluded?: { path: string; reason?: string }[];
   rules?: { name: string; sha256?: string; appliesTo?: string[] }[];
@@ -74,6 +83,7 @@ export interface ReviewRecordV1 {
   reviewer: { id: string; modelFamily: string; model?: string; started: "self" | "manual" | "run"; implementer?: string; sameFamilyFallback: boolean };
   coverage: { reviewed: string[]; skipped: { path: string; reason: string }[] };
   findings: RecordFinding[];
+  rubricScores?: RubricScore[];
   verdict: "approved" | "changes_requested";
   call: { ok: boolean; error?: string };
   /** The review was made without a REVIEW.md (`arev record --light` only), which `arev gate` accepts (spec AC2). */

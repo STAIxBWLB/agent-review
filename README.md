@@ -32,8 +32,9 @@ bun add -g @staix/agent-review
 
 <!-- arev commands:end -->
 
-Run `arev packet --help` for subject and output options. Packet and rule
-commands require Git with support for `--attr-source` and `check-attr --source`.
+Run `arev packet --help` for subject and output options. Code packets and
+Git-backed rule selection require Git with support for `--attr-source` and
+`check-attr --source`.
 `arev packet --pr N` reads the pull request from the repository `origin` names
 on `github.com`, never from the repository `gh` resolves for itself (`GH_REPO`,
 the working directory), and refuses an origin that names no GitHub repository.
@@ -48,6 +49,25 @@ body, and referenced issue bodies. A reviewer can read this file without
 GitHub access. For a local subject, use `--contract FILE` to embed a local brief.
 Contract-bearing `--json` and MCP results return the packet and its framed
 `contract` text together. Plain CLI output includes the contract below the brief.
+
+For a manuscript or a rubric review, build a file-set packet:
+
+```sh
+arev packet --profile paper --files manuscript.md --evidence evidence.json --contract checklist.md --out paper-review
+arev packet --profile rubric --files candidate-a.md candidate-b.md --contract rubric.json --out rubric-review
+```
+
+Paper takes one manuscript with optional JSON evidence and a checklist. Rubric
+takes one or more text artifacts and a v1 JSON rubric with 1-20 criteria. Each
+criterion has `id`, `description`, a `scale` of `binary` or `ordinal-1-5`, and
+an optional boolean `blocking`. Select inputs within the Git worktree or, for
+a standalone review, within the current directory.
+
+These packets bind each included input's SHA-256 and carry the current commit
+as context when available. The report copies the packet ID and file-set head
+from `packet.json`. For rubric reports, also supply `rubricSha256` from
+`packet.rubric.sha256` and `rubricScores` with one `{id, score}` per criterion.
+Binary scores are booleans and ordinal scores are integers from 1 through 5.
 
 ### `arev gate`
 

@@ -154,9 +154,18 @@ export function mcpHandlers(cwd: string): Record<McpToolName, Handler> {
 const REPORT_SCHEMA = {
   type: "object",
   description: "The report body you wrote for this packet, as JSON. arev checks it field by field against the packet.",
-  // The protocol validates the envelope only: the report is read field by field by `parseReviewRecord`, the one reader of
-  // ReviewRecordV1. A schema that closes the object refuses every real report before its handler runs - the protocol
-  // reports `report: unknown argument: v` - and an empty schema is its spelling of "any JSON-safe value".
+  // Advertise rubric report fields while leaving the rest of the report envelope open. Only parseReviewRecord knows
+  // the packet's criterion IDs, scales and digest, so it performs the authoritative validation.
+  properties: {
+    rubricSha256: { type: "string", description: "SHA-256 of the rubric bound in the packet." },
+    rubricScores: {
+      type: "array", maxItems: 20,
+      items: {
+        type: "object", required: ["id", "score"], additionalProperties: false,
+        properties: { id: { type: "string" }, score: { oneOf: [{ type: "boolean" }, { type: "integer" }] } },
+      },
+    },
+  },
   additionalProperties: {},
 } as const;
 

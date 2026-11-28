@@ -15,7 +15,7 @@ import { parseReviewAnchor, reviewAnchorErrorMessage, type ReviewAnchor } from "
 import { blocksApproval, findingTally, findingsForHead, positionalFindingId, type ReviewFinding, type ReviewFindingSet, type ReviewFindingTally } from "./findings.ts";
 import { deniedReportPath } from "./deny.ts";
 import { sanitize } from "./frame.ts";
-import { MAX_REPORT_BYTES, Refusal, appendEvent, lineShaped, readLedger, recordId, reviewProjectId, secretShaped, shown, stringsIn, type LedgerEvent, type PacketBlock, type RecordFinding, type ReviewRecordV1 } from "./ledger.ts";
+import { MAX_REPORT_BYTES, Refusal, appendEvent, lineShaped, readLedger, recordId, reviewProjectId, secretShaped, shown, stringsIn, type LedgerEvent, type PacketBlock, type RecordFinding, type ReviewRecordV1, type RubricScore } from "./ledger.ts";
 import { bindPacketContract, buildPacket, type PacketRequest } from "./packet.ts";
 import { PacketUsageError } from "./packet-cli.ts";
 import { reviewGit } from "./review-git.ts";
@@ -26,7 +26,7 @@ const MAX_ID = 96, MAX_PATH = 512, MAX_TEXT = 2048, MAX_REF = 512, MAX_NAME = 12
 const TERMS = ["bugs", "security", "compliance"] as const, SEVERITIES = ["blocking", "advisory"] as const;
 const DISPOSITIONS = ["open", "fixed", "false_positive", "accepted"] as const, ORIGINS = ["introduced", "pre_existing", "indeterminate"] as const;
 const FINDING_FIELDS = ["id", "term", "severity", "path", "anchor", "text", "disposition", "rationale", "origin", "evidence"];
-const RECORD_FIELDS = ["v", "packet", "reviewer", "coverage", "findings", "verdict", "call"];
+const RECORD_FIELDS = ["v", "packet", "reviewer", "coverage", "findings", "verdict", "call", "rubricSha256", "rubricScores"];
 
 function refuse(message: string, next: string): never {
   throw new Refusal(message, next);
@@ -47,6 +47,9 @@ export function resolveHead(cwd: string, value: string): string {
   // What counts as full is the repository's own object format: 40 hexadecimal characters is a whole OID in a SHA-1
   // repository and a prefix in a SHA-256 one, where git resolves it but a length test alone would read it as a head.
   if (fullOidHere(cwd, value)) return value;
+  // A file set has a full content ID even when this repository uses 40-character Git object names.
+  if (PACKET_ID.test(value) && readLedger(cwd).some(event => event.type === "packet" &&
+      event.packet.subject.kind === "file-set" && event.packet.subject.head === value)) return value;
   throw new Refusal(`--head ${value} does not name a commit in this repository`,
     "pass the full head SHA (40 characters, or 64 in a SHA-256 repository), or fetch that commit and retry");
 }
@@ -182,6 +185,35 @@ export function parseReviewRecord(raw: unknown, options: RecordOptions): ReviewR
   }
 }
 
+function validateRubricScores(row: Record<string, unknown>, packet: PacketBlock): RubricScore[] | undefined {
+  const retry = "use the bound rubric from packet.json and run arev record again";
+  const rubric = packet.rubric;
+  if (packet.profile !== "rubric") {
+    if (row.rubricSha256 !== undefined || row.rubricScores !== undefined) {
+      refuse("rubric scores apply only to a rubric packet", "remove the rubric fields from this report");
+    }
+    return undefined;
+  }
+  if (!rubric || row.rubricSha256 !== rubric.sha256) refuse("rubricSha256 does not match the packet's rubric", retry);
+  const scores = rows(row.rubricScores, rubric.criteria.length);
+  if (!scores || scores.length !== rubric.criteria.length) refuse("rubricScores must score every bound rubric criterion once", retry);
+  const byId = new Map<string, RubricScore>();
+  const scales = new Map(rubric.criteria.map(({ id, scale }) => [id, scale]));
+  for (const entry of scores) {
+    const item = closed(entry, ["id", "score"], "a rubric score");
+    const id = item?.id, score = item?.score;
+    if (typeof id !== "string" || !scales.has(id) || byId.has(id)) {
+      refuse("rubricScores contains an unknown or duplicate criterion id", retry);
+    }
+    if (scales.get(id) === "binary" ? typeof score !== "boolean"
+      : typeof score !== "number" || !Number.isInteger(score) || score < 1 || score > 5) {
+      refuse("rubricScores contains a value outside its criterion scale", retry);
+    }
+    byId.set(id, { id, score: score as boolean | number });
+  }
+  return rubric.criteria.map(({ id }) => byId.get(id)!);
+}
+
 function validateReviewRecord(raw: unknown, options: RecordOptions): ReviewRecordV1 {
   const cap = options.maxAdvisories ?? DEFAULT_ADVISORY_CAP;
   if (!Number.isSafeInteger(cap) || cap < 0 || cap > MAX_FINDINGS) refuse(`the advisory cap ${cap} is not an integer in 0-${MAX_FINDINGS}`, `fix review.advisory_cap in the packet, or omit it for the default ${DEFAULT_ADVISORY_CAP}`);
@@ -313,12 +345,14 @@ function validateReviewRecord(raw: unknown, options: RecordOptions): ReviewRecor
   const call: ReviewRecordV1["call"] = { ok: callRow.ok, ...(callRow.error === undefined ? {} : { error: text(callRow.error, MAX_TEXT, "call.error") }) };
   if (findings.length === 0 && call.ok !== true) refuse("an empty finding list is accepted only with call.ok true", "a failed call cannot report a clean review; set call.ok to false and name the failure, or record what you found");
 
+  const rubricScores = validateRubricScores(row, options.packet);
   return {
     v: 1,
     packet: options.packet,
     reviewer,
     coverage,
     findings,
+    ...(rubricScores === undefined ? {} : { rubricScores }),
     verdict: oneOf(row.verdict, ["approved", "changes_requested"] as const, "verdict"),
     call,
     // Only `--light` states this: the report is untrusted content, and the flag is the reviewer's claim about the run.

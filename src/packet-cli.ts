@@ -11,7 +11,9 @@ import { readRules, renderRules } from "./rules.ts";
 
 /** Read the settings for the authoritative tree the packet uses. */
 export function packetSettings(cwd: string, bundle: PacketBundle): ReviewMdSettings {
-  return parseReviewMd(readRules(repositoryRoot(cwd), bundle.packet.subject.mergeBase, []).rules);
+  const { subject } = bundle.packet;
+  if (subject.kind === "file-set" && subject.commit === undefined) return parseReviewMd([]);
+  return parseReviewMd(readRules(repositoryRoot(cwd), subject.mergeBase, []).rules);
 }
 
 export function appendPacketEvent(cwd: string, bundle: PacketBundle, settings: ReviewMdSettings): void {
@@ -42,7 +44,7 @@ function packetArgs(args: readonly string[]) {
       options: {
         pr: { type: "string" }, from: { type: "string" }, to: { type: "string" },
         commit: { type: "string" }, workspace: { type: "boolean" }, files: { type: "boolean" },
-        profile: { type: "string" }, contract: { type: "string" }, json: { type: "boolean" }, out: { type: "string" },
+        profile: { type: "string" }, evidence: { type: "string" }, contract: { type: "string" }, json: { type: "boolean" }, out: { type: "string" },
       },
     });
   } catch {
@@ -63,7 +65,13 @@ export function runPacket(cwd: string, args: readonly string[]): number | void {
       throw new PacketUsageError("Unexpected packet path. Place each path after --files.");
     }
   }
-  if (values.profile !== undefined && values.profile !== "code") throw new PacketUsageError("Unsupported profile. Use --profile code.");
+  const profile = values.profile ?? "code";
+  if (profile !== "code" && profile !== "paper" && profile !== "rubric") {
+    throw new PacketUsageError("Unsupported profile. Use code, paper or rubric.");
+  }
+  if (values.evidence !== undefined && (profile !== "paper" || values.evidence === "")) {
+    throw new PacketUsageError("Pass --evidence FILE only with --profile paper.");
+  }
   if (values.out === "") throw new PacketUsageError("Output directory is empty. Pass --out DIR.");
   if (values.contract === "" || (values.contract !== undefined && values.pr !== undefined)) {
     throw new PacketUsageError("Pass --contract FILE only without --pr.");
@@ -77,7 +85,14 @@ export function runPacket(cwd: string, args: readonly string[]): number | void {
     values.commit !== undefined, values.workspace, values.files].filter(Boolean).length;
   if (subjects > 1) throw new PacketUsageError("Multiple packet subjects supplied. Choose one subject.");
   let request: PacketRequest;
-  if (values.pr !== undefined) request = { kind: "pr", number: values.pr };
+  if (profile !== "code") {
+    if (!values.files || values.out === undefined || (profile === "paper" && positionals.length !== 1) ||
+        (profile === "rubric" && values.contract === undefined)) {
+      throw new PacketUsageError("Use --profile paper --files MANUSCRIPT --out DIR or --profile rubric --files ARTIFACT... --contract RUBRIC --out DIR.");
+    }
+    request = { kind: "file-set", profile, paths: positionals,
+      ...(values.evidence === undefined ? {} : { evidenceFile: values.evidence }) };
+  } else if (values.pr !== undefined) request = { kind: "pr", number: values.pr };
   else if (values.from !== undefined || values.to !== undefined) {
     if (!values.from || !values.to) throw new PacketUsageError("A range needs both endpoints. Pass --from A --to B.");
     request = { kind: "range", base: values.from, head: values.to };
@@ -85,7 +100,7 @@ export function runPacket(cwd: string, args: readonly string[]): number | void {
   else if (values.files) request = { kind: "files", paths: positionals };
   else request = { kind: "workspace" };
 
-  const root = repositoryRoot(cwd);
+  const root = request.kind === "file-set" ? cwd : repositoryRoot(cwd);
   // A workspace or files subject counts every uncommitted path in the worktree, so a bundle `--out` writes there is
   // itself a change: `arev record` rebuilds the packet and would refuse the report for the bundle just delivered.
   if (values.out !== undefined && (request.kind === "workspace" || request.kind === "files") &&
